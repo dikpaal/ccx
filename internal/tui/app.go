@@ -1712,7 +1712,8 @@ func vpAtBottom(vp *viewport.Model) bool {
 	return vp.YOffset >= total-h
 }
 
-// liveBadgeText returns "[LIVE ▼]" when auto-scroll is active, "[LIVE]" otherwise.
+// liveBadgeText returns "[LIVE ▲]" or "[LIVE ▼]" when auto-scroll is active,
+// with arrow direction matching the sort order. "[LIVE]" when not following.
 func (a *App) liveBadgeText() string {
 	var sp *SplitPane
 	var msgList *list.Model
@@ -1731,8 +1732,7 @@ func (a *App) liveBadgeText() string {
 		return "[LIVE]"
 	}
 
-	items := msgList.Items()
-	if msgList.Index() < len(items)-1 {
+	if !a.isAtNewest(msgList) {
 		return "[LIVE]"
 	}
 	following := false
@@ -1744,6 +1744,9 @@ func (a *App) liveBadgeText() string {
 		following = vpAtBottom(&sp.Preview)
 	}
 	if following {
+		if a.msgReverse {
+			return "[LIVE ▲]"
+		}
 		return "[LIVE ▼]"
 	}
 	return "[LIVE]"

@@ -556,8 +556,7 @@ func (a *App) handleMessageKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		sp.Focus = !sp.Focus
 		if sp.Focus && a.liveTail {
-			items := a.messageList.Items()
-			if a.messageList.Index() >= len(items)-1 {
+			if a.isAtNewest(&a.messageList) {
 				a.snapListToEnd()
 			} else {
 				a.refreshMsgPreview(sp)
@@ -584,8 +583,7 @@ func (a *App) handleMessageKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			sp.Focus = true
 			if a.liveTail {
-				items := a.messageList.Items()
-				if a.messageList.Index() >= len(items)-1 {
+				if a.isAtNewest(&a.messageList) {
 					a.snapListToEnd()
 				} else {
 					a.refreshMsgPreview(sp)
@@ -674,7 +672,11 @@ func (a *App) handleDetailKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				a.applyMessageFilter()
 				items := a.messageList.Items()
 				if len(items) > 0 {
-					a.messageList.Select(len(items) - 1)
+					if a.msgReverse {
+						a.messageList.Select(0)
+					} else {
+						a.messageList.Select(len(items) - 1)
+					}
 				}
 			}
 		}
@@ -1467,8 +1469,9 @@ func (a *App) refreshLiveMessages(filePath string, msgs *[]session.Entry, msgLis
 	}
 
 	curIdx := msgList.Index()
-	oldItems := msgList.Items()
-	wasAtEnd := curIdx >= len(oldItems)-1
+	oldLen := len(msgList.Items())
+	// "wasAtNewest" means cursor was on the newest message
+	wasAtNewest := (a.msgReverse && curIdx == 0) || (!a.msgReverse && curIdx >= oldLen-1)
 	*msgs = entries
 
 	merged := mergeConversationTurns(entries)
@@ -1483,17 +1486,24 @@ func (a *App) refreshLiveMessages(filePath string, msgs *[]session.Entry, msgLis
 	}
 	msgList.SetItems(items)
 
-	if a.msgReverse {
-		// Reversed: newest is at index 0, "end" means index 0
-		if wasAtEnd {
+	if wasAtNewest || a.liveTail {
+		// Stay on newest message
+		if a.msgReverse {
 			msgList.Select(0)
+		} else {
+			msgList.Select(len(items) - 1)
+		}
+	} else if a.msgReverse {
+		// Reversed: new items prepended at index 0, shift cursor to compensate
+		added := len(items) - oldLen
+		if added > 0 {
+			msgList.Select(min(curIdx+added, len(items)-1))
 		} else if curIdx < len(items) {
 			msgList.Select(curIdx)
 		}
 	} else {
-		if wasAtEnd {
-			msgList.Select(len(items) - 1)
-		} else if curIdx < len(items) {
+		// Normal order: new items appended at end, cursor stays
+		if curIdx < len(items) {
 			msgList.Select(curIdx)
 		}
 	}
@@ -1538,13 +1548,26 @@ func (a *App) toggleLiveTail() (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
-// snapListToEnd selects the last item in the active message list and refreshes preview.
+// isAtNewest returns true if the message list cursor is on the newest message.
+func (a *App) isAtNewest(msgList *list.Model) bool {
+	if a.msgReverse {
+		return msgList.Index() == 0
+	}
+	return msgList.Index() >= len(msgList.Items())-1
+}
+
+// snapListToNewest selects the newest message in the active list and refreshes preview.
+// When reversed (newest first), that's index 0; otherwise it's the last index.
 func (a *App) snapListToEnd() {
 	switch a.state {
 	case viewMessages:
 		items := a.messageList.Items()
 		if len(items) > 0 {
-			a.messageList.Select(len(items) - 1)
+			if a.msgReverse {
+				a.messageList.Select(0)
+			} else {
+				a.messageList.Select(len(items) - 1)
+			}
 		}
 		a.msgSplit.CacheKey = ""
 		if a.msgSplit.Show {
@@ -1553,7 +1576,11 @@ func (a *App) snapListToEnd() {
 	case viewAgentMessages:
 		items := a.agentMsgList.Items()
 		if len(items) > 0 {
-			a.agentMsgList.Select(len(items) - 1)
+			if a.msgReverse {
+				a.agentMsgList.Select(0)
+			} else {
+				a.agentMsgList.Select(len(items) - 1)
+			}
 		}
 		a.agentMsgSplit.CacheKey = ""
 		if a.agentMsgSplit.Show {

@@ -83,9 +83,8 @@ type App struct {
 	detailFrom       viewState
 
 	// Message filtering & sorting
-	msgFilter     filterMode
-	filterPending bool // waiting for second key after 'f'
-	msgReverse    bool // reverse sort (newest first)
+	msgFilter  filterMode
+	msgReverse bool // reverse sort (newest first)
 
 	// Split pane ratio (list width as % of terminal width)
 	splitRatio int
@@ -222,7 +221,7 @@ func (a *App) View() string {
 		if a.msgReverse {
 			sortHint = "↓"
 		}
-		h := fmt.Sprintf("↵detail a:agents t:tools m:memory L:live S:sort(%s) !:filter(%s)", sortHint, filterModeShort(a.msgFilter))
+		h := fmt.Sprintf("↵detail a:agents t:tools m:memory L:live S:sort(%s) /:search", sortHint)
 		if inTmux() {
 			h += " J:jump"
 		}
@@ -436,9 +435,12 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	if a.sessSplit.Focus && a.sessSplit.Show {
 		switch msg.String() {
+		case "/":
+			a.sessSplit.Focus = false
+			cmd := startListSearch(&a.sessionList, "")
+			return a, cmd
 		case "down", "up", "pgdown", "pgup", "home", "end":
 			scrollPreview(&a.sessSplit.Preview, msg.String())
-			// Pin if scrolled away from bottom, unpin if at bottom
 			a.sessPreviewPinned = !a.sessPreviewAtBottom()
 			return a, nil
 		}
@@ -463,37 +465,6 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (a *App) handleMessageKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	sp := &a.msgSplit
-
-	// Handle second key of filter sequence (f + u/a/t/s/g/k)
-	if a.filterPending {
-		a.filterPending = false
-		target := filterNone
-		switch msg.String() {
-		case "u":
-			target = filterUser
-		case "a":
-			target = filterAssistant
-		case "t":
-			target = filterToolCalls
-		case "s":
-			target = filterSummary
-		case "g":
-			target = filterAgents
-		case "k":
-			target = filterSkills
-		default:
-			a.copiedMsg = ""
-			return a, nil
-		}
-		if a.msgFilter == target {
-			a.msgFilter = filterNone // toggle off
-		} else {
-			a.msgFilter = target
-		}
-		a.applyMessageFilter()
-		a.copiedMsg = filterModeTip(a.msgFilter)
-		return a, nil
-	}
 
 	switch msg.String() {
 	case "q":
@@ -559,10 +530,6 @@ func (a *App) handleMessageKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.copiedMsg = "Sort: oldest first"
 		}
 		return a, nil
-	case "!":
-		a.filterPending = true
-		a.copiedMsg = "filter: u=user a=asst t=tools s=summary g=agents k=skills"
-		return a, nil
 	case "tab":
 		if !sp.Show {
 			return a, nil
@@ -620,6 +587,12 @@ func (a *App) handleMessageKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if sp.Focus && sp.Show {
+		// Search from preview: unfocus and start search
+		if msg.String() == "/" {
+			sp.Focus = false
+			cmd := startListSearch(&a.messageList, "")
+			return a, cmd
+		}
 		// Block cursor navigation (up/down/left/right/f/F) handled first
 		if sp.Folds != nil {
 			result := sp.Folds.HandleKey(msg.String())
@@ -639,7 +612,7 @@ func (a *App) handleMessageKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Auto-trigger search on letter/digit keys (skip keys used for actions)
-	if !sp.Focus && !a.filterPending && isSearchTrigger(msg.String()) {
+	if !sp.Focus && isSearchTrigger(msg.String()) {
 		switch msg.String() {
 		case "a", "t", "g", "p", "q", "r", "J", "L", "S":
 			// handled above
@@ -769,6 +742,10 @@ func (a *App) handleAgentKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	if a.agentSplit.Focus && a.agentSplit.Show {
 		switch msg.String() {
+		case "/":
+			a.agentSplit.Focus = false
+			cmd := startListSearch(&a.agentList, "")
+			return a, cmd
 		case "down", "up", "pgdown", "pgup", "home", "end":
 			scrollPreview(&a.agentSplit.Preview, msg.String())
 			return a, nil
@@ -890,6 +867,12 @@ func (a *App) handleAgentMsgKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if sp.Focus && sp.Show {
+		// Search from preview: unfocus and start search
+		if msg.String() == "/" {
+			sp.Focus = false
+			cmd := startListSearch(&a.agentMsgList, "")
+			return a, cmd
+		}
 		// Block cursor navigation (up/down/left/right/f/F) handled first
 		if sp.Folds != nil {
 			result := sp.Folds.HandleKey(msg.String())
@@ -1059,6 +1042,12 @@ func (a *App) handleToolCallKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if sp.Focus && sp.Show {
+		// Search from preview: unfocus and start search
+		if msg.String() == "/" {
+			sp.Focus = false
+			cmd := startListSearch(&a.toolList, "")
+			return a, cmd
+		}
 		if sp.Folds != nil {
 			result := sp.Folds.HandleKey(msg.String())
 			if result == foldHandled {

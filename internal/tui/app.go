@@ -522,6 +522,18 @@ func (a *App) handleMessageKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !ok {
 			return a, nil
 		}
+		// When preview focused on a Task block, jump to the agent
+		if sp.Focus && sp.Folds != nil {
+			bc := sp.Folds.BlockCursor
+			if bc >= 0 && bc < len(item.entry.Content) {
+				block := item.entry.Content[bc]
+				if block.Type == "tool_use" && block.ToolName == "Task" {
+					if agent, found := a.findAgentForMessage(item.entry); found {
+						return a.openAgentMessages(agent)
+					}
+				}
+			}
+		}
 		return a.openDetail(item.entry, viewMessages)
 	case "a":
 		return a.openAgents(a.currentSess)

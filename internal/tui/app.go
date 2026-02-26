@@ -107,11 +107,6 @@ type App struct {
 	liveTail        bool // auto-scroll to latest message on tick
 	detailLiveTrack bool // auto-update detail view to latest message
 
-	// Agent preview message navigation
-	agentPreviewMsgs   []session.Entry
-	agentPreviewCursor int
-	agentPreviewStarts []int // line offsets per message for scroll-to
-
 	// Memory view
 	memoryVP   viewport.Model
 	memoryFrom viewState
@@ -742,16 +737,10 @@ func (a *App) handleAgentKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		a.agentSplit.Focus = !a.agentSplit.Focus
-		if len(a.agentPreviewMsgs) > 0 {
-			a.renderAgentPreviewContent()
-		}
 		return a, nil
 	case "left":
 		if a.agentSplit.Focus && a.agentSplit.Show {
 			a.agentSplit.Focus = false
-			if len(a.agentPreviewMsgs) > 0 {
-				a.renderAgentPreviewContent()
-			}
 		}
 		return a, nil
 	case "right":
@@ -764,9 +753,6 @@ func (a *App) handleAgentKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.agentList.Select(idx)
 		}
 		a.agentSplit.Focus = true
-		if len(a.agentPreviewMsgs) > 0 {
-			a.renderAgentPreviewContent()
-		}
 		return a, nil
 	case "[":
 		if a.agentSplit.Show {
@@ -780,29 +766,9 @@ func (a *App) handleAgentKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	if a.agentSplit.Focus && a.agentSplit.Show && len(a.agentPreviewMsgs) > 0 {
+	if a.agentSplit.Focus && a.agentSplit.Show {
 		switch msg.String() {
-		case "up":
-			if a.agentPreviewCursor > 0 {
-				a.agentPreviewCursor--
-				a.renderAgentPreviewContent()
-				a.scrollAgentPreviewToCursor()
-			}
-			return a, nil
-		case "down":
-			if a.agentPreviewCursor < len(a.agentPreviewMsgs)-1 {
-				a.agentPreviewCursor++
-				a.renderAgentPreviewContent()
-				a.scrollAgentPreviewToCursor()
-			}
-			return a, nil
-		case "enter":
-			if a.agentPreviewCursor >= 0 && a.agentPreviewCursor < len(a.agentPreviewMsgs) {
-				entry := a.agentPreviewMsgs[a.agentPreviewCursor]
-				a.openDetailFromAgentPreview(entry)
-			}
-			return a, nil
-		case "pgdown", "pgup", "home", "end":
+		case "down", "up", "pgdown", "pgup", "home", "end":
 			scrollPreview(&a.agentSplit.Preview, msg.String())
 			return a, nil
 		}
@@ -2083,84 +2049,18 @@ func (a *App) updateAgentPreview() {
 
 	entries, err := session.LoadMessages(item.agent.FilePath)
 	if err != nil || len(entries) == 0 {
-		a.agentPreviewMsgs = nil
 		a.agentSplit.Preview.SetContent(dimStyle.Render("(no messages)"))
 		return
 	}
 
-	a.agentPreviewMsgs = entries
-	a.agentPreviewCursor = 0
-	a.renderAgentPreviewContent()
-}
-
-func (a *App) renderAgentPreviewContent() {
 	previewW := max(a.width-a.agentSplit.ListWidth(a.width, a.splitRatio)-1, 1)
-	oldOffset := a.agentSplit.Preview.YOffset
-
-	cursor := -1
-	if a.agentSplit.Focus {
-		cursor = a.agentPreviewCursor
-	}
-
 	var sb strings.Builder
-	a.agentPreviewStarts = make([]int, len(a.agentPreviewMsgs))
-	lineCount := 0
-	for i, e := range a.agentPreviewMsgs {
-		a.agentPreviewStarts[i] = lineCount
-		if i == cursor {
-			// Render selected message fully expanded
-			rp := renderFullMessageWithCursor(e, previewW, defaultFolds(e), nil, -1)
-			content := rp.content
-			sb.WriteString(content)
-			lineCount += strings.Count(content, "\n")
-		} else {
-			// Compact one-liner for non-selected messages
-			msg := renderCompactMessage(e, previewW, 1)
-			sb.WriteString(msg)
-			lineCount += strings.Count(msg, "\n")
-		}
+	for _, e := range entries {
+		sb.WriteString(renderCompactMessage(e, previewW, 2))
 	}
-
 	contentH := max(a.height-3, 1)
-	if a.agentSplit.Preview.Width != previewW || a.agentSplit.Preview.Height != contentH {
-		a.agentSplit.Preview = viewport.New(previewW, contentH)
-	}
+	a.agentSplit.Preview = viewport.New(previewW, contentH)
 	a.agentSplit.Preview.SetContent(sb.String())
-
-	// Clamp offset
-	maxOffset := max(lineCount-contentH, 0)
-	if oldOffset > maxOffset {
-		oldOffset = maxOffset
-	}
-	a.agentSplit.Preview.YOffset = oldOffset
-}
-
-func (a *App) scrollAgentPreviewToCursor() {
-	if a.agentPreviewCursor < 0 || a.agentPreviewCursor >= len(a.agentPreviewStarts) {
-		return
-	}
-	blockLine := a.agentPreviewStarts[a.agentPreviewCursor]
-	vpHeight := a.agentSplit.Preview.Height
-	totalLines := a.agentSplit.Preview.TotalLineCount()
-
-	if blockLine < a.agentSplit.Preview.YOffset {
-		a.agentSplit.Preview.YOffset = max(blockLine-1, 0)
-		return
-	}
-	if blockLine >= a.agentSplit.Preview.YOffset+vpHeight {
-		a.agentSplit.Preview.YOffset = min(blockLine-vpHeight/2, max(totalLines-vpHeight, 0))
-	}
-}
-
-func (a *App) openDetailFromAgentPreview(entry session.Entry) {
-	a.detailEntry = entry
-	a.detailFrom = viewAgents
-	previewW := max(a.width-2, 40)
-	content := renderFullMessage(entry, previewW)
-	a.detailContent = content
-	a.detailVP = viewport.New(a.width, a.height-2)
-	a.detailVP.SetContent(content)
-	a.state = viewDetail
 }
 
 // --- Helpers ---

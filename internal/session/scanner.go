@@ -21,16 +21,43 @@ var (
 	bCwd           = []byte(`"cwd"`)
 	bGitBranch     = []byte(`"gitBranch"`)
 	bTodosNonEmpty = []byte(`"todos":[{`)
+	bSlug          = []byte(`"slug"`)
+	bTypeProgress  = []byte(`"type":"progress"`)
+	bTypeProgressS = []byte(`"type": "progress"`)
+	bTypeFileHist  = []byte(`"type":"file-history-snapshot"`)
+	bTypeFileHistS = []byte(`"type": "file-history-snapshot"`)
+	bTeamName      = []byte(`"teamName":"`)
+	bTeamNameS     = []byte(`"teamName": "`)
+	bAgentName     = []byte(`"agentName":"`)
+	bAgentNameS    = []byte(`"agentName": "`)
+
+	// Feature detection markers
+	bIsCompactSummary  = []byte(`"isCompactSummary":true`)
+	bIsCompactSummaryS = []byte(`"isCompactSummary": true`)
+	bSkillTool         = []byte(`"name":"Skill"`)
+	bSkillToolS        = []byte(`"name": "Skill"`)
+	bMCPTool           = []byte(`"name":"mcp__`)
+	bMCPToolS          = []byte(`"name": "mcp__`)
+
+	decodedPathCache sync.Map // dirName → decoded path (string, "" if unresolvable)
 )
 
-func ScanSessions() ([]Session, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("get home dir: %w", err)
+// ScanSessions scans for Claude Code sessions. If claudeDir is empty,
+// defaults to ~/.claude.
+func ScanSessions(claudeDir string) ([]Session, error) {
+	if claudeDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("get home dir: %w", err)
+		}
+		claudeDir = filepath.Join(home, ".claude")
 	}
 
-	projectsDir := filepath.Join(home, ".claude", "projects")
-	if _, err := os.Stat(projectsDir); os.IsNotExist(err) {
+	// Derive home dir for path decoding (claudeDir is typically ~/.claude)
+	home := filepath.Dir(claudeDir)
+
+	projectsDir := filepath.Join(claudeDir, "projects")
+	if _, statErr := os.Stat(projectsDir); os.IsNotExist(statErr) {
 		return nil, nil
 	}
 
@@ -40,6 +67,7 @@ func ScanSessions() ([]Session, error) {
 		size    int64
 	}
 	var files []fileEntry
+	var err error
 	err = filepath.Walk(projectsDir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return nil
@@ -113,7 +141,6 @@ func scanSessionStream(path string, modTime time.Time, home string) Session {
 		ShortID:  shortID,
 		FilePath: path,
 		ModTime:  modTime,
-		IsLive:   time.Since(modTime) < 60*time.Second,
 	}
 
 	dir := filepath.Dir(path)
@@ -143,7 +170,7 @@ func scanSessionStream(path string, modTime time.Time, home string) Session {
 			cwd, branch := extractMetadataFast(line)
 			if cwd != "" {
 				sess.ProjectPath = cwd
-				sess.ProjectName = shortenPath(cwd, home)
+				sess.ProjectName = ShortenPath(cwd, home)
 			}
 			if branch != "" {
 				sess.GitBranch = branch
@@ -171,13 +198,116 @@ func scanSessionStream(path string, modTime time.Time, home string) Session {
 				sess.Todos = todos
 			}
 		}
+
+		// Extract plan slugs (collect all distinct slugs in order)
+		if idx := bytes.Index(line, bSlug); idx >= 0 {
+			if v := extractJSONFieldValue(line[idx+len(bSlug):]); v != "" {
+				seen := false
+				for _, s := range sess.PlanSlugs {
+					if s == v {
+						seen = true
+						break
+					}
+				}
+				if !seen {
+					sess.PlanSlugs = append(sess.PlanSlugs, v)
+					if sess.PlanSlug == "" {
+						sess.PlanSlug = v
+					}
+				}
+			}
+		}
+
+		// Feature detection (cheap byte-level checks, skip once detected)
+		if !sess.HasCompaction {
+			if bytes.Contains(line, bIsCompactSummary) || bytes.Contains(line, bIsCompactSummaryS) {
+				sess.HasCompaction = true
+			}
+		}
+		if !sess.HasSkills {
+			if bytes.Contains(line, bSkillTool) || bytes.Contains(line, bSkillToolS) {
+				sess.HasSkills = true
+			}
+		}
+		if !sess.HasMCP {
+			if bytes.Contains(line, bMCPTool) || bytes.Contains(line, bMCPToolS) {
+				sess.HasMCP = true
+			}
+		}
+
+		// Team detection (check any line for teamName/agentName)
+		if sess.TeamName == "" {
+			if bytes.Contains(line, bTeamName) || bytes.Contains(line, bTeamNameS) {
+				sess.TeamName = extractQuotedAfter(line, bTeamName, bTeamNameS)
+			}
+		}
+		if sess.TeammateName == "" {
+			if bytes.Contains(line, bAgentName) || bytes.Contains(line, bAgentNameS) {
+				sess.TeammateName = extractQuotedAfter(line, bAgentName, bAgentNameS)
+			}
+		}
 	}
 
 	sess.MsgCount = userMsgCount
+
+	// Determine team role
+	if sess.TeamName != "" {
+		if sess.TeammateName != "" {
+			sess.TeamRole = "teammate"
+		} else {
+			sess.TeamRole = "leader"
+		}
+	}
+
+	if sess.ProjectPath == "" {
+		// Fallback: decode the project directory name back to a real path.
+		// The dir name is EncodeProjectPath(cwd) which replaces / and . with -.
+		// We resolve ambiguity by walking the filesystem.
+		dirName := filepath.Base(filepath.Dir(path))
+		if p := decodeProjectPath(dirName); p != "" {
+			sess.ProjectPath = p
+			sess.ProjectName = ShortenPath(p, home)
+		} else {
+			// Directory may not exist (renamed/deleted). Derive path from dir name.
+			sess.ProjectPath = strings.ReplaceAll(dirName, "-", "/")
+		}
+	}
 	if sess.ProjectPath != "" {
 		sess.IsWorktree = isGitWorktree(sess.ProjectPath)
 		sess.HasMemory = hasProjectMemory(sess.ProjectPath, home)
 	}
+
+	// Load richer todos from ~/.claude/todos/ files if JSONL had none
+	if len(sess.Todos) == 0 {
+		sess.Todos = loadFileTodos(sess.ID, home)
+	}
+	for _, t := range sess.Todos {
+		if t.Status == "pending" || t.Status == "in_progress" {
+			sess.HasTodos = true
+			break
+		}
+	}
+
+	// Load tasks from ~/.claude/tasks/{sessionID}/
+	sess.Tasks = loadFileTasks(sess.ID, home)
+	for _, t := range sess.Tasks {
+		if t.Status == "pending" || t.Status == "in_progress" {
+			sess.HasTasks = true
+			break
+		}
+	}
+
+	// Check plan file existence (any slug)
+	for _, slug := range sess.PlanSlugs {
+		if planFileExists(slug, home) {
+			sess.HasPlan = true
+			break
+		}
+	}
+
+	// Check for subagents
+	sess.HasAgents = hasSubagents(path)
+
 	return sess
 }
 
@@ -254,6 +384,8 @@ func extractSimpleContent(line []byte) string {
 			continue
 		}
 		text = strings.ReplaceAll(text, "\n", " ")
+		text = ansiRegex.ReplaceAllString(text, "")
+		text = xmlTagRegex.ReplaceAllString(text, "")
 		if isSystemPrompt(text) {
 			return ""
 		}
@@ -336,6 +468,22 @@ func extractJSONFieldValue(b []byte) string {
 	return ""
 }
 
+// extractQuotedAfter finds one of the markers in line and returns the quoted string value after it.
+func extractQuotedAfter(line []byte, markers ...[]byte) string {
+	for _, m := range markers {
+		idx := bytes.Index(line, m)
+		if idx < 0 {
+			continue
+		}
+		start := idx + len(m) // points right after the opening quote
+		end := bytes.IndexByte(line[start:], '"')
+		if end > 0 {
+			return string(line[start : start+end])
+		}
+	}
+	return ""
+}
+
 func extractTodos(line []byte) []TodoItem {
 	idx := bytes.Index(line, bTodosNonEmpty)
 	if idx < 0 {
@@ -368,11 +516,137 @@ func EncodeProjectPath(path string) string {
 	return s
 }
 
+// MoveProject moves a session's project directory to a new path.
+// It renames the ~/.claude/projects/<encoded>/ directory and rewrites
+// the "cwd" field in all JSONL files (including subagent dirs).
+func MoveProject(oldPath, newPath string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("get home dir: %w", err)
+	}
+
+	oldEncoded := EncodeProjectPath(oldPath)
+	newEncoded := EncodeProjectPath(newPath)
+	projectsDir := filepath.Join(home, ".claude", "projects")
+	oldDir := filepath.Join(projectsDir, oldEncoded)
+	newDir := filepath.Join(projectsDir, newEncoded)
+
+	if _, err := os.Stat(oldDir); os.IsNotExist(err) {
+		return fmt.Errorf("project dir not found: %s", oldDir)
+	}
+	if _, err := os.Stat(newDir); err == nil {
+		return fmt.Errorf("target already exists: %s", newDir)
+	}
+
+	// Rewrite "cwd" in all JSONL files under oldDir
+	if err := rewriteCwdInDir(oldDir, oldPath, newPath); err != nil {
+		return fmt.Errorf("rewrite cwd: %w", err)
+	}
+
+	// Rename the directory
+	if err := os.Rename(oldDir, newDir); err != nil {
+		return fmt.Errorf("rename dir: %w", err)
+	}
+
+	// Clear decoded path cache since paths changed
+	decodedPathCache.Delete(oldEncoded)
+
+	return nil
+}
+
+// rewriteCwdInDir replaces old cwd with new cwd in all JSONL files under dir.
+func rewriteCwdInDir(dir, oldCwd, newCwd string) error {
+	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || !strings.HasSuffix(path, ".jsonl") {
+			return nil
+		}
+		return rewriteCwdInFile(path, oldCwd, newCwd)
+	})
+}
+
+func rewriteCwdInFile(path, oldCwd, newCwd string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	oldPattern := []byte(`"cwd":"` + oldCwd + `"`)
+	newPattern := []byte(`"cwd":"` + newCwd + `"`)
+	oldPatternSpaced := []byte(`"cwd": "` + oldCwd + `"`)
+	newPatternSpaced := []byte(`"cwd": "` + newCwd + `"`)
+
+	updated := bytes.ReplaceAll(data, oldPattern, newPattern)
+	updated = bytes.ReplaceAll(updated, oldPatternSpaced, newPatternSpaced)
+
+	if bytes.Equal(data, updated) {
+		return nil // no changes needed
+	}
+	return os.WriteFile(path, updated, 0644)
+}
+
+func loadFileTodos(sessionID, home string) []TodoItem {
+	path := filepath.Join(home, ".claude", "todos", sessionID+"-agent-"+sessionID+".json")
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) <= 2 { // "[]" is 2 bytes
+		return nil
+	}
+	var todos []TodoItem
+	if json.Unmarshal(data, &todos) != nil {
+		return nil
+	}
+	return todos
+}
+
+func loadFileTasks(sessionID, home string) []TaskItem {
+	dir := filepath.Join(home, ".claude", "tasks", sessionID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var tasks []TaskItem
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || e.Name() == ".lock" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var t TaskItem
+		if json.Unmarshal(data, &t) == nil && t.Subject != "" {
+			tasks = append(tasks, t)
+		}
+	}
+	return tasks
+}
+
+func planFileExists(slug, home string) bool {
+	if slug == "" {
+		return false
+	}
+	path := filepath.Join(home, ".claude", "plans", slug+".md")
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func hasProjectMemory(projectPath, home string) bool {
 	encoded := EncodeProjectPath(projectPath)
 	memDir := filepath.Join(home, ".claude", "projects", encoded, "memory")
 	entries, err := os.ReadDir(memDir)
 	return err == nil && len(entries) > 0
+}
+
+func hasSubagents(sessionFilePath string) bool {
+	dir := filepath.Dir(sessionFilePath)
+	sessID := strings.TrimSuffix(filepath.Base(sessionFilePath), ".jsonl")
+	agentDir := filepath.Join(dir, sessID, "subagents")
+	if _, err := os.Stat(agentDir); err != nil {
+		return false
+	}
+	matches, _ := filepath.Glob(filepath.Join(agentDir, "agent-*.jsonl"))
+	return len(matches) > 0
 }
 
 func isGitWorktree(projectPath string) bool {
@@ -394,18 +668,87 @@ func isSystemPrompt(s string) bool {
 	return false
 }
 
+// decodeProjectPath tries to resolve an encoded directory name back to a real
+// filesystem path. The encoding replaces both '/' and '.' with '-', so the
+// decode is ambiguous. We resolve by walking the filesystem segment by segment:
+// for each '-', try '/' first (new segment), then '.' (dot in current segment).
+func decodeProjectPath(dirName string) string {
+	if !strings.HasPrefix(dirName, "-") {
+		return ""
+	}
+	if cached, ok := decodedPathCache.Load(dirName); ok {
+		return cached.(string)
+	}
+	// Split on '-' to get candidate segments. First element is empty (leading '-').
+	parts := strings.Split(dirName[1:], "-") // e.g. "Users","gavin","jeong","src",...
+	if len(parts) == 0 {
+		return ""
+	}
+
+	// Recursively try building a valid path
+	result := tryResolvePath("/", parts)
+	if result != "" {
+		if info, err := os.Stat(result); err == nil && info.IsDir() {
+			decodedPathCache.Store(dirName, result)
+			return result
+		}
+	}
+	decodedPathCache.Store(dirName, "")
+	return ""
+}
+
+// tryResolvePath recursively resolves path segments.
+// For each '-' boundary, it tries: '/' (new dir), '-' (literal hyphen), '.' (dot).
+func tryResolvePath(base string, remaining []string) string {
+	if len(remaining) == 0 {
+		return base
+	}
+
+	// Try appending next segment as a new directory component (was '/')
+	candidate := filepath.Join(base, remaining[0])
+	if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+		if result := tryResolvePath(candidate, remaining[1:]); result != "" {
+			return result
+		}
+	}
+
+	// Try merging with '-' (the '-' was a literal hyphen in the name)
+	if len(remaining) >= 2 {
+		merged := remaining[0] + "-" + remaining[1]
+		newRemaining := make([]string, 0, len(remaining)-1)
+		newRemaining = append(newRemaining, merged)
+		newRemaining = append(newRemaining, remaining[2:]...)
+		if result := tryResolvePath(base, newRemaining); result != "" {
+			return result
+		}
+	}
+
+	// Try merging with '.' (the '-' was originally a '.')
+	if len(remaining) >= 2 {
+		merged := remaining[0] + "." + remaining[1]
+		newRemaining := make([]string, 0, len(remaining)-1)
+		newRemaining = append(newRemaining, merged)
+		newRemaining = append(newRemaining, remaining[2:]...)
+		if result := tryResolvePath(base, newRemaining); result != "" {
+			return result
+		}
+	}
+
+	return ""
+}
+
 func decodeDirName(dirName, home string) string {
 	if !strings.HasPrefix(dirName, "-") {
 		return dirName
 	}
 	decoded := strings.ReplaceAll(dirName, "-", "/")
 	if strings.HasPrefix(decoded, "/Users/") {
-		return shortenPath(decoded, home)
+		return ShortenPath(decoded, home)
 	}
 	return decoded
 }
 
-func shortenPath(path, home string) string {
+func ShortenPath(path, home string) string {
 	if strings.HasPrefix(path, home) {
 		return "~" + path[len(home):]
 	}
@@ -468,8 +811,14 @@ func LoadMessagesSummary(filePath string, headN, tailN int) (head []Entry, tail 
 			continue
 		}
 
-		// Fast skip: meta and non-message lines without full JSON parse
+		// Fast skip: meta, progress, file-history-snapshot, and non-message
+		// lines without full JSON parse. Must match LoadMessages filtering
+		// so that entry indices are consistent between summary and full load.
 		if bytes.Contains(line, bIsMeta) || bytes.Contains(line, bIsMetaSpaced) {
+			continue
+		}
+		if bytes.Contains(line, bTypeProgress) || bytes.Contains(line, bTypeProgressS) ||
+			bytes.Contains(line, bTypeFileHist) || bytes.Contains(line, bTypeFileHistS) {
 			continue
 		}
 		hasRole := bytes.Contains(line, bRoleUser) || bytes.Contains(line, bRoleUserS) ||

@@ -22,10 +22,8 @@ func (a *App) enterCopyMode() {
 
 	var content string
 	switch a.state {
-	case viewDetail:
-		content = a.detailContent
-	case viewAgentDetail:
-		content = a.agentDetailContent
+	case viewMessageFull:
+		content = a.msgFull.content
 	}
 
 	a.copyLines = strings.Split(stripANSI(content), "\n")
@@ -43,20 +41,16 @@ func (a *App) exitCopyMode() {
 	}
 	offset := vp.YOffset
 	switch a.state {
-	case viewDetail:
-		a.detailVP.SetContent(a.detailContent)
-	case viewAgentDetail:
-		a.agentDetailVP.SetContent(a.agentDetailContent)
+	case viewMessageFull:
+		a.refreshMsgFullPreview()
 	}
 	vp.YOffset = offset
 }
 
 func (a *App) activeDetailVP() *viewport.Model {
 	switch a.state {
-	case viewDetail:
-		return &a.detailVP
-	case viewAgentDetail:
-		return &a.agentDetailVP
+	case viewMessageFull:
+		return &a.msgFull.vp
 	default:
 		return nil
 	}

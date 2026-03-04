@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gavin-jeong/csb/internal/session"
+	"github.com/keyolk/ccx/internal/session"
 )
 
 func main() {
 	start := time.Now()
-	sessions, err := session.ScanSessions()
+	sessions, err := session.ScanSessions("")
 	elapsed := time.Since(start)
 	if err != nil {
 		fmt.Printf("ERROR: %v\n", err)

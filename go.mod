@@ -1,4 +1,4 @@
-module github.com/gavin-jeong/csb
+module github.com/keyolk/ccx
 
 go 1.25.1
 

@@ -3,9 +3,18 @@ package session
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
+
+var ansiRegex = regexp.MustCompile(`(?:\x1b|\\u001b)\[[0-9;]*m`)
+var xmlTagRegex = regexp.MustCompile(`</?[a-zA-Z][a-zA-Z0-9_-]*>`)
+
+// StripXMLTags removes XML-like tags such as <command-name>, </local-command-stdout>, etc.
+func StripXMLTags(s string) string {
+	return xmlTagRegex.ReplaceAllString(s, "")
+}
 
 type rawEntry struct {
 	Type      string          `json:"type"`
@@ -152,6 +161,8 @@ func EntryPreview(e Entry) string {
 				continue
 			}
 			text = strings.ReplaceAll(text, "\n", " ")
+			text = ansiRegex.ReplaceAllString(text, "")
+			text = xmlTagRegex.ReplaceAllString(text, "")
 			if len(text) > 100 {
 				return text[:97] + "..."
 			}

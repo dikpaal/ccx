@@ -7,6 +7,16 @@ type TodoItem struct {
 	Status  string `json:"status"` // pending, in_progress, completed
 }
 
+type TaskItem struct {
+	ID          string   `json:"id"`
+	Subject     string   `json:"subject"`
+	Status      string   `json:"status"`
+	Description string   `json:"description"`
+	ActiveForm  string   `json:"activeForm"`
+	Blocks      []string `json:"blocks"`
+	BlockedBy   []string `json:"blockedBy"`
+}
+
 type Session struct {
 	ID          string
 	ShortID     string
@@ -19,9 +29,24 @@ type Session struct {
 	FirstPrompt string
 	Created     time.Time
 	IsWorktree  bool
-	IsLive      bool
+	IsLive       bool
+	IsResponding bool
 	HasMemory   bool
+	HasTodos    bool
 	Todos       []TodoItem
+	HasTasks    bool
+	HasPlan     bool
+	PlanSlug    string   // first plan slug (kept for compat)
+	PlanSlugs   []string // all distinct plan slugs in order
+	Tasks       []TaskItem
+	TeamName     string // e.g. "supports-build"
+	TeamRole     string // "leader", "teammate", ""
+	TeammateName string // e.g. "build-deploy" (teammate only)
+
+	HasAgents     bool
+	HasCompaction bool
+	HasSkills     bool
+	HasMCP        bool
 }
 
 type Entry struct {

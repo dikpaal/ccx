@@ -1,5 +1,5 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-BIN := bin/csb
+BIN := bin/ccx
 
 .PHONY: build run install clean tidy
 
@@ -10,7 +10,7 @@ run: build
 	$(BIN)
 
 install: build
-	cp $(BIN) ~/.local/bin/csb
+	cp $(BIN) ~/.local/bin/ccx
 
 clean:
 	rm -rf bin/

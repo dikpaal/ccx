@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/gavin-jeong/csb/internal/session"
+	"github.com/keyolk/ccx/internal/session"
 )
 
 // mergedMsg represents a logical conversation turn, potentially combining
@@ -30,14 +30,22 @@ func mergeConversationTurns(entries []session.Entry) []mergedMsg {
 	for i < len(entries) {
 		e := entries[i]
 
-		// User message with actual text → standalone turn
+		// User message with actual text → start a user turn, absorb
+		// consecutive user messages (e.g. command output, tool results)
 		if e.Role == "user" && hasUserText(e) {
-			result = append(result, mergedMsg{
-				entry:    e,
+			merged := mergedMsg{
+				entry:    cloneEntry(e),
 				startIdx: i,
 				endIdx:   i,
-			})
-			i++
+			}
+			j := i + 1
+			for j < len(entries) && entries[j].Role == "user" {
+				merged.entry.Content = append(merged.entry.Content, entries[j].Content...)
+				merged.endIdx = j
+				j++
+			}
+			result = append(result, merged)
+			i = j
 			continue
 		}
 
@@ -76,14 +84,21 @@ func mergeConversationTurns(entries []session.Entry) []mergedMsg {
 	return result
 }
 
-// hasUserText returns true if the entry has at least one non-empty text block.
+// hasUserText returns true if the entry is a real user prompt (has text
+// blocks but no tool_result blocks). User messages that carry tool_result
+// blocks are automated tool responses — any text they contain is
+// system-generated (e.g. <system-reminder>) and should not break merging.
 func hasUserText(e session.Entry) bool {
+	hasText := false
 	for _, block := range e.Content {
+		if block.Type == "tool_result" {
+			return false // automated tool response, not a real user prompt
+		}
 		if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
-			return true
+			hasText = true
 		}
 	}
-	return false
+	return hasText
 }
 
 // cloneEntry creates a shallow copy of an Entry with its own Content slice.
@@ -94,87 +109,49 @@ func cloneEntry(e session.Entry) session.Entry {
 	return clone
 }
 
-// filterMerged applies a filter mode to merged messages.
-func filterMerged(msgs []mergedMsg, mode filterMode) []mergedMsg {
-	switch mode {
-	case filterNone:
-		return msgs
-	case filterSummary:
-		return summarizeMerged(msgs)
-	default:
-		var result []mergedMsg
-		for _, m := range msgs {
-			if mergedMatchesFilter(m.entry, mode) {
-				result = append(result, m)
-			}
-		}
-		return result
-	}
-}
 
-func mergedMatchesFilter(e session.Entry, mode filterMode) bool {
-	switch mode {
-	case filterUser:
-		return e.Role == "user"
-	case filterAssistant:
-		return e.Role == "assistant"
-	case filterToolCalls:
-		for _, b := range e.Content {
-			if b.Type == "tool_use" {
-				return true
-			}
-		}
-		return false
-	case filterAgents:
-		for _, b := range e.Content {
-			if b.Type == "tool_use" && b.ToolName == "Task" {
-				return true
-			}
-		}
-		return false
-	case filterSkills:
-		for _, b := range e.Content {
-			if b.Type == "tool_use" && b.ToolName == "Skill" {
-				return true
-			}
-		}
-		return false
-	default:
-		return true
-	}
-}
-
-// summarizeMerged keeps user messages + the last assistant turn before each user.
-func summarizeMerged(msgs []mergedMsg) []mergedMsg {
-	if len(msgs) == 0 {
-		return nil
-	}
+// filterConversation keeps messages with visible conversation content:
+// real text (not system-generated) or tool calls.
+// Drops empty entries ("no content") and system-only messages.
+func filterConversation(msgs []mergedMsg) []mergedMsg {
 	var result []mergedMsg
-	var lastAsst *mergedMsg
-	for i := range msgs {
-		m := msgs[i]
-		if m.entry.Role == "user" {
-			if lastAsst != nil {
-				result = append(result, *lastAsst)
-				lastAsst = nil
-			}
+	for _, m := range msgs {
+		if hasVisibleContent(m.entry) {
 			result = append(result, m)
-		} else {
-			msg := m
-			lastAsst = &msg
 		}
-	}
-	if lastAsst != nil {
-		result = append(result, *lastAsst)
 	}
 	return result
 }
 
-// reverseMerged reverses a slice of mergedMsg in place.
-func reverseMerged(msgs []mergedMsg) {
-	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
-		msgs[i], msgs[j] = msgs[j], msgs[i]
+// hasVisibleContent returns true if the entry has content meaningful
+// in a conversation preview (non-system text or tool calls).
+func hasVisibleContent(e session.Entry) bool {
+	for _, b := range e.Content {
+		if b.Type == "tool_use" {
+			return true
+		}
+		if b.Type == "text" {
+			text := strings.TrimSpace(b.Text)
+			if text != "" && !isSystemText(text) {
+				return true
+			}
+		}
 	}
+	return false
+}
+
+// isSystemText returns true if text is system-generated content
+// (e.g. <system-reminder> tags) or API noise rather than real conversation.
+func isSystemText(text string) bool {
+	return strings.HasPrefix(text, "<system-reminder>") ||
+		strings.HasPrefix(text, "<system>") ||
+		text == "Prompt is too long"
+}
+
+// isSystemAgent returns true if the agent is an internal system agent
+// (e.g. autocompaction summary agents) that should be hidden from the UI.
+func isSystemAgent(a session.Subagent) bool {
+	return strings.HasPrefix(a.ID, "acompact-")
 }
 
 // mergedToolSummary returns a compact tool summary with counts for duplicates.

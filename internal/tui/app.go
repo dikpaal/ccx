@@ -5,19 +5,31 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/gavin-jeong/csb/internal/session"
+	"github.com/keyolk/ccx/internal/session"
 )
 
 type tickMsg time.Time
 type liveTickMsg time.Time
+type spinnerTickMsg time.Time
+type globalStatsMsg session.GlobalStats
+
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+func spinnerTickCmd() tea.Cmd {
+	return tea.Tick(80*time.Millisecond, func(t time.Time) tea.Msg {
+		return spinnerTickMsg(t)
+	})
+}
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
@@ -35,64 +47,36 @@ type viewState int
 
 const (
 	viewSessions viewState = iota
-	viewMessages
-	viewDetail
-	viewAgents
-	viewAgentMessages
-	viewAgentDetail
-	viewToolCalls
-	viewMemory
+	viewConversation
+	viewMessageFull
+	viewGlobalStats
+
 )
 
 type App struct {
 	state  viewState
 	width  int
 	height int
+	config Config
 
 	// Data
-	sessions     []session.Session
-	currentSess  session.Session
-	messages     []session.Entry // all messages (unfiltered)
-	agents       []session.Subagent
-	currentAgent session.Subagent
-	agentMsgs    []session.Entry
-	toolCalls    []toolCallItem
+	sessions    []session.Session
+	currentSess session.Session
 
-	// List models (owned here, referenced by SplitPanes)
-	sessionList  list.Model
-	messageList  list.Model
-	agentList    list.Model
-	agentMsgList list.Model
-	toolList     list.Model
+	// List models
+	sessionList list.Model
 
-	// Split panes (each holds a *list.Model pointer + viewport)
-	sessSplit     SplitPane
-	msgSplit      SplitPane
-	agentSplit    SplitPane
-	agentMsgSplit SplitPane
-	toolSplit     SplitPane
+	// Split panes
+	sessSplit SplitPane
 
 	// Session-specific: pinned scroll state
 	sessPreviewPinned bool
-
-	// Detail viewports (full-screen, not split panes)
-	detailVP         viewport.Model
-	agentDetailVP    viewport.Model
-	detailEntry      session.Entry
-	agentDetailEntry session.Entry
-	detailFrom       viewState
-
-	// Message filtering & sorting
-	msgFilter  filterMode
-	msgReverse bool // reverse sort (newest first)
 
 	// Split pane ratio (list width as % of terminal width)
 	splitRatio int
 
 	// Content for clipboard/pager
-	detailContent      string
-	agentDetailContent string
-	copiedMsg          string
+	copiedMsg string
 
 	// Copy mode (detail view)
 	copyModeActive bool
@@ -102,27 +86,140 @@ type App struct {
 
 	// Live tracking
 	lastMsgLoadTime time.Time
-	lastMsgCount    int
 	liveTail        bool // auto-scroll to latest message on tick
-	detailLiveTrack bool // auto-update detail view to latest message
 
-	// Memory view
-	memoryVP   viewport.Model
-	memoryFrom viewState
+	// Mouse state
+	dragResizing   bool
+	lastClickTime  time.Time
+	lastClickY     int
+	breadcrumbSegs []breadcrumbSegment
+
+	// Global stats view
+	globalStatsVP      viewport.Model
+	globalStatsCache   *session.GlobalStats
+	globalStatsLoading bool
+	spinnerFrame       int
+
+	// Session preview mode
+	sessPreviewMode    sessPreview
+	sessStatsCache     *session.SessionStats
+	sessStatsCacheKey  string
+	sessMemoryCache    string // rendered memory content
+	sessMemoryCacheKey string
+	sessTasksCache     string
+	sessTasksCacheKey  string
+
+	// Conversation preview state
+	sessConvEntries    []mergedMsg  // merged conversation messages
+	sessConvCursor     int          // current message cursor
+	sessConvCacheID    string       // session ID for which convEntries are loaded
+	sessConvExpanded   map[int]bool // which messages are expanded
+	sessConvSearching  bool             // typing in preview search
+	sessConvSearchInput textinput.Model // search input for preview
+	sessConvFiltered   []int            // indices into sessConvEntries matching search
+	sessConvFilterTerm string           // applied filter term
+
+	// Group mode: groupFlat=0, groupProject=1, groupTree=2
+	sessGroupMode int
+	liveUpdate    bool // auto-refresh disabled by default
+
+	// Edit file menu
+	editMenu    bool
+	editSess    session.Session
+
+	// Actions menu (x key)
+	actionsMenu bool
+	actionsSess session.Session
+	editChoices []editChoice // available files to edit
+
+	// Move project
+	moveMode      bool
+	moveInput     textinput.Model
+	moveSess      session.Session
+
+	// Worktree creation
+	worktreeMode  bool
+	worktreeInput textinput.Model
+	worktreeSess  session.Session
+
+	// Live modal (overlay on sessions list — captures tmux pane)
+	liveModal       bool
+	liveModalVP     viewport.Model
+	liveModalSess   session.Session
+	liveModalPane   tmuxPane
+	liveModalInput  textinput.Model
+	liveModalTyping bool // input mode active
+
+	// Inline live input (bottom prompt, no modal)
+	liveInputActive bool
+	liveInputModel  textinput.Model
+	liveInputPane   tmuxPane
+
+	// Conversation split view (viewConversation)
+	conv struct {
+		sess     session.Session
+		messages []session.Entry
+		merged   []mergedMsg
+		agents   []session.Subagent
+		items    []convItem
+		split    SplitPane
+		agent    session.Subagent // non-zero when viewing agent conversation
+	}
+	convList list.Model
+
+	// Full-screen message detail (viewMessageFull)
+	msgFull struct {
+		sess        session.Session
+		agent       session.Subagent
+		messages    []session.Entry
+		merged      []mergedMsg
+		agents      []session.Subagent
+		idx         int
+		vp          viewport.Model
+		folds       FoldState
+		content     string
+		allMessages bool // true when showing full conversation (all messages concatenated)
+	}
+
+	// Navigation stack for agent drill-down
+	navStack []navFrame
 }
 
-func NewApp(sessions []session.Session) *App {
+type sessPreview int
+
+const (
+	sessPreviewConversation sessPreview = iota // text-only, expandable
+	sessPreviewStats
+	sessPreviewMemory
+	sessPreviewTasksPlan
+	numSessPreviewModes = 4
+)
+
+// Config holds application configuration from CLI flags.
+type Config struct {
+	TmuxEnabled  bool   // enable tmux integration (I, J, live modal)
+	TmuxAutoLive bool   // auto-enter live session in same tmux window on startup
+	WorktreeDir  string // subdirectory name for worktrees (default ".worktree")
+}
+
+func NewApp(sessions []session.Session, cfg Config) *App {
+	// Set IsLive by matching running Claude processes to sessions.
+	// In tmux: match by session ID in process args, fallback to most recent for path.
+	// Outside tmux: match by project path.
+	markLiveSessions(sessions)
+
+	if cfg.WorktreeDir == "" {
+		cfg.WorktreeDir = ".worktree"
+	}
+
 	a := &App{
 		state:      viewSessions,
 		sessions:   sessions,
+		config:     cfg,
 		splitRatio: 35,
-		msgReverse: true,
 	}
-	a.sessSplit = SplitPane{List: &a.sessionList}
-	a.msgSplit = SplitPane{List: &a.messageList, Show: true, Folds: &FoldState{}}
-	a.agentSplit = SplitPane{List: &a.agentList, Show: true}
-	a.agentMsgSplit = SplitPane{List: &a.agentMsgList, Show: true, Folds: &FoldState{}}
-	a.toolSplit = SplitPane{List: &a.toolList, Folds: &FoldState{}}
+	a.sessSplit = SplitPane{List: &a.sessionList, ItemHeight: 2}
+	a.conv.split = SplitPane{List: &a.convList, Show: true, Folds: &FoldState{}, ItemHeight: 1}
 	return a
 }
 
@@ -135,7 +232,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		a.width = msg.Width
 		a.height = msg.Height
-		a.resizeAll()
+		cmd := a.resizeAll()
+		return a, cmd
+
+	case editorDoneMsg:
 		return a, nil
 
 	case tickMsg:
@@ -143,10 +243,32 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, tea.Batch(cmd, tickCmd())
 
 	case liveTickMsg:
-		if a.liveTail || a.detailLiveTrack {
+		if a.liveModal {
+			a.captureLivePane()
+			return a, liveTickCmd()
+		}
+		if a.liveTail {
 			a.handleLiveTail()
 			return a, liveTickCmd()
 		}
+		return a, nil
+
+	case spinnerTickMsg:
+		if a.globalStatsLoading {
+			a.spinnerFrame = (a.spinnerFrame + 1) % len(spinnerFrames)
+			return a, spinnerTickCmd()
+		}
+		return a, nil
+
+	case globalStatsMsg:
+		stats := session.GlobalStats(msg)
+		a.globalStatsCache = &stats
+		a.globalStatsLoading = false
+		// Switch to global stats view now that data is ready
+		contentH := a.height - 3
+		a.globalStatsVP = viewport.New(a.width, contentH)
+		a.globalStatsVP.SetContent(renderGlobalStats(stats, a.width))
+		a.state = viewGlobalStats
 		return a, nil
 
 	case tea.MouseMsg:
@@ -158,27 +280,38 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, tea.Quit
 		}
 
+		// Live modal intercepts all keys when active
+		if a.liveModal {
+			return a.handleLiveModalKeys(msg)
+		}
+
+		// Inline live input intercepts all keys when active
+		if a.liveInputActive {
+			return a.handleLiveInput(msg)
+		}
+
 		if a.isFiltering() {
-			return a.updateActiveList(msg)
+			m, cmd := a.updateActiveList(msg)
+			a.syncAllFilterVisibility()
+			return m, cmd
+		}
+
+		// Esc clears an applied search filter before doing normal navigation
+		if msg.String() == "esc" && a.hasFilterApplied() {
+			a.resetActiveFilter()
+			a.syncAllFilterVisibility()
+			return a, nil
 		}
 
 		switch a.state {
 		case viewSessions:
 			return a.handleSessionKeys(msg)
-		case viewMessages:
-			return a.handleMessageKeys(msg)
-		case viewDetail:
-			return a.handleDetailKeys(msg)
-		case viewAgents:
-			return a.handleAgentKeys(msg)
-		case viewAgentMessages:
-			return a.handleAgentMsgKeys(msg)
-		case viewAgentDetail:
-			return a.handleAgentDetailKeys(msg)
-		case viewToolCalls:
-			return a.handleToolCallKeys(msg)
-		case viewMemory:
-			return a.handleMemoryKeys(msg)
+		case viewGlobalStats:
+			return a.handleGlobalStatsKeys(msg)
+		case viewConversation:
+			return a.handleConversationKeys(msg)
+		case viewMessageFull:
+			return a.handleMessageFullKeys(msg)
 		}
 	}
 
@@ -194,912 +327,465 @@ func (a *App) View() string {
 
 	switch a.state {
 	case viewSessions:
-		title = titleStyle.Render("CSB — Claude Session Browser")
+		title = a.renderBreadcrumb()
 		content = a.renderSessionSplit()
-		h := "↵open a:agents g:dir m:memory r:resume"
-		if inTmux() {
-			h += " J:jump"
-		}
-		if a.sessSplit.Show {
-			h += " esc:close ←→:focus []:resize"
+		if a.moveMode {
+			help = "  " + a.moveInput.View() + helpStyle.Render("  enter:move esc:cancel")
+		} else if a.worktreeMode {
+			help = "  " + a.worktreeInput.View() + helpStyle.Render("  enter:create esc:cancel")
+		} else if a.sessConvSearching {
+			help = "  " + a.sessConvSearchInput.View() + helpStyle.Render("  enter:apply esc:cancel")
 		} else {
-			h += " →:preview"
+			h := "↵open g:dir e:edit x:actions R:refresh G:group S:stats"
+			if !a.sessSplit.Show {
+				h += " tab:preview →:preview"
+			} else if a.sessSplit.Focus && a.sessPreviewMode == sessPreviewConversation {
+				h += " ↑↓:nav ↵:jump →←:fold f/F:all /:search tab:mode"
+			} else {
+				h += " tab:mode esc:close ←→:focus []:resize"
+			}
+			if a.config.TmuxEnabled && inTmux() {
+				h += " L:live I:input J:jump"
+			}
+			help = formatHelp(h + " /:search q:quit")
 		}
-		help = helpStyle.Render("  " + h + " /:search q:quit")
 
-	case viewMessages:
-		title = a.breadcrumb("Sessions", a.currentSess.ShortID)
-		content = a.renderMsgSplit(&a.msgSplit)
+	case viewGlobalStats:
+		title = a.renderBreadcrumb()
+		content = a.globalStatsVP.View()
+		help = formatHelp("↑↓:scroll esc:back q:quit")
+
+	case viewConversation:
+		title = a.renderBreadcrumb()
+		content = a.renderConvSplit()
 		badges := ""
-		if fl := filterModeLabel(a.msgFilter); fl != "" {
-			badges += fl + "  "
-		}
 		if a.liveTail {
-			badges += liveBadge.Render(a.liveBadgeText()) + "  "
+			badgeStyle := liveBadge
+			if a.currentSess.IsResponding {
+				badgeStyle = busyBadge
+			}
+			badges = badgeStyle.Render(a.liveBadgeText()) + "  "
 		}
-		sortHint := "↑"
-		if a.msgReverse {
-			sortHint = "↓"
+		sp := &a.conv.split
+		h := "↵open c:full e:edit L:live R:refresh"
+		if a.config.TmuxEnabled && inTmux() {
+			h += " I:input J:jump"
 		}
-		h := fmt.Sprintf("↵detail a:agents t:tools m:memory L:live S:sort(%s) /:search", sortHint)
-		if inTmux() {
-			h += " J:jump"
-		}
-		if a.msgSplit.Show {
-			if a.msgSplit.Focus {
+		if sp.Show {
+			if sp.Focus {
 				h += " ↑↓:blocks ←→:fold f/F:all"
 			} else {
-				h += " →:preview"
+				h += " tab:preview →:focus"
 			}
 			h += " esc:close []:resize"
 		} else {
-			h += " →:preview"
+			h += " tab:preview →:preview"
 		}
-		help = badges + helpStyle.Render("  "+h+" /:search esc:back q:quit")
+		help = badges + formatHelp(h+" /:search esc:back q:quit")
 
-	case viewDetail:
-		title = a.breadcrumb("Sessions", a.currentSess.ShortID, roleLabel(a.detailEntry))
-		content = a.detailVP.View()
-		pct := int(a.detailVP.ScrollPercent() * 100)
-		detailBadge := ""
-		if a.detailLiveTrack {
-			detailBadge = liveBadge.Render(a.detailLiveBadgeText()) + "  "
-		}
-		if a.copyModeActive {
-			help = detailBadge + helpStyle.Render(fmt.Sprintf("  ↑↓:move v/sp:select y/↵:copy home/end esc:cancel %d%%", pct))
-		} else {
-			help = detailBadge + helpStyle.Render(fmt.Sprintf("  ↑↓:scroll v:copy y:all o:pager esc:back q:quit %d%%", pct))
-		}
-
-	case viewAgents:
-		title = a.breadcrumb("Sessions", a.currentSess.ShortID, "Agents")
-		content = a.renderAgentSplit()
-		if a.agentSplit.Show {
-			help = helpStyle.Render("  ↵open esc:close ←→:focus []:resize /:search esc:back q:quit")
-		} else {
-			help = helpStyle.Render("  ↵open →:preview /:search esc:back q:quit")
-		}
-
-	case viewAgentMessages:
-		title = a.breadcrumb("Sessions", a.currentSess.ShortID, "Agents", a.currentAgent.ShortID)
-		content = a.renderMsgSplit(&a.agentMsgSplit)
-		agentBadges := ""
-		if a.liveTail {
-			agentBadges = liveBadge.Render(a.liveBadgeText()) + "  "
-		}
-		h := "↵detail t:tools L:live"
-		if inTmux() {
-			h += " J:jump"
-		}
-		if a.agentMsgSplit.Show {
-			if a.agentMsgSplit.Focus {
-				h += " ↑↓:blocks ←→:fold f/F:all"
+	case viewMessageFull:
+		title = a.renderBreadcrumb()
+		content = a.renderMessageFull()
+		if a.msgFull.allMessages {
+			if a.copyModeActive {
+				help = formatHelp("all messages  ↑↓:move v/sp:select y/↵:copy home/end esc:cancel")
 			} else {
-				h += " →:preview"
+				help = formatHelp("all messages  ↑↓:scroll v:copy y:all o:pager esc:back q:quit")
 			}
-			h += " esc:close []:resize"
 		} else {
-			h += " →:preview"
-		}
-		help = agentBadges + helpStyle.Render("  "+h+" /:search esc:back q:quit")
-
-	case viewAgentDetail:
-		title = a.breadcrumb("Sessions", a.currentSess.ShortID, "Agents", a.currentAgent.ShortID, roleLabel(a.agentDetailEntry))
-		content = a.agentDetailVP.View()
-		pct := int(a.agentDetailVP.ScrollPercent() * 100)
-		agentDetailBadge := ""
-		if a.detailLiveTrack {
-			agentDetailBadge = liveBadge.Render(a.detailLiveBadgeText()) + "  "
-		}
-		if a.copyModeActive {
-			help = agentDetailBadge + helpStyle.Render(fmt.Sprintf("  ↑↓:move v/sp:select y/↵:copy home/end esc:cancel %d%%", pct))
-		} else {
-			help = agentDetailBadge + helpStyle.Render(fmt.Sprintf("  ↑↓:scroll v:copy y:all o:pager esc:back q:quit %d%%", pct))
-		}
-
-	case viewToolCalls:
-		src := "Session"
-		if a.currentAgent.ID != "" {
-			src = "Agent " + a.currentAgent.ShortID
-		}
-		title = a.breadcrumb("Sessions", a.currentSess.ShortID, src, "Tools")
-		content = a.renderMsgSplit(&a.toolSplit)
-		h := "↵view"
-		if a.toolSplit.Show {
-			if a.toolSplit.Focus {
-				h += " ↑↓:blocks ←→:fold f/F:all"
+			pos := fmt.Sprintf("#%d/%d", a.msgFull.idx+1, len(a.msgFull.merged))
+			if a.copyModeActive {
+				help = formatHelp(pos + "  ↑↓:move v/sp:select y/↵:copy home/end esc:cancel")
 			} else {
-				h += " →:preview"
+				help = formatHelp(pos + "  ↑↓:blocks ←→:fold n/N:msg f/F:all v:copy y:all o:pager esc:back q:quit")
 			}
-			h += " esc:close []:resize"
-		} else {
-			h += " →:preview"
 		}
-		help = helpStyle.Render("  " + h + " /:search esc:back q:quit")
-
-	case viewMemory:
-		src := "Sessions"
-		if a.memoryFrom == viewMessages {
-			src = a.currentSess.ShortID
-		}
-		title = a.breadcrumb(src, "Memory")
-		content = a.memoryVP.View()
-		pct := int(a.memoryVP.ScrollPercent() * 100)
-		help = helpStyle.Render(fmt.Sprintf("  ↑↓:scroll esc:back q:quit %d%%", pct))
 	}
 
-	// Override help with search hints when filtering
+	// Inline live input prompt
+	if a.liveInputActive {
+		help = "  " + a.liveInputModel.View() + helpStyle.Render("  enter:send esc:cancel")
+	}
+
+	// Override help with filter input + search hints when filtering
 	if a.isFiltering() {
-		help = a.searchHints()
+		val := a.activeFilterValue()
+		prompt := helpKeyStyle.Render("Search: ") + val + blockCursorStyle.Render("▏")
+		help = "  " + prompt + a.searchHints()
+	} else if a.hasFilterApplied() {
+		help = "  " + filterBadge.Render("[filtered]") + " " + help
 	}
 
 	if a.copiedMsg != "" {
 		help += "  " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(a.copiedMsg)
 	}
 
-	titleW := lipgloss.Width(title)
-	if titleW < a.width {
-		title += lipgloss.NewStyle().Background(colorPrimary).Render(strings.Repeat(" ", a.width-titleW))
+	screen := title + "\n" + content + "\n" + help
+
+	// Overlay live modal if active
+	if a.liveModal {
+		screen = a.overlayModal(screen)
 	}
 
-	return title + "\n" + content + "\n" + help
+	return screen
+}
+
+// overlayModal places the modal box centered over the base screen.
+func (a *App) overlayModal(base string) string {
+	modal := a.renderLiveModal()
+	if modal == "" {
+		return base
+	}
+	return lipgloss.Place(a.width, a.height, lipgloss.Center, lipgloss.Center, modal,
+		lipgloss.WithWhitespaceChars(" "),
+		lipgloss.WithWhitespaceForeground(lipgloss.Color("#000000")),
+	)
 }
 
 // --- Key handlers ---
 
 func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
+	sp := &a.sessSplit
+	key := msg.String()
+
+	// Clear actions menu on any unrelated key
+	if a.actionsMenu {
+		return a.handleActionsMenu(key)
+	}
+
+	// Edit menu: pick file to open
+	if a.editMenu {
+		return a.handleEditMenu(key)
+	}
+
+	// While conv search is active, route all keys to it
+	if a.sessConvSearching {
+		return a.handleConvSearch(msg)
+	}
+
+	// Move mode: text input for new project path
+	if a.moveMode {
+		return a.handleMoveInput(msg)
+	}
+
+	// Worktree mode: text input for worktree name
+	if a.worktreeMode {
+		return a.handleWorktreeInput(msg)
+	}
+
+	// View-specific keys
+	switch key {
 	case "q":
 		return a, tea.Quit
 	case "esc":
-		if a.sessSplit.Show {
+		if sp.Show {
+			// If in a non-default preview mode, go back to messages first
+			if a.sessPreviewMode != sessPreviewConversation {
+				a.sessPreviewMode = sessPreviewConversation
+				sp.CacheKey = ""
+				sp.Focus = false
+				return a, nil
+			}
 			idx := a.sessionList.Index()
-			a.sessSplit.Show = false
-			a.sessSplit.Focus = false
-			contentH := a.height - 3
-			a.sessionList.SetSize(a.sessSplit.ListWidth(a.width, a.splitRatio), contentH)
+			sp.Show = false
+			sp.Focus = false
+			contentH := max(a.height-3, 1)
+			a.sessionList.SetSize(sp.ListWidth(a.width, a.splitRatio), contentH)
 			a.sessionList.Select(idx)
 			return a, nil
 		}
 		return a, nil
 	case "enter":
+		// If conversation preview is focused, jump to the selected message
+		if sp.Focus && sp.Show && a.sessPreviewMode == sessPreviewConversation && len(a.sessConvEntries) > 0 {
+			return a.jumpToConvMessage()
+		}
 		item, ok := a.sessionList.SelectedItem().(sessionItem)
 		if !ok {
 			return a, nil
 		}
 		a.currentSess = item.sess
-		return a, a.loadSessionMessages()
-	case "a":
-		item, ok := a.sessionList.SelectedItem().(sessionItem)
-		if !ok {
-			return a, nil
-		}
-		return a.openAgents(item.sess)
+		return a, a.openConversation(item.sess)
 	case "g":
 		item, ok := a.sessionList.SelectedItem().(sessionItem)
 		if !ok {
 			return a, nil
 		}
 		return a.openProjectDir(item.sess.ProjectPath)
-	case "m":
+	case "x":
 		item, ok := a.sessionList.SelectedItem().(sessionItem)
 		if !ok {
 			return a, nil
 		}
-		return a.openMemory(item.sess, viewSessions)
-	case "r":
+		a.actionsMenu = true
+		a.actionsSess = item.sess
+		a.copiedMsg = "Actions: d:delete  m:move  w:worktree  r:resume"
+		return a, nil
+	case "I":
+		if !a.config.TmuxEnabled {
+			return a, nil
+		}
 		item, ok := a.sessionList.SelectedItem().(sessionItem)
 		if !ok {
 			return a, nil
 		}
-		return a.resumeSession(item.sess)
+		return a.sendInputToLive(item.sess.ProjectPath, item.sess.ID)
 	case "J":
+		if !a.config.TmuxEnabled {
+			return a, nil
+		}
 		item, ok := a.sessionList.SelectedItem().(sessionItem)
 		if !ok {
 			return a, nil
 		}
-		return a.jumpToTmuxPane(item.sess.ProjectPath)
-	case "tab":
-		if !a.sessSplit.Show {
+		return a.jumpToTmuxPane(item.sess.ProjectPath, item.sess.ID)
+	case "L":
+		if !a.config.TmuxEnabled {
 			return a, nil
 		}
-		a.sessSplit.Focus = !a.sessSplit.Focus
+		item, ok := a.sessionList.SelectedItem().(sessionItem)
+		if !ok {
+			return a, nil
+		}
+		return a.openLiveModal(item.sess)
+	case "e":
+		item, ok := a.sessionList.SelectedItem().(sessionItem)
+		if !ok {
+			return a, nil
+		}
+		return a.openEditMenu(item.sess)
+	case "G":
+		a.sessGroupMode = (a.sessGroupMode + 1) % 3
+		a.rebuildSessionList()
+		return a, nil
+	case "R":
+		cmd := a.doRefresh()
+		a.copiedMsg = "Refreshed"
+		return a, cmd
+	case "S":
+		return a.openGlobalStats()
+	// Session has custom tab/shift+tab (mode cycling)
+	case "tab":
+		if !sp.Show {
+			idx := a.sessionList.Index()
+			sp.Show = true
+			sp.CacheKey = ""
+			contentH := a.height - 3
+			a.sessionList.SetSize(sp.ListWidth(a.width, a.splitRatio), contentH)
+			a.sessionList.Select(idx)
+		} else {
+			a.cycleSessionPreviewMode()
+		}
+		return a, nil
+	case "shift+tab":
+		if sp.Show {
+			a.cycleSessionPreviewModeReverse()
+		}
 		return a, nil
 	case "left":
-		if a.sessSplit.Focus && a.sessSplit.Show {
-			a.sessSplit.Focus = false
-		}
-		return a, nil
-	case "right":
-		if !a.sessSplit.Show {
+		if sp.Focus && sp.Show && a.sessPreviewMode == sessPreviewConversation {
+			// Delegate to conversation handler (collapse), fall through below
+		} else if sp.Focus && sp.Show {
+			sp.Focus = false
+			return a, nil
+		} else if !sp.Focus && sp.Show {
 			idx := a.sessionList.Index()
-			a.sessSplit.Show = true
-			a.sessSplit.CacheKey = ""
-			contentH := a.height - 3
-			a.sessionList.SetSize(a.sessSplit.ListWidth(a.width, a.splitRatio), contentH)
+			sp.Show = false
+			contentH := max(a.height-3, 1)
+			a.sessionList.SetSize(sp.ListWidth(a.width, a.splitRatio), contentH)
 			a.sessionList.Select(idx)
+			return a, nil
 		}
-		a.sessSplit.Focus = true
-		return a, nil
+	case "right":
+		if sp.Focus && sp.Show && a.sessPreviewMode == sessPreviewConversation {
+			// Delegate to conversation handler (expand), fall through below
+		} else {
+			if !sp.Show {
+				idx := a.sessionList.Index()
+				sp.Show = true
+				sp.CacheKey = ""
+				contentH := max(a.height-3, 1)
+				a.sessionList.SetSize(sp.ListWidth(a.width, a.splitRatio), contentH)
+				a.sessionList.Select(idx)
+			}
+			sp.Focus = true
+			return a, nil
+		}
 	case "[":
-		if a.sessSplit.Show {
-			a.adjustSplitRatio(5)
+		if sp.Show {
+			a.adjustSplitRatio(-5) // preview larger
 		}
 		return a, nil
 	case "]":
-		if a.sessSplit.Show {
-			a.adjustSplitRatio(-5)
+		if sp.Show {
+			a.adjustSplitRatio(5) // preview smaller
 		}
 		return a, nil
 	}
 
-	if a.sessSplit.Focus && a.sessSplit.Show {
-		switch msg.String() {
-		case "/":
-			a.sessSplit.Focus = false
-			cmd := startListSearch(&a.sessionList, "")
-			return a, cmd
-		case "down", "up", "pgdown", "pgup", "home", "end":
-			scrollPreview(&a.sessSplit.Preview, msg.String())
-			a.sessPreviewPinned = !a.sessPreviewAtBottom()
-			return a, nil
+	// Focused preview: custom conversation nav or simple scroll
+	// up/down are NOT consumed here — they fall through to navigate the session list.
+	if sp.Focus && sp.Show {
+		if a.sessPreviewMode == sessPreviewConversation && len(a.sessConvEntries) > 0 {
+			visible := a.convVisibleEntries()
+			switch key {
+			case "/":
+				a.startConvSearch()
+				return a, nil
+			case "esc":
+				if a.sessConvFilterTerm != "" {
+					a.clearConvFilter()
+					return a, nil
+				}
+			case "up":
+				if a.sessConvCursor > 0 {
+					previewW := max(a.width-sp.ListWidth(a.width, a.splitRatio)-1, 1)
+					curLine := convCursorLine(visible, a.sessConvCursor, a.sessConvExpanded, previewW)
+					vpTop := sp.Preview.YOffset
+					vpBottom := vpTop + sp.Preview.Height
+					if curLine < vpTop || curLine >= vpBottom {
+						// Cursor off-screen: snap to nearest visible edge
+						if curLine >= vpBottom {
+							a.sessConvCursor = convLastVisible(visible, a.sessConvExpanded, previewW, vpTop, vpBottom)
+						} else {
+							a.sessConvCursor = convFirstVisible(visible, a.sessConvExpanded, previewW, vpTop, vpBottom)
+						}
+					} else {
+						a.sessConvCursor--
+					}
+					a.sessPreviewPinned = true
+					a.refreshConvPreview()
+				}
+				return a, nil
+			case "down":
+				if a.sessConvCursor < len(visible)-1 {
+					previewW := max(a.width-sp.ListWidth(a.width, a.splitRatio)-1, 1)
+					curLine := convCursorLine(visible, a.sessConvCursor, a.sessConvExpanded, previewW)
+					vpTop := sp.Preview.YOffset
+					vpBottom := vpTop + sp.Preview.Height
+					if curLine < vpTop || curLine >= vpBottom {
+						// Cursor off-screen: snap to nearest visible edge
+						if curLine < vpTop {
+							a.sessConvCursor = convFirstVisible(visible, a.sessConvExpanded, previewW, vpTop, vpBottom)
+						} else {
+							a.sessConvCursor = convLastVisible(visible, a.sessConvExpanded, previewW, vpTop, vpBottom)
+						}
+					} else {
+						a.sessConvCursor++
+					}
+					a.refreshConvPreview()
+				}
+				// Pin unless at the very end
+				a.sessPreviewPinned = a.sessConvCursor < len(visible)-1
+				return a, nil
+			case "enter":
+				return a.jumpToConvMessage()
+			case "right":
+				if a.sessConvExpanded == nil {
+					a.sessConvExpanded = make(map[int]bool)
+				}
+				a.sessConvExpanded[a.sessConvCursor] = true
+				a.refreshConvPreview()
+				return a, nil
+			case "left":
+				if a.sessConvExpanded != nil && a.sessConvExpanded[a.sessConvCursor] {
+					delete(a.sessConvExpanded, a.sessConvCursor)
+					a.refreshConvPreview()
+				} else {
+					sp.Focus = false
+				}
+				return a, nil
+			case "f":
+				a.sessConvExpanded = nil
+				a.refreshConvPreview()
+				return a, nil
+			case "F":
+				a.sessConvExpanded = make(map[int]bool)
+				for i := range visible {
+					a.sessConvExpanded[i] = true
+				}
+				a.refreshConvPreview()
+				return a, nil
+			case "pgdown":
+				scrollPreview(&sp.Preview, "pgdown")
+				a.sessPreviewPinned = !a.sessPreviewAtBottom()
+				return a, nil
+			case "pgup":
+				scrollPreview(&sp.Preview, "pgup")
+				a.sessPreviewPinned = true
+				return a, nil
+			case "home":
+				a.sessConvCursor = 0
+				a.sessPreviewPinned = true
+				a.refreshConvPreview()
+				return a, nil
+			case "end":
+				a.sessConvCursor = len(visible) - 1
+				a.sessPreviewPinned = false
+				a.refreshConvPreview()
+				return a, nil
+			}
+		} else {
+			switch key {
+			case "/":
+				sp.Focus = false
+				return a, startListSearch(&a.sessionList)
+			case "up", "down", "pgdown", "pgup", "home", "end":
+				scrollPreview(&sp.Preview, key)
+				a.sessPreviewPinned = !a.sessPreviewAtBottom()
+				return a, nil
+			}
 		}
 	}
 
-	// Auto-trigger search on letter/digit keys
-	if !a.sessSplit.Focus && isSearchTrigger(msg.String()) {
-		cmd := startListSearch(&a.sessionList, msg.String())
-		return a, cmd
-	}
-
-	// Page boundary: pgup on first page → first item, pgdown on last → last item
-	if !a.sessSplit.Focus && listPageEdge(&a.sessionList, msg.String()) {
+	// List boundary (up/down always navigate list, scroll preview at edges)
+	if !sp.Focus && sp.HandleListBoundary(key) {
 		a.updateSessionPreview()
 		return a, nil
 	}
 
+	// Default list update
+	oldIdx := a.sessionList.Index()
 	m, cmd := a.updateSessionList(msg)
+	newIdx := a.sessionList.Index()
+	if sp.Show && oldIdx == newIdx {
+		switch key {
+		case "down", "up", "pgdown", "pgup":
+			scrollPreview(&sp.Preview, key)
+			return a, nil
+		}
+	}
 	a.updateSessionPreview()
 	return m, cmd
-}
-
-func (a *App) handleMessageKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	sp := &a.msgSplit
-
-	switch msg.String() {
-	case "q":
-		return a, tea.Quit
-	case "esc":
-		if sp.Show {
-			idx := a.messageList.Index()
-			sp.Show = false
-			sp.Focus = false
-			contentH := a.height - 3
-			a.messageList.SetSize(sp.ListWidth(a.width, a.splitRatio), contentH)
-			a.messageList.Select(idx)
-			return a, nil
-		}
-		a.msgFilter = filterNone
-		a.liveTail = false
-		a.state = viewSessions
-		return a, nil
-	case "enter":
-		item, ok := a.messageList.SelectedItem().(messageItem)
-		if !ok {
-			return a, nil
-		}
-		// When preview focused on a Task block, jump to the agent
-		if sp.Focus && sp.Folds != nil {
-			bc := sp.Folds.BlockCursor
-			entry := sp.Folds.Entry
-			if bc >= 0 && bc < len(entry.Content) {
-				block := entry.Content[bc]
-				if block.Type == "tool_use" && block.ToolName == "Task" {
-					if agent, found := a.findAgentForMessage(entry); found {
-						return a.openAgentMessages(agent)
-					}
-				}
-			}
-		}
-		return a.openDetail(item.entry, viewMessages)
-	case "a":
-		return a.openAgents(a.currentSess)
-	case "t":
-		return a.openToolCalls(a.messages, "")
-	case "g":
-		return a.openProjectDir(a.currentSess.ProjectPath)
-	case "m":
-		return a.openMemory(a.currentSess, viewMessages)
-	case "J":
-		return a.jumpToTmuxPane(a.currentSess.ProjectPath)
-	case "L":
-		return a.toggleLiveTail()
-	case "S":
-		a.msgReverse = !a.msgReverse
-		curIdx := a.messageList.Index()
-		a.applyMessageFilter()
-		// Flip cursor position to track the same logical position
-		items := a.messageList.Items()
-		newIdx := len(items) - 1 - curIdx
-		if newIdx >= 0 && newIdx < len(items) {
-			a.messageList.Select(newIdx)
-		}
-		if a.msgReverse {
-			a.copiedMsg = "Sort: newest first"
-		} else {
-			a.copiedMsg = "Sort: oldest first"
-		}
-		return a, nil
-	case "tab":
-		if !sp.Show {
-			return a, nil
-		}
-		sp.Focus = !sp.Focus
-		if sp.Focus && a.liveTail {
-			if a.isAtNewest(&a.messageList) {
-				a.snapListToEnd()
-			} else {
-				a.refreshMsgPreview(sp)
-			}
-		} else if sp.Folds != nil && sp.Folds.Collapsed != nil {
-			a.refreshMsgPreview(sp)
-		}
-		return a, nil
-	case "left":
-		if !sp.Focus {
-			return a, nil // no-op when list focused
-		}
-		// When preview focused, fall through to fold handling below
-	case "right":
-		if !sp.Focus {
-			// Open and/or focus preview
-			if !sp.Show {
-				idx := a.messageList.Index()
-				sp.Show = true
-				sp.CacheKey = ""
-				contentH := a.height - 3
-				a.messageList.SetSize(sp.ListWidth(a.width, a.splitRatio), contentH)
-				a.messageList.Select(idx)
-			}
-			sp.Focus = true
-			if a.liveTail {
-				if a.isAtNewest(&a.messageList) {
-					a.snapListToEnd()
-				} else {
-					a.refreshMsgPreview(sp)
-				}
-			} else {
-				a.refreshMsgPreview(sp)
-			}
-			return a, nil
-		}
-		// When preview focused, fall through to fold handling below
-	case "[":
-		if sp.Show {
-			a.adjustSplitRatio(5)
-		}
-		return a, nil
-	case "]":
-		if sp.Show {
-			a.adjustSplitRatio(-5)
-		}
-		return a, nil
-	}
-
-	if sp.Focus && sp.Show {
-		// Search from preview: unfocus and start search
-		if msg.String() == "/" {
-			sp.Focus = false
-			cmd := startListSearch(&a.messageList, "")
-			return a, cmd
-		}
-		// Block cursor navigation (up/down/left/right/f/F) handled first
-		if sp.Folds != nil {
-			result := sp.Folds.HandleKey(msg.String())
-			if result == foldHandled {
-				a.refreshMsgPreview(sp)
-				sp.ScrollToBlock()
-				return a, nil
-			}
-			if result == foldSwitchToList {
-				sp.Focus = false
-				return a, nil
-			}
-		}
-		if sp.HandlePreviewScroll(msg.String()) {
-			return a, nil
-		}
-	}
-
-	// Auto-trigger search on letter/digit keys (skip keys used for actions)
-	if !sp.Focus && isSearchTrigger(msg.String()) {
-		switch msg.String() {
-		case "a", "t", "g", "p", "q", "r", "J", "L", "S":
-			// handled above
-		default:
-			cmd := startListSearch(&a.messageList, msg.String())
-			return a, cmd
-		}
-	}
-
-	// Page boundary: pgup on first page → first item, pgdown on last → last item
-	if !sp.Focus && listPageEdge(&a.messageList, msg.String()) {
-		if sp.Show {
-			a.updateMsgPreview(sp)
-		}
-		return a, nil
-	}
-
-	m, cmd := a.updateMessageList(msg)
-	if sp.Show {
-		a.updateMsgPreview(sp)
-	}
-	return m, cmd
-}
-
-func (a *App) handleDetailKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if a.copyModeActive {
-		return a.handleCopyModeKeys(msg)
-	}
-	switch msg.String() {
-	case "q":
-		return a, tea.Quit
-	case "esc":
-		wasTracking := a.detailLiveTrack
-		a.detailLiveTrack = false
-		switch a.detailFrom {
-		case viewToolCalls:
-			a.state = viewToolCalls
-		case viewAgentMessages:
-			a.state = viewAgentMessages
-		case viewAgents:
-			a.state = viewAgents
-		default:
-			a.state = viewMessages
-			if wasTracking {
-				a.applyMessageFilter()
-				items := a.messageList.Items()
-				if len(items) > 0 {
-					if a.msgReverse {
-						a.messageList.Select(0)
-					} else {
-						a.messageList.Select(len(items) - 1)
-					}
-				}
-			}
-		}
-		return a, nil
-	case "v":
-		a.enterCopyMode()
-		return a, nil
-	case "y":
-		copyToClipboard(renderPlainMessage(a.detailEntry))
-		a.copiedMsg = "Copied!"
-		return a, nil
-	case "o":
-		return a, openInPager(a.detailContent)
-	}
-	var cmd tea.Cmd
-	a.detailVP, cmd = a.detailVP.Update(msg)
-	return a, cmd
-}
-
-func (a *App) handleAgentKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "q":
-		return a, tea.Quit
-	case "esc":
-		if a.agentSplit.Show {
-			idx := a.agentList.Index()
-			a.agentSplit.Show = false
-			a.agentSplit.Focus = false
-			contentH := max(a.height-3, 1)
-			a.agentList.SetSize(a.agentSplit.ListWidth(a.width, a.splitRatio), contentH)
-			a.agentList.Select(idx)
-			return a, nil
-		}
-		a.state = viewMessages
-		return a, nil
-	case "enter":
-		item, ok := a.agentList.SelectedItem().(agentItem)
-		if !ok {
-			return a, nil
-		}
-		return a.openAgentMessages(item.agent)
-	case "tab":
-		if !a.agentSplit.Show {
-			return a, nil
-		}
-		a.agentSplit.Focus = !a.agentSplit.Focus
-		return a, nil
-	case "left":
-		if a.agentSplit.Focus && a.agentSplit.Show {
-			a.agentSplit.Focus = false
-		}
-		return a, nil
-	case "right":
-		if !a.agentSplit.Show {
-			idx := a.agentList.Index()
-			a.agentSplit.Show = true
-			a.agentSplit.CacheKey = ""
-			contentH := max(a.height-3, 1)
-			a.agentList.SetSize(a.agentSplit.ListWidth(a.width, a.splitRatio), contentH)
-			a.agentList.Select(idx)
-		}
-		a.agentSplit.Focus = true
-		return a, nil
-	case "[":
-		if a.agentSplit.Show {
-			a.adjustSplitRatio(5)
-		}
-		return a, nil
-	case "]":
-		if a.agentSplit.Show {
-			a.adjustSplitRatio(-5)
-		}
-		return a, nil
-	}
-
-	if a.agentSplit.Focus && a.agentSplit.Show {
-		switch msg.String() {
-		case "/":
-			a.agentSplit.Focus = false
-			cmd := startListSearch(&a.agentList, "")
-			return a, cmd
-		case "down", "up", "pgdown", "pgup", "home", "end":
-			scrollPreview(&a.agentSplit.Preview, msg.String())
-			return a, nil
-		}
-	}
-
-	// Auto-trigger search on letter/digit keys
-	if !a.agentSplit.Focus && isSearchTrigger(msg.String()) {
-		switch msg.String() {
-		case "p", "q":
-			// handled above
-		default:
-			cmd := startListSearch(&a.agentList, msg.String())
-			return a, cmd
-		}
-	}
-
-	// Page boundary
-	if !a.agentSplit.Focus && listPageEdge(&a.agentList, msg.String()) {
-		if a.agentSplit.Show {
-			a.updateAgentPreview()
-		}
-		return a, nil
-	}
-
-	m, cmd := a.updateAgentList(msg)
-	if a.agentSplit.Show {
-		a.updateAgentPreview()
-	}
-	return m, cmd
-}
-
-func (a *App) handleAgentMsgKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	sp := &a.agentMsgSplit
-
-	switch msg.String() {
-	case "q":
-		return a, tea.Quit
-	case "esc":
-		if sp.Show {
-			idx := a.agentMsgList.Index()
-			sp.Show = false
-			sp.Focus = false
-			contentH := a.height - 3
-			a.agentMsgList.SetSize(sp.ListWidth(a.width, a.splitRatio), contentH)
-			a.agentMsgList.Select(idx)
-			return a, nil
-		}
-		a.liveTail = false
-		a.state = viewAgents
-		return a, nil
-	case "enter":
-		item, ok := a.agentMsgList.SelectedItem().(messageItem)
-		if !ok {
-			return a, nil
-		}
-		return a.openAgentDetail(item.entry)
-	case "t":
-		return a.openToolCalls(a.agentMsgs, a.currentAgent.ShortID)
-	case "J":
-		return a.jumpToTmuxPane(a.currentSess.ProjectPath)
-	case "L":
-		return a.toggleLiveTail()
-	case "tab":
-		if !sp.Show {
-			return a, nil
-		}
-		sp.Focus = !sp.Focus
-		if sp.Focus && a.liveTail {
-			items := a.agentMsgList.Items()
-			if a.agentMsgList.Index() >= len(items)-1 {
-				a.snapListToEnd()
-			} else {
-				a.refreshMsgPreview(sp)
-			}
-		} else if sp.Folds != nil && sp.Folds.Collapsed != nil {
-			a.refreshMsgPreview(sp)
-		}
-		return a, nil
-	case "left":
-		if !sp.Focus {
-			return a, nil
-		}
-		// When preview focused, fall through to fold handling below
-	case "right":
-		if !sp.Focus {
-			if !sp.Show {
-				idx := a.agentMsgList.Index()
-				sp.Show = true
-				sp.CacheKey = ""
-				contentH := a.height - 3
-				a.agentMsgList.SetSize(sp.ListWidth(a.width, a.splitRatio), contentH)
-				a.agentMsgList.Select(idx)
-			}
-			sp.Focus = true
-			if a.liveTail {
-				items := a.agentMsgList.Items()
-				if a.agentMsgList.Index() >= len(items)-1 {
-					a.snapListToEnd()
-				} else {
-					a.refreshMsgPreview(sp)
-				}
-			} else {
-				a.refreshMsgPreview(sp)
-			}
-			return a, nil
-		}
-		// When preview focused, fall through to fold handling below
-	case "[":
-		if sp.Show {
-			a.adjustSplitRatio(5)
-		}
-		return a, nil
-	case "]":
-		if sp.Show {
-			a.adjustSplitRatio(-5)
-		}
-		return a, nil
-	}
-
-	if sp.Focus && sp.Show {
-		// Search from preview: unfocus and start search
-		if msg.String() == "/" {
-			sp.Focus = false
-			cmd := startListSearch(&a.agentMsgList, "")
-			return a, cmd
-		}
-		// Block cursor navigation (up/down/left/right/f/F) handled first
-		if sp.Folds != nil {
-			result := sp.Folds.HandleKey(msg.String())
-			if result == foldHandled {
-				a.refreshMsgPreview(sp)
-				sp.ScrollToBlock()
-				return a, nil
-			}
-			if result == foldSwitchToList {
-				sp.Focus = false
-				return a, nil
-			}
-		}
-		if sp.HandlePreviewScroll(msg.String()) {
-			return a, nil
-		}
-	}
-
-	// Auto-trigger search on letter/digit keys
-	if !sp.Focus && isSearchTrigger(msg.String()) {
-		switch msg.String() {
-		case "t", "p", "q", "J", "L":
-			// handled above
-		default:
-			cmd := startListSearch(&a.agentMsgList, msg.String())
-			return a, cmd
-		}
-	}
-
-	// Page boundary
-	if !sp.Focus && listPageEdge(&a.agentMsgList, msg.String()) {
-		if sp.Show {
-			a.updateMsgPreview(sp)
-		}
-		return a, nil
-	}
-
-	m, cmd := a.updateAgentMsgList(msg)
-	if sp.Show {
-		a.updateMsgPreview(sp)
-	}
-	return m, cmd
-}
-
-func (a *App) handleAgentDetailKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if a.copyModeActive {
-		return a.handleCopyModeKeys(msg)
-	}
-	switch msg.String() {
-	case "q":
-		return a, tea.Quit
-	case "esc":
-		wasTracking := a.detailLiveTrack
-		a.detailLiveTrack = false
-		a.state = viewAgentMessages
-		if wasTracking {
-			merged := mergeConversationTurns(a.agentMsgs)
-			contentH := a.height - 3
-			a.agentMsgList = newMessageList(merged, a.agentMsgSplit.ListWidth(a.width, a.splitRatio), contentH)
-			items := a.agentMsgList.Items()
-			if len(items) > 0 {
-				a.agentMsgList.Select(len(items) - 1)
-			}
-		}
-		return a, nil
-	case "v":
-		a.enterCopyMode()
-		return a, nil
-	case "y":
-		copyToClipboard(renderPlainMessage(a.agentDetailEntry))
-		a.copiedMsg = "Copied!"
-		return a, nil
-	case "o":
-		return a, openInPager(a.agentDetailContent)
-	}
-	var cmd tea.Cmd
-	a.agentDetailVP, cmd = a.agentDetailVP.Update(msg)
-	return a, cmd
-}
-
-func (a *App) handleMemoryKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "q":
-		return a, tea.Quit
-	case "esc":
-		a.state = a.memoryFrom
-		return a, nil
-	}
-	var cmd tea.Cmd
-	a.memoryVP, cmd = a.memoryVP.Update(msg)
-	return a, cmd
-}
-
-func (a *App) handleToolCallKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	sp := &a.toolSplit
-
-	switch msg.String() {
-	case "q":
-		return a, tea.Quit
-	case "esc":
-		if sp.Show {
-			idx := a.toolList.Index()
-			sp.Show = false
-			sp.Focus = false
-			contentH := a.height - 3
-			a.toolList.SetSize(sp.ListWidth(a.width, a.splitRatio), contentH)
-			a.toolList.Select(idx)
-			return a, nil
-		}
-		if a.currentAgent.ID != "" {
-			a.state = viewAgentMessages
-		} else {
-			a.state = viewMessages
-		}
-		return a, nil
-	case "enter":
-		item, ok := a.toolList.SelectedItem().(toolCallItem)
-		if !ok {
-			return a, nil
-		}
-		// For Task tool calls, jump to agent messages
-		if item.toolName == "Task" {
-			if agent, found := a.findAgentForMessage(item.entry); found {
-				return a.openAgentMessages(agent)
-			}
-		}
-		return a.openDetail(item.entry, viewToolCalls)
-	case "tab":
-		if !sp.Show {
-			return a, nil
-		}
-		sp.Focus = !sp.Focus
-		if sp.Focus && sp.Folds != nil && sp.Folds.Collapsed != nil {
-			a.refreshMsgPreview(sp)
-		}
-		return a, nil
-	case "left":
-		if !sp.Focus {
-			return a, nil
-		}
-		// When preview focused, fall through to fold handling below
-	case "right":
-		if !sp.Focus {
-			if !sp.Show {
-				idx := a.toolList.Index()
-				sp.Show = true
-				sp.CacheKey = ""
-				contentH := a.height - 3
-				a.toolList.SetSize(sp.ListWidth(a.width, a.splitRatio), contentH)
-				a.toolList.Select(idx)
-			}
-			sp.Focus = true
-			a.refreshMsgPreview(sp)
-			return a, nil
-		}
-		// When preview focused, fall through to fold handling below
-	case "[":
-		if sp.Show {
-			a.adjustSplitRatio(5)
-		}
-		return a, nil
-	case "]":
-		if sp.Show {
-			a.adjustSplitRatio(-5)
-		}
-		return a, nil
-	}
-
-	if sp.Focus && sp.Show {
-		// Search from preview: unfocus and start search
-		if msg.String() == "/" {
-			sp.Focus = false
-			cmd := startListSearch(&a.toolList, "")
-			return a, cmd
-		}
-		if sp.Folds != nil {
-			result := sp.Folds.HandleKey(msg.String())
-			if result == foldHandled {
-				a.refreshMsgPreview(sp)
-				sp.ScrollToBlock()
-				return a, nil
-			}
-			if result == foldSwitchToList {
-				sp.Focus = false
-				return a, nil
-			}
-		}
-		if sp.HandlePreviewScroll(msg.String()) {
-			return a, nil
-		}
-	}
-
-	if listPageEdge(&a.toolList, msg.String()) {
-		if sp.Show {
-			a.updateToolPreview(sp)
-		}
-		return a, nil
-	}
-
-	// Auto-trigger search on letter/digit keys
-	if !sp.Focus && isSearchTrigger(msg.String()) {
-		switch msg.String() {
-		case "q":
-			// handled above
-		default:
-			cmd := startListSearch(&a.toolList, msg.String())
-			return a, cmd
-		}
-	}
-
-	if a.listReady(&a.toolList) {
-		var cmd tea.Cmd
-		a.toolList, cmd = a.toolList.Update(msg)
-		if sp.Show {
-			a.updateToolPreview(sp)
-		}
-		return a, cmd
-	}
-	return a, nil
 }
 
 // --- Actions ---
 
 func (a *App) openProjectDir(projectPath string) (tea.Model, tea.Cmd) {
 	if projectPath == "" {
+		a.copiedMsg = "no project path"
 		return a, nil
 	}
+	if _, err := os.Stat(projectPath); os.IsNotExist(err) {
+		a.copiedMsg = "dir not found"
+		return a, nil
+	}
+
+	// In tmux: open a split pane at the project path, keep CSB running
+	if inTmux() {
+		shell := os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/bash"
+		}
+		cmd := "cd " + shellQuote(projectPath) + " && " + shell
+		err := exec.Command("tmux", "split-window", "-h", "-l", "50%", cmd).Run()
+		if err != nil {
+			a.copiedMsg = "tmux split failed"
+		}
+		return a, nil
+	}
+
+	// Non-tmux: take over CSB with a shell
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "/bin/bash"
@@ -1111,65 +797,222 @@ func (a *App) openProjectDir(projectPath string) (tea.Model, tea.Cmd) {
 	})
 }
 
-func (a *App) openMemory(sess session.Session, from viewState) (tea.Model, tea.Cmd) {
-	if sess.ProjectPath == "" {
+func (a *App) openGlobalStats() (tea.Model, tea.Cmd) {
+	if a.globalStatsCache != nil {
+		// Already computed, reuse
+		contentH := a.height - 3
+		a.globalStatsVP = viewport.New(a.width, contentH)
+		a.globalStatsVP.SetContent(renderGlobalStats(*a.globalStatsCache, a.width))
+		a.state = viewGlobalStats
 		return a, nil
 	}
 
-	home, _ := os.UserHomeDir()
-	var sb strings.Builder
+	a.globalStatsLoading = true
+	a.spinnerFrame = 0
+	// Stay on current view while scanning — loading shows in title bar
 
-	// 1. Todos from session
-	if len(sess.Todos) > 0 {
-		sb.WriteString(dimStyle.Render("── Todos ──"))
-		sb.WriteString("\n\n")
-		for _, t := range sess.Todos {
-			icon := "○"
-			style := dimStyle
-			switch t.Status {
-			case "completed":
-				icon = "✓"
-				style = lipgloss.NewStyle().Foreground(colorAccent)
-			case "in_progress":
-				icon = "◉"
-				style = lipgloss.NewStyle().Foreground(colorAssistant)
-			}
-			sb.WriteString(style.Render(fmt.Sprintf("  %s %s", icon, t.Content)))
-			sb.WriteString("\n")
-		}
-		sb.WriteString("\n")
+	sessions := a.sessions
+	return a, tea.Batch(
+		spinnerTickCmd(),
+		func() tea.Msg {
+			return globalStatsMsg(session.AggregateStats(sessions))
+		},
+	)
+}
+
+func (a *App) handleGlobalStatsKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q":
+		return a, tea.Quit
+	case "esc":
+		a.state = viewSessions
+		return a, nil
+	}
+	var cmd tea.Cmd
+	a.globalStatsVP, cmd = a.globalStatsVP.Update(msg)
+	return a, cmd
+}
+
+// --- Live Modal ---
+
+func (a *App) openLiveModal(sess session.Session) (tea.Model, tea.Cmd) {
+	if !sess.IsLive {
+		a.copiedMsg = "not a live session"
+		return a, nil
+	}
+	pane, found := findTmuxPane(sess.ProjectPath, sess.ID)
+	if !found {
+		a.copiedMsg = "tmux pane not found"
+		return a, nil
+	}
+	a.liveModal = true
+	a.liveModalSess = sess
+	a.liveModalPane = pane
+	modalW := a.liveModalWidth()
+	modalH := a.liveModalHeight()
+	a.liveModalVP = viewport.New(modalW-2, modalH-2)
+	a.captureLivePane()
+	a.liveModalVP.GotoBottom()
+	return a, liveTickCmd()
+}
+
+func (a *App) closeLiveModal() {
+	a.liveModal = false
+}
+
+func (a *App) captureLivePane() {
+	content, err := tmuxCapturePane(a.liveModalPane)
+	if err != nil {
+		return
+	}
+	wasAtBottom := vpAtBottom(&a.liveModalVP)
+	a.liveModalVP.SetContent(content)
+	if wasAtBottom {
+		a.liveModalVP.GotoBottom()
+	}
+	// Update responding state for modal title/border color
+	info, err := os.Stat(a.liveModalSess.FilePath)
+	if err == nil {
+		a.liveModalSess.IsResponding = a.liveModalSess.IsLive && time.Since(info.ModTime()) < 10*time.Second
+	}
+}
+
+func (a *App) handleLiveModalKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if a.liveModalTyping {
+		return a.handleLiveModalInput(msg)
 	}
 
-	// 2. Auto-memory from ~/.claude/projects/<encoded>/memory/
-	encoded := session.EncodeProjectPath(sess.ProjectPath)
-	memDir := home + "/.claude/projects/" + encoded + "/memory"
-	if entries, err := os.ReadDir(memDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			fp := memDir + "/" + e.Name()
-			data, err := os.ReadFile(fp)
-			if err != nil || len(data) == 0 {
-				continue
-			}
-			sb.WriteString(dimStyle.Render("── " + e.Name() + " ──"))
-			sb.WriteString("\n\n")
-			sb.WriteString(strings.TrimRight(string(data), "\n"))
-			sb.WriteString("\n\n")
-		}
+	key := msg.String()
+	switch key {
+	case "q", "esc":
+		a.closeLiveModal()
+		return a, nil
+	case "up":
+		scrollPreview(&a.liveModalVP, "up")
+		return a, nil
+	case "down":
+		scrollPreview(&a.liveModalVP, "down")
+		return a, nil
+	case "pgup":
+		scrollPreview(&a.liveModalVP, "pgup")
+		return a, nil
+	case "pgdown":
+		scrollPreview(&a.liveModalVP, "pgdown")
+		return a, nil
+	case "home":
+		scrollPreview(&a.liveModalVP, "home")
+		return a, nil
+	case "end":
+		scrollPreview(&a.liveModalVP, "end")
+		return a, nil
+	case "I":
+		a.liveModalTyping = true
+		ti := textinput.New()
+		ti.Prompt = "Send: "
+		ti.Width = a.liveModalWidth() - 6
+		ti.Focus()
+		a.liveModalInput = ti
+		return a, ti.Cursor.BlinkCmd()
+	case "J":
+		a.closeLiveModal()
+		return a.jumpToTmuxPane(a.liveModalSess.ProjectPath, a.liveModalSess.ID)
 	}
-
-	if sb.Len() == 0 {
-		sb.WriteString(dimStyle.Render("No memory or todos found for this session."))
-	}
-
-	contentH := a.height - 3
-	a.memoryVP = viewport.New(a.width, contentH)
-	a.memoryVP.SetContent(sb.String())
-	a.memoryFrom = from
-	a.state = viewMemory
 	return a, nil
+}
+
+func (a *App) handleLiveModalInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		text := a.liveModalInput.Value()
+		a.liveModalTyping = false
+		if text == "" {
+			return a, nil
+		}
+		if err := tmuxSendKeys(a.liveModalPane, text); err != nil {
+			a.copiedMsg = "Send failed"
+			return a, nil
+		}
+		a.copiedMsg = "Sent"
+		return a, nil
+	case "esc":
+		a.liveModalTyping = false
+		return a, nil
+	}
+	var cmd tea.Cmd
+	a.liveModalInput, cmd = a.liveModalInput.Update(msg)
+	return a, cmd
+}
+
+func (a *App) liveModalWidth() int {
+	return max(min(a.width-8, a.width*85/100), 40)
+}
+
+func (a *App) liveModalHeight() int {
+	return max(a.height-6, 10)
+}
+
+func (a *App) renderLiveModal() string {
+	if !a.liveModal {
+		return ""
+	}
+	modalW := a.liveModalWidth()
+	modalH := a.liveModalHeight()
+
+	// Pick colors based on responding state
+	titleBg := lipgloss.Color("#4ADE80")
+	borderColor := lipgloss.Color("#4ADE80")
+	titleLabel := "LIVE"
+	if a.liveModalSess.IsResponding {
+		titleBg = lipgloss.Color("#F59E0B")
+		borderColor = lipgloss.Color("#F59E0B")
+		titleLabel = "BUSY"
+	}
+
+	// Title: LIVE/BUSY <project> <id> ... <scroll%>
+	sessionLabel := a.liveModalSess.ShortID
+	if a.liveModalSess.ProjectName != "" {
+		sessionLabel = a.liveModalSess.ProjectName + " " + sessionLabel
+	}
+	titleText := fmt.Sprintf(" %s %s ", titleLabel, sessionLabel)
+	pct := int(a.liveModalVP.ScrollPercent() * 100)
+	rightText := fmt.Sprintf(" %d%% ", pct)
+	titlePad := max(modalW-2-len(titleText)-len(rightText), 0)
+	title := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#000000")).
+		Background(titleBg).
+		Render(titleText) +
+		lipgloss.NewStyle().
+			Background(colorPrimary).
+			Foreground(lipgloss.Color("#A1A1AA")).
+			Render(strings.Repeat("─", titlePad)+rightText)
+
+	// Body
+	body := a.liveModalVP.View()
+
+	// Help line / input
+	var help string
+	if a.liveModalTyping {
+		inputView := a.liveModalInput.View()
+		inputPad := max(modalW-2-lipgloss.Width(inputView), 0)
+		help = inputView + strings.Repeat(" ", inputPad)
+	} else {
+		helpText := " ↑↓:scroll I:input J:jump esc:close "
+		helpPad := max(modalW-2-len(helpText), 0)
+		help = helpStyle.Render(helpText + strings.Repeat(" ", helpPad))
+	}
+
+	// Build modal box
+	borderStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderColor).
+		Width(modalW - 2).
+		Height(modalH - 2)
+
+	inner := title + "\n" + body + "\n" + help
+	box := borderStyle.Render(inner)
+
+	return box
 }
 
 func (a *App) resumeSession(sess session.Session) (tea.Model, tea.Cmd) {
@@ -1177,6 +1020,39 @@ func (a *App) resumeSession(sess session.Session) (tea.Model, tea.Cmd) {
 	if dir == "" {
 		dir, _ = os.UserHomeDir()
 	}
+
+	if sess.IsLive {
+		// Live session: jump to existing pane
+		pane, found := findTmuxPane(sess.ProjectPath, sess.ID)
+		if found {
+			if err := switchToTmuxPane(pane); err != nil {
+				a.copiedMsg = "Switch failed"
+			}
+			return a, nil
+		}
+		// Fallback: take over CSB
+		c := exec.Command("claude", "--resume", sess.ID)
+		c.Dir = dir
+		return a, tea.ExecProcess(c, func(err error) tea.Msg {
+			return tea.QuitMsg{}
+		})
+	}
+
+	// Non-live session in tmux: spawn a new tmux window
+	if inTmux() {
+		windowName := sess.ProjectName
+		if windowName == "" {
+			windowName = "claude"
+		}
+		if err := tmuxNewWindowClaude(windowName, dir, sess.ID); err != nil {
+			a.copiedMsg = "Spawn failed"
+		} else {
+			a.copiedMsg = "Resumed in new window"
+		}
+		return a, nil
+	}
+
+	// Non-tmux: take over CSB
 	c := exec.Command("claude", "--resume", sess.ID)
 	c.Dir = dir
 	return a, tea.ExecProcess(c, func(err error) tea.Msg {
@@ -1184,233 +1060,432 @@ func (a *App) resumeSession(sess session.Session) (tea.Model, tea.Cmd) {
 	})
 }
 
-func (a *App) openDetail(entry session.Entry, from viewState) (tea.Model, tea.Cmd) {
-	a.detailEntry = entry
-	a.detailFrom = from
-	content := renderFullMessage(entry, a.width)
-	a.detailContent = content
-	contentH := a.height - 3
-	a.detailVP = viewport.New(a.width, contentH)
-	a.detailVP.SetContent(content)
-	a.state = viewDetail
+// --- Edit file with $EDITOR ---
 
-	// Enable live tracking if opening the latest message of a live session
-	a.detailLiveTrack = false
-	if from == viewMessages && a.currentSess.IsLive {
-		items := a.messageList.Items()
-		if a.messageList.Index() >= len(items)-1 {
-			a.detailLiveTrack = true
-			if !a.liveTail {
-				return a, liveTickCmd()
-			}
+type editChoice struct {
+	key   string // "m", "t", "k", "p"
+	label string // "memory", "todos", "tasks", "plan"
+	path  string // file path to open
+}
+
+func editableFiles(sess session.Session) []editChoice {
+	home, _ := os.UserHomeDir()
+	var choices []editChoice
+
+	if sess.HasMemory {
+		encoded := session.EncodeProjectPath(sess.ProjectPath)
+		p := filepath.Join(home, ".claude", "projects", encoded, "memory", "MEMORY.md")
+		if _, err := os.Stat(p); err == nil {
+			choices = append(choices, editChoice{"m", "memory", p})
 		}
 	}
+	if sess.HasTodos {
+		p := filepath.Join(home, ".claude", "todos", sess.ID+"-agent-"+sess.ID+".json")
+		if _, err := os.Stat(p); err == nil {
+			choices = append(choices, editChoice{"t", "todos", p})
+		}
+	}
+	if sess.HasTasks {
+		dir := filepath.Join(home, ".claude", "tasks", sess.ID)
+		if _, err := os.Stat(dir); err == nil {
+			choices = append(choices, editChoice{"k", "tasks", dir})
+		}
+	}
+	for i, slug := range sess.PlanSlugs {
+		p := filepath.Join(home, ".claude", "plans", slug+".md")
+		if _, err := os.Stat(p); err == nil {
+			key := "p"
+			label := "plan"
+			if len(sess.PlanSlugs) > 1 {
+				key = fmt.Sprintf("p%d", i+1)
+				label = fmt.Sprintf("plan %d (%s)", i+1, slug)
+			}
+			choices = append(choices, editChoice{key, label, p})
+		}
+	}
+	// Session JSONL file itself
+	choices = append(choices, editChoice{"s", "session", sess.FilePath})
 
+	return choices
+}
+
+func (a *App) openEditMenu(sess session.Session) (tea.Model, tea.Cmd) {
+	choices := editableFiles(sess)
+	if len(choices) == 0 {
+		a.copiedMsg = "No editable files"
+		return a, nil
+	}
+	// If only the session file is available, open it directly
+	if len(choices) == 1 {
+		return a.openInEditor(choices[0].path)
+	}
+	a.editMenu = true
+	a.editSess = sess
+	a.editChoices = choices
+
+	parts := make([]string, len(choices))
+	for i, c := range choices {
+		parts[i] = c.key + ":" + c.label
+	}
+	a.copiedMsg = "Edit: " + strings.Join(parts, " ")
 	return a, nil
 }
 
-func (a *App) openAgentDetail(entry session.Entry) (tea.Model, tea.Cmd) {
-	a.agentDetailEntry = entry
-	a.detailFrom = viewAgentMessages
-	content := renderFullMessage(entry, a.width)
-	a.agentDetailContent = content
-	contentH := a.height - 3
-	a.agentDetailVP = viewport.New(a.width, contentH)
-	a.agentDetailVP.SetContent(content)
-	a.state = viewAgentDetail
-
-	// Enable live tracking if opening the latest agent message of a live agent
-	a.detailLiveTrack = false
-	if a.agentMsgList.Width() > 0 {
-		items := a.agentMsgList.Items()
-		if a.agentMsgList.Index() >= len(items)-1 {
-			if info, err := os.Stat(a.currentAgent.FilePath); err == nil {
-				if time.Since(info.ModTime()) < 60*time.Second {
-					a.detailLiveTrack = true
-					if !a.liveTail {
-						return a, liveTickCmd()
-					}
-				}
-			}
+func (a *App) handleEditMenu(key string) (tea.Model, tea.Cmd) {
+	a.editMenu = false
+	for _, c := range a.editChoices {
+		if c.key == key {
+			return a.openInEditor(c.path)
 		}
 	}
-
+	a.copiedMsg = ""
 	return a, nil
 }
 
-func (a *App) jumpToTmuxPane(projectPath string) (tea.Model, tea.Cmd) {
-	pane, found := findTmuxPane(projectPath)
+func (a *App) handleActionsMenu(key string) (tea.Model, tea.Cmd) {
+	a.actionsMenu = false
+	a.copiedMsg = ""
+	sess := a.actionsSess
+	switch key {
+	case "d":
+		if sess.IsLive {
+			a.copiedMsg = "Cannot delete live session"
+			return a, nil
+		}
+		return a.deleteSession(sess)
+	case "r":
+		return a.resumeSession(sess)
+	case "m":
+		if sess.ProjectPath == "" {
+			a.copiedMsg = "No project path"
+			return a, nil
+		}
+		if sess.IsLive {
+			a.copiedMsg = "Cannot move live session"
+			return a, nil
+		}
+		a.moveSess = sess
+		a.moveMode = true
+		ti := textinput.New()
+		ti.Prompt = "Move to: "
+		ti.SetValue(sess.ProjectPath)
+		ti.Width = a.width - 12
+		ti.Focus()
+		a.moveInput = ti
+		return a, ti.Cursor.BlinkCmd()
+	case "w":
+		if sess.ProjectPath == "" {
+			a.copiedMsg = "Not a git repo"
+			return a, nil
+		}
+		if sess.IsLive {
+			a.copiedMsg = "Cannot create worktree for live session"
+			return a, nil
+		}
+		if sess.IsWorktree {
+			a.copiedMsg = "Already a worktree"
+			return a, nil
+		}
+		gitPath := filepath.Join(sess.ProjectPath, ".git")
+		info, err := os.Stat(gitPath)
+		if err != nil || !info.IsDir() {
+			a.copiedMsg = "Not a git repo"
+			return a, nil
+		}
+		a.worktreeSess = sess
+		a.worktreeMode = true
+		ti := textinput.New()
+		ti.Prompt = "Worktree name: "
+		name := sess.GitBranch
+		if name == "" {
+			name = sess.ShortID
+		}
+		name = strings.NewReplacer("/", "-", " ", "-").Replace(name)
+		ti.SetValue(name)
+		ti.Width = a.width - 20
+		ti.Focus()
+		a.worktreeInput = ti
+		return a, ti.Cursor.BlinkCmd()
+	}
+	return a, nil
+}
+
+func (a *App) openInEditor(path string) (tea.Model, tea.Cmd) {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vi"
+	}
+	c := exec.Command(editor, path)
+	return a, tea.ExecProcess(c, func(err error) tea.Msg {
+		return editorDoneMsg{}
+	})
+}
+
+type editorDoneMsg struct{}
+
+func (a *App) deleteSession(sess session.Session) (tea.Model, tea.Cmd) {
+	if err := os.Remove(sess.FilePath); err != nil && !os.IsNotExist(err) {
+		a.copiedMsg = "Delete failed: " + err.Error()
+		return a, nil
+	}
+
+	// Remove from in-memory list and update the list widget
+	idx := a.sessionList.Index()
+	var remaining []session.Session
+	for _, s := range a.sessions {
+		if s.ID != sess.ID {
+			remaining = append(remaining, s)
+		}
+	}
+	a.sessions = remaining
+
+	// Clear any active filter before rebuilding — the deleted item may have
+	// been the last match, leaving an empty "No items" filtered view.
+	if a.hasFilterApplied() {
+		a.sessionList.ResetFilter()
+	}
+
+	items := buildGroupedItems(remaining, a.sessGroupMode)
+	a.sessionList.SetItems(items)
+	if idx >= len(items) {
+		idx = len(items) - 1
+	}
+	if idx >= 0 {
+		a.sessionList.Select(idx)
+	}
+	a.sessSplit.CacheKey = ""
+	a.copiedMsg = "Session deleted"
+	return a, nil
+}
+
+func (a *App) handleMoveInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		newPath := strings.TrimSpace(a.moveInput.Value())
+		a.moveMode = false
+		if newPath == "" || newPath == a.moveSess.ProjectPath {
+			return a, nil
+		}
+		return a.executeMove(a.moveSess, newPath)
+	case "esc":
+		a.moveMode = false
+		return a, nil
+	}
+	var cmd tea.Cmd
+	a.moveInput, cmd = a.moveInput.Update(msg)
+	return a, cmd
+}
+
+func (a *App) executeMove(sess session.Session, newPath string) (tea.Model, tea.Cmd) {
+	oldPath := sess.ProjectPath
+	if err := session.MoveProject(oldPath, newPath); err != nil {
+		a.copiedMsg = "Move failed: " + err.Error()
+		return a, nil
+	}
+
+	home, _ := os.UserHomeDir()
+	newName := session.ShortenPath(newPath, home)
+
+	// Update all in-memory sessions that share the old project path
+	for i := range a.sessions {
+		if a.sessions[i].ProjectPath == oldPath {
+			a.sessions[i].ProjectPath = newPath
+			a.sessions[i].ProjectName = newName
+			// Update FilePath: ~/.claude/projects/<new-encoded>/<filename>
+			oldEncoded := session.EncodeProjectPath(oldPath)
+			newEncoded := session.EncodeProjectPath(newPath)
+			a.sessions[i].FilePath = strings.Replace(a.sessions[i].FilePath, oldEncoded, newEncoded, 1)
+		}
+	}
+
+	// Rebuild list items
+	items := make([]list.Item, len(a.sessions))
+	for i, s := range a.sessions {
+		items[i] = sessionItem{sess: s}
+	}
+	idx := a.sessionList.Index()
+	a.sessionList.SetItems(items)
+	a.sessionList.Select(idx)
+	a.sessSplit.CacheKey = ""
+	a.copiedMsg = fmt.Sprintf("Moved → %s", newName)
+	return a, nil
+}
+
+func (a *App) handleWorktreeInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		name := strings.TrimSpace(a.worktreeInput.Value())
+		a.worktreeMode = false
+		if name == "" {
+			return a, nil
+		}
+		return a.executeWorktree(a.worktreeSess, name)
+	case "esc":
+		a.worktreeMode = false
+		return a, nil
+	}
+	var cmd tea.Cmd
+	a.worktreeInput, cmd = a.worktreeInput.Update(msg)
+	return a, cmd
+}
+
+func (a *App) executeWorktree(sess session.Session, name string) (tea.Model, tea.Cmd) {
+	// Get repo root
+	out, err := exec.Command("git", "-C", sess.ProjectPath, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		a.copiedMsg = "Not a git repo"
+		return a, nil
+	}
+	repoRoot := strings.TrimSpace(string(out))
+
+	// Determine branch
+	branch := sess.GitBranch
+	if branch == "" {
+		bOut, err := exec.Command("git", "-C", sess.ProjectPath, "branch", "--show-current").Output()
+		if err != nil {
+			a.copiedMsg = "Cannot determine branch"
+			return a, nil
+		}
+		branch = strings.TrimSpace(string(bOut))
+	}
+
+	wtPath := filepath.Join(repoRoot, a.config.WorktreeDir, name)
+
+	// Try adding worktree on existing branch first; if it fails because
+	// the branch is already checked out, create a new branch from it.
+	if err := exec.Command("git", "-C", repoRoot, "worktree", "add", wtPath, branch).Run(); err != nil {
+		if err2 := exec.Command("git", "-C", repoRoot, "worktree", "add", "-b", name, wtPath, branch).Run(); err2 != nil {
+			a.copiedMsg = "Worktree failed: " + err2.Error()
+			return a, nil
+		}
+	}
+
+	// Move session data to the new worktree path
+	oldPath := sess.ProjectPath
+	if err := session.MoveProject(oldPath, wtPath); err != nil {
+		a.copiedMsg = "Move failed: " + err.Error()
+		return a, nil
+	}
+
+	home, _ := os.UserHomeDir()
+	newName := session.ShortenPath(wtPath, home)
+
+	// Update in-memory sessions
+	for i := range a.sessions {
+		if a.sessions[i].ProjectPath == oldPath {
+			a.sessions[i].ProjectPath = wtPath
+			a.sessions[i].ProjectName = newName
+			a.sessions[i].IsWorktree = true
+			oldEncoded := session.EncodeProjectPath(oldPath)
+			newEncoded := session.EncodeProjectPath(wtPath)
+			a.sessions[i].FilePath = strings.Replace(a.sessions[i].FilePath, oldEncoded, newEncoded, 1)
+		}
+	}
+
+	a.rebuildSessionList()
+	a.copiedMsg = fmt.Sprintf("Worktree created → %s/%s", a.config.WorktreeDir, name)
+	return a, nil
+}
+
+func (a *App) jumpToTmuxPane(projectPath string, sessionID ...string) (tea.Model, tea.Cmd) {
+	pane, found := findTmuxPane(projectPath, sessionID...)
 	if !found {
 		a.copiedMsg = "No tmux pane found"
 		return a, nil
 	}
-	if err := moveWithAndSwitchPane(pane); err != nil {
+	if err := switchToTmuxPane(pane); err != nil {
 		a.copiedMsg = "Switch failed"
 		return a, nil
 	}
 	return a, nil
 }
 
-func (a *App) openAgents(sess session.Session) (tea.Model, tea.Cmd) {
-	a.currentSess = sess
-	if len(a.agents) == 0 {
-		agents, err := session.FindSubagents(sess.FilePath)
-		if err != nil || len(agents) == 0 {
+func (a *App) sendInputToLive(projectPath string, sessionID ...string) (tea.Model, tea.Cmd) {
+	if !inTmux() {
+		a.copiedMsg = "Requires tmux"
+		return a, nil
+	}
+	pane, found := findTmuxPane(projectPath, sessionID...)
+	if !found || !hasClaude(pane.PID) {
+		a.copiedMsg = "No live Claude pane"
+		return a, nil
+	}
+	a.liveInputActive = true
+	a.liveInputPane = pane
+	ti := textinput.New()
+	ti.Prompt = "Send to Claude: "
+	ti.Width = a.width - 20
+	ti.Focus()
+	a.liveInputModel = ti
+	return a, ti.Cursor.BlinkCmd()
+}
+
+func (a *App) handleLiveInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		text := a.liveInputModel.Value()
+		a.liveInputActive = false
+		if text == "" {
 			return a, nil
 		}
-		a.agents = agents
-	}
-	contentH := max(a.height-3, 1)
-	a.agentSplit.Focus = false
-	a.agentSplit.CacheKey = ""
-	a.agentList = newAgentList(a.agents, a.agentSplit.ListWidth(a.width, a.splitRatio), contentH)
-	a.state = viewAgents
-	return a, nil
-}
-
-func (a *App) openAgentMessages(agent session.Subagent) (tea.Model, tea.Cmd) {
-	a.currentAgent = agent
-	entries, err := session.LoadMessages(agent.FilePath)
-	if err != nil {
+		if err := tmuxSendKeys(a.liveInputPane, text); err != nil {
+			a.copiedMsg = "Send failed"
+			return a, nil
+		}
+		a.copiedMsg = "Sent!"
+		return a, nil
+	case "esc":
+		a.liveInputActive = false
 		return a, nil
 	}
-	a.agentMsgs = entries
-	a.agentMsgSplit.Focus = false
-	a.agentMsgSplit.CacheKey = ""
-	if info, err := os.Stat(agent.FilePath); err == nil {
-		a.lastMsgLoadTime = info.ModTime()
-	}
-	contentH := a.height - 3
-	merged := mergeConversationTurns(entries)
-	a.agentMsgList = newMessageList(merged, a.agentMsgSplit.ListWidth(a.width, a.splitRatio), contentH)
-	a.state = viewAgentMessages
-	return a, nil
-}
-
-func (a *App) openToolCalls(msgs []session.Entry, agentCtx string) (tea.Model, tea.Cmd) {
-	a.toolCalls = extractToolCalls(msgs)
-	if len(a.toolCalls) == 0 {
-		return a, nil
-	}
-	if agentCtx == "" {
-		a.currentAgent = session.Subagent{}
-	}
-	contentH := a.height - 3
-	a.toolSplit.CacheKey = ""
-	a.toolSplit.Focus = false
-	a.toolList = newToolList(a.toolCalls, a.toolSplit.ListWidth(a.width, a.splitRatio), contentH)
-	a.state = viewToolCalls
-	return a, nil
-}
-
-func (a *App) loadSessionMessages() tea.Cmd {
-	entries, err := session.LoadMessages(a.currentSess.FilePath)
-	if err != nil {
-		return nil
-	}
-	a.messages = entries
-	a.msgFilter = filterNone
-	a.msgSplit.Focus = false
-	a.msgSplit.CacheKey = ""
-	if info, err := os.Stat(a.currentSess.FilePath); err == nil {
-		a.lastMsgLoadTime = info.ModTime()
-	}
-
-	// Pre-load subagents for direct agent jump
-	agents, _ := session.FindSubagents(a.currentSess.FilePath)
-	a.agents = agents
-
-	a.applyMessageFilter()
-	// Select latest message on open
-	if !a.msgReverse {
-		items := a.messageList.Items()
-		if len(items) > 0 {
-			a.messageList.Select(len(items) - 1)
-		}
-	}
-	a.state = viewMessages
-	return nil
-}
-
-func (a *App) applyMessageFilter() {
-	merged := mergeConversationTurns(a.messages)
-	filtered := filterMerged(merged, a.msgFilter)
-	if a.msgReverse {
-		reverseMerged(filtered)
-	}
-	contentH := a.height - 3
-	a.messageList = newMessageList(filtered, a.msgSplit.ListWidth(a.width, a.splitRatio), contentH)
-	a.msgSplit.CacheKey = ""
-}
-
-// --- Agent matching ---
-
-// findAgentForMessage checks if a message has a Task tool_use and finds the
-// matching subagent by timestamp proximity.
-func (a *App) findAgentForMessage(entry session.Entry) (session.Subagent, bool) {
-	if len(a.agents) == 0 {
-		return session.Subagent{}, false
-	}
-
-	hasTask := false
-	for _, block := range entry.Content {
-		if block.Type == "tool_use" && block.ToolName == "Task" {
-			hasTask = true
-			break
-		}
-	}
-	if !hasTask || entry.Timestamp.IsZero() {
-		return session.Subagent{}, false
-	}
-
-	// Find agent with closest timestamp after the Task tool call
-	var best session.Subagent
-	bestDiff := float64(math.MaxFloat64)
-	for _, ag := range a.agents {
-		if ag.Timestamp.IsZero() {
-			continue
-		}
-		diff := ag.Timestamp.Sub(entry.Timestamp).Seconds()
-		// Agent should start after or very close to the Task call (within 60s)
-		if diff >= -5 && diff < 60 {
-			absDiff := math.Abs(diff)
-			if absDiff < bestDiff {
-				bestDiff = absDiff
-				best = ag
-			}
-		}
-	}
-	if bestDiff < math.MaxFloat64 {
-		return best, true
-	}
-	return session.Subagent{}, false
+	var cmd tea.Cmd
+	a.liveInputModel, cmd = a.liveInputModel.Update(msg)
+	return a, cmd
 }
 
 // --- Live refresh ---
 
 func (a *App) handleTick() tea.Cmd {
-	now := time.Now()
+	if !a.liveUpdate {
+		return nil
+	}
+	return a.doRefresh()
+}
 
+func (a *App) doRefresh() tea.Cmd {
 	switch a.state {
 	case viewSessions:
-		// Update IsLive flags by re-statting files
-		changed := false
+		// Update ModTime and IsLive flags
+		needsSort := false
+		needsRefresh := false
 		for i := range a.sessions {
 			info, err := os.Stat(a.sessions[i].FilePath)
 			if err != nil {
 				continue
 			}
-			live := now.Sub(info.ModTime()) < 60*time.Second
-			if a.sessions[i].IsLive != live {
-				a.sessions[i].IsLive = live
-				changed = true
-			}
 			if !info.ModTime().Equal(a.sessions[i].ModTime) {
 				a.sessions[i].ModTime = info.ModTime()
-				changed = true
+				needsSort = true
 			}
 		}
-		if changed && !a.isFiltering() {
+		// Snapshot old live state, clear, and re-detect
+		type liveState struct{ live, responding bool }
+		oldLive := make([]liveState, len(a.sessions))
+		for i := range a.sessions {
+			oldLive[i] = liveState{a.sessions[i].IsLive, a.sessions[i].IsResponding}
+			a.sessions[i].IsLive = false
+			a.sessions[i].IsResponding = false
+		}
+		markLiveSessions(a.sessions)
+		for i := range a.sessions {
+			if a.sessions[i].IsLive != oldLive[i].live {
+				needsSort = true
+			}
+			if a.sessions[i].IsResponding != oldLive[i].responding {
+				needsRefresh = true
+			}
+		}
+		if needsSort && !a.isFiltering() && !a.hasFilterApplied() {
 			// Remember currently selected session so cursor follows it after re-sort
 			selectedID := ""
 			if sel, ok := a.sessionList.SelectedItem().(sessionItem); ok {
@@ -1421,120 +1496,41 @@ func (a *App) handleTick() tea.Cmd {
 				return a.sessions[i].ModTime.After(a.sessions[j].ModTime)
 			})
 
-			items := make([]list.Item, len(a.sessions))
+			items := buildGroupedItems(a.sessions, a.sessGroupMode)
 			newIdx := 0
-			for i, s := range a.sessions {
-				items[i] = sessionItem{sess: s}
-				if s.ID == selectedID {
+			for i, item := range items {
+				if si, ok := item.(sessionItem); ok && si.sess.ID == selectedID {
 					newIdx = i
+					break
 				}
 			}
 			a.sessionList.SetItems(items)
 			a.sessionList.Select(newIdx)
+		} else if needsRefresh && !a.isFiltering() && !a.hasFilterApplied() {
+			// Badge-only change: update items without re-sorting
+			items := buildGroupedItems(a.sessions, a.sessGroupMode)
+			idx := a.sessionList.Index()
+			a.sessionList.SetItems(items)
+			a.sessionList.Select(idx)
 		}
 		// Refresh preview for live sessions (auto-scroll to bottom)
 		a.refreshSessionPreviewLive()
-
-	case viewMessages:
-		a.refreshLiveMessages(a.currentSess.FilePath, &a.messages, &a.messageList)
-
-	case viewDetail:
-		if a.detailLiveTrack {
-			a.refreshDetailLive()
-		}
-
-	case viewAgentMessages:
-		a.refreshLiveMessages(a.currentAgent.FilePath, &a.agentMsgs, &a.agentMsgList)
-
-	case viewAgentDetail:
-		if a.detailLiveTrack {
-			a.refreshAgentDetailLive()
-		}
 	}
 
 	return nil
 }
 
-func (a *App) refreshLiveMessages(filePath string, msgs *[]session.Entry, msgList *list.Model) {
-	if a.isFiltering() {
-		return
-	}
-	info, err := os.Stat(filePath)
-	if err != nil {
-		return
-	}
-	if !info.ModTime().After(a.lastMsgLoadTime) {
-		return
-	}
-
-	entries, err := session.LoadMessages(filePath)
-	if err != nil || len(entries) == len(*msgs) {
-		return
-	}
-
-	curIdx := msgList.Index()
-	oldLen := len(msgList.Items())
-	// "wasAtNewest" means cursor was on the newest message
-	wasAtNewest := (a.msgReverse && curIdx == 0) || (!a.msgReverse && curIdx >= oldLen-1)
-	*msgs = entries
-
-	merged := mergeConversationTurns(entries)
-	filtered := filterMerged(merged, a.msgFilter)
-	if a.msgReverse {
-		reverseMerged(filtered)
-	}
-
-	items := make([]list.Item, len(filtered))
-	for i, m := range filtered {
-		items[i] = messageItem{entry: m.entry, index: m.startIdx, endIndex: m.endIdx}
-	}
-	msgList.SetItems(items)
-
-	if wasAtNewest || a.liveTail {
-		// Stay on newest message
-		if a.msgReverse {
-			msgList.Select(0)
-		} else {
-			msgList.Select(len(items) - 1)
-		}
-	} else if a.msgReverse {
-		// Reversed: new items prepended at index 0, shift cursor to compensate
-		added := len(items) - oldLen
-		if added > 0 {
-			msgList.Select(min(curIdx+added, len(items)-1))
-		} else if curIdx < len(items) {
-			msgList.Select(curIdx)
-		}
-	} else {
-		// Normal order: new items appended at end, cursor stays
-		if curIdx < len(items) {
-			msgList.Select(curIdx)
-		}
-	}
-
-	a.lastMsgLoadTime = info.ModTime()
-}
 
 // handleLiveTail refreshes messages and snaps to the latest entry + updates preview.
 func (a *App) handleLiveTail() {
 	switch a.state {
-	case viewMessages:
-		a.refreshLiveMessages(a.currentSess.FilePath, &a.messages, &a.messageList)
-		if a.msgSplit.Show {
-			a.updateMsgPreview(&a.msgSplit)
-		}
-	case viewAgentMessages:
-		a.refreshLiveMessages(a.currentAgent.FilePath, &a.agentMsgs, &a.agentMsgList)
-		if a.agentMsgSplit.Show {
-			a.updateMsgPreview(&a.agentMsgSplit)
-		}
-	case viewDetail:
-		if a.detailLiveTrack {
-			a.refreshDetailLive()
-		}
-	case viewAgentDetail:
-		if a.detailLiveTrack {
-			a.refreshAgentDetailLive()
+	case viewConversation:
+		a.refreshConversation()
+		// Snap cursor to the last (newest) message
+		if n := len(a.conv.items); n > 0 {
+			a.convList.Select(n - 1)
+			a.conv.split.CacheKey = ""
+			a.updateConvPreview()
 		}
 	}
 }
@@ -1543,8 +1539,6 @@ func (a *App) toggleLiveTail() (tea.Model, tea.Cmd) {
 	a.liveTail = !a.liveTail
 	if a.liveTail {
 		a.copiedMsg = "Live tail ON"
-		// Always snap list to end, regardless of new messages
-		a.snapListToEnd()
 		a.handleLiveTail()
 		return a, liveTickCmd()
 	}
@@ -1552,124 +1546,7 @@ func (a *App) toggleLiveTail() (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
-// isAtNewest returns true if the message list cursor is on the newest message.
-func (a *App) isAtNewest(msgList *list.Model) bool {
-	if a.msgReverse {
-		return msgList.Index() == 0
-	}
-	return msgList.Index() >= len(msgList.Items())-1
-}
 
-// snapListToNewest selects the newest message in the active list and refreshes preview.
-// When reversed (newest first), that's index 0; otherwise it's the last index.
-func (a *App) snapListToEnd() {
-	switch a.state {
-	case viewMessages:
-		items := a.messageList.Items()
-		if len(items) > 0 {
-			if a.msgReverse {
-				a.messageList.Select(0)
-			} else {
-				a.messageList.Select(len(items) - 1)
-			}
-		}
-		a.msgSplit.CacheKey = ""
-		if a.msgSplit.Show {
-			a.updateMsgPreview(&a.msgSplit)
-		}
-	case viewAgentMessages:
-		items := a.agentMsgList.Items()
-		if len(items) > 0 {
-			if a.msgReverse {
-				a.agentMsgList.Select(0)
-			} else {
-				a.agentMsgList.Select(len(items) - 1)
-			}
-		}
-		a.agentMsgSplit.CacheKey = ""
-		if a.agentMsgSplit.Show {
-			a.updateMsgPreview(&a.agentMsgSplit)
-		}
-	}
-}
-
-// refreshDetailLive reloads messages and updates the detail view to show the latest entry.
-func (a *App) refreshDetailLive() {
-	if a.copyModeActive {
-		return
-	}
-	info, err := os.Stat(a.currentSess.FilePath)
-	if err != nil {
-		return
-	}
-	if time.Since(info.ModTime()) > 60*time.Second {
-		a.detailLiveTrack = false
-		return
-	}
-	if !info.ModTime().After(a.lastMsgLoadTime) {
-		return
-	}
-	entries, err := session.LoadMessages(a.currentSess.FilePath)
-	if err != nil || len(entries) == len(a.messages) {
-		return
-	}
-	a.messages = entries
-	a.lastMsgLoadTime = info.ModTime()
-
-	merged := mergeConversationTurns(entries)
-	if len(merged) == 0 {
-		return
-	}
-	latest := merged[len(merged)-1]
-
-	atBottom := vpAtBottom(&a.detailVP)
-	a.detailEntry = latest.entry
-	content := renderFullMessage(latest.entry, a.width)
-	a.detailContent = content
-	a.detailVP.SetContent(content)
-	if atBottom {
-		a.detailVP.GotoBottom()
-	}
-}
-
-// refreshAgentDetailLive reloads agent messages and updates the agent detail view.
-func (a *App) refreshAgentDetailLive() {
-	if a.copyModeActive {
-		return
-	}
-	info, err := os.Stat(a.currentAgent.FilePath)
-	if err != nil {
-		return
-	}
-	if time.Since(info.ModTime()) > 60*time.Second {
-		a.detailLiveTrack = false
-		return
-	}
-	if !info.ModTime().After(a.lastMsgLoadTime) {
-		return
-	}
-	entries, err := session.LoadMessages(a.currentAgent.FilePath)
-	if err != nil || len(entries) == len(a.agentMsgs) {
-		return
-	}
-	a.agentMsgs = entries
-	a.lastMsgLoadTime = info.ModTime()
-
-	merged := mergeConversationTurns(entries)
-	if len(merged) == 0 {
-		return
-	}
-	latest := merged[len(merged)-1]
-
-	atBottom := vpAtBottom(&a.agentDetailVP)
-	a.agentDetailEntry = latest.entry
-	content := renderFullMessage(latest.entry, a.width)
-	a.agentDetailContent = content
-	a.agentDetailVP.SetContent(content)
-	if atBottom {
-		a.agentDetailVP.GotoBottom()
-	}
-}
 
 func vpAtBottom(vp *viewport.Model) bool {
 	total := vp.TotalLineCount()
@@ -1680,211 +1557,28 @@ func vpAtBottom(vp *viewport.Model) bool {
 	return vp.YOffset >= total-h
 }
 
-// liveBadgeText returns "[LIVE ▲]" or "[LIVE ▼]" when auto-scroll is active,
-// with arrow direction matching the sort order. "[LIVE]" when not following.
+// liveBadgeText returns "[LIVE]" badge text for the conversation view.
 func (a *App) liveBadgeText() string {
-	var sp *SplitPane
-	var msgList *list.Model
-	switch a.state {
-	case viewMessages:
-		sp = &a.msgSplit
-		msgList = &a.messageList
-	case viewAgentMessages:
-		sp = &a.agentMsgSplit
-		msgList = &a.agentMsgList
-	default:
-		return "[LIVE]"
-	}
-
-	if !sp.Show {
-		return "[LIVE]"
-	}
-
-	if !a.isAtNewest(msgList) {
-		return "[LIVE]"
-	}
-	following := false
-	if sp.Focus {
-		if sp.Folds != nil {
-			following = sp.Folds.BlockCursor >= len(sp.Folds.Entry.Content)-1
-		}
-	} else {
-		following = vpAtBottom(&sp.Preview)
-	}
-	if following {
-		if a.msgReverse {
-			return "[LIVE ▲]"
-		}
-		return "[LIVE ▼]"
-	}
 	return "[LIVE]"
 }
 
-// detailLiveBadgeText returns "[LIVE ▼]" when auto-scroll is active in detail view.
-func (a *App) detailLiveBadgeText() string {
-	var vp *viewport.Model
+// refreshActivePreview re-renders the preview for the current view state.
+func (a *App) refreshActivePreview() {
 	switch a.state {
-	case viewDetail:
-		vp = &a.detailVP
-	case viewAgentDetail:
-		vp = &a.agentDetailVP
-	default:
-		return "[LIVE]"
+	case viewSessions:
+		a.updateSessionPreview()
+	case viewConversation:
+		a.conv.split.RefreshFoldPreview(a.width, a.splitRatio)
 	}
-	if vpAtBottom(vp) {
-		return "[LIVE ▼]"
-	}
-	return "[LIVE]"
-}
-
-// --- Message split pane ---
-
-func (a *App) renderMsgSplit(sp *SplitPane) string {
-	if !sp.Show || a.width < 40 || a.height < 10 {
-		return sp.List.View()
-	}
-
-	listW := sp.ListWidth(a.width, a.splitRatio)
-	previewW := max(a.width-listW-1, 1)
-	contentH := max(a.height-3, 1)
-
-	if sp.List.Width() > 0 && (sp.List.Width() != listW || sp.List.Height() != contentH) {
-		sp.List.SetSize(listW, contentH)
-	}
-
-	a.updateMsgPreview(sp)
-
-	if sp.Preview.Width != previewW || sp.Preview.Height != contentH {
-		sp.Preview.Width = previewW
-		sp.Preview.Height = max(contentH, 1)
-		// Re-wrap content at new width and clamp offset
-		if sp.Folds != nil && sp.Folds.Collapsed != nil {
-			cursor := -1
-			if sp.Focus {
-				cursor = sp.Folds.BlockCursor
-			}
-			rp := renderFullMessageWithCursor(sp.Folds.Entry, previewW, sp.Folds.Collapsed, sp.Folds.Formatted, cursor)
-			sp.Folds.BlockStarts = rp.blockStarts
-			sp.Preview.SetContent(rp.content)
-		}
-		sp.Preview.YOffset = min(sp.Preview.YOffset, max(sp.Preview.TotalLineCount()-contentH, 0))
-	}
-
-	borderColor := colorBorderDim
-	if sp.Focus {
-		borderColor = colorBorderFocused
-	}
-
-	leftStyle := lipgloss.NewStyle().Width(listW).MaxWidth(listW).Height(contentH).MaxHeight(contentH)
-	rightStyle := lipgloss.NewStyle().Width(previewW).MaxWidth(previewW).Height(contentH).MaxHeight(contentH)
-	borderStyle := lipgloss.NewStyle().Foreground(borderColor).Height(contentH).MaxHeight(contentH)
-
-	left := leftStyle.Render(sp.List.View())
-	border := borderStyle.Render(strings.Repeat("│\n", max(contentH-1, 0)) + "│")
-	right := rightStyle.Render(sp.Preview.View())
-
-	return lipgloss.JoinHorizontal(lipgloss.Top, left, border, right)
-}
-
-func (a *App) updateMsgPreview(sp *SplitPane) {
-	item, ok := sp.List.SelectedItem().(messageItem)
-	if !ok {
-		return
-	}
-	// Build cache key from index + block count
-	cacheKey := fmt.Sprintf("%d:%d", item.index, len(item.entry.Content))
-	if cacheKey == sp.CacheKey {
-		return
-	}
-
-	// Check if this is a different entry or same entry with more content
-	oldCacheKey := sp.CacheKey
-	isNewEntry := true
-	if oldCacheKey != "" {
-		// Parse old cache key to compare entry index
-		var oldIdx int
-		fmt.Sscanf(oldCacheKey, "%d:", &oldIdx)
-		isNewEntry = oldIdx != item.index
-	}
-
-	if isNewEntry {
-		// Different entry: reset everything
-		sp.CacheKey = cacheKey
-		if sp.Folds != nil {
-			sp.Folds.Reset(item.entry)
-		}
-
-		items := sp.List.Items()
-		isLast := sp.List.Index() >= len(items)-1
-		isLive := a.currentSess.IsLive || a.liveTail
-
-		if sp.Folds != nil && isLast && isLive {
-			// Live + last message: start at the last block, scroll to bottom
-			sp.Folds.BlockCursor = max(len(item.entry.Content)-1, 0)
-		}
-
-		a.refreshMsgPreview(sp)
-
-		if isLast && isLive {
-			sp.Preview.GotoBottom()
-		} else {
-			sp.Preview.GotoTop()
-		}
-	} else {
-		// Same entry but content grew: preserve view state
-		sp.CacheKey = cacheKey
-
-		if sp.Folds != nil {
-			oldBlockCount := len(sp.Folds.Entry.Content)
-			wasAtLastBlock := sp.Folds.BlockCursor >= oldBlockCount-1
-
-			sp.Folds.GrowBlocks(item.entry, oldBlockCount)
-
-			// Determine if we should auto-scroll to bottom
-			shouldFollow := false
-			if sp.Focus {
-				shouldFollow = wasAtLastBlock
-				if shouldFollow {
-					sp.Folds.BlockCursor = max(len(item.entry.Content)-1, 0)
-				}
-			} else {
-				shouldFollow = vpAtBottom(&sp.Preview)
-			}
-			a.refreshMsgPreview(sp)
-			if shouldFollow {
-				sp.Preview.GotoBottom()
-			}
-		}
-	}
-}
-
-func (a *App) refreshMsgPreview(sp *SplitPane) {
-	if sp.Folds != nil {
-		sp.RefreshFoldPreview(a.width, a.splitRatio)
-	}
-}
-
-// updateToolPreview updates the preview for tool call items.
-func (a *App) updateToolPreview(sp *SplitPane) {
-	item, ok := sp.List.SelectedItem().(toolCallItem)
-	if !ok {
-		return
-	}
-	cacheKey := fmt.Sprintf("%d:%d", item.msgIndex, len(item.entry.Content))
-	if cacheKey == sp.CacheKey {
-		return
-	}
-	sp.CacheKey = cacheKey
-	if sp.Folds != nil {
-		sp.Folds.Reset(item.entry)
-	}
-	a.refreshMsgPreview(sp)
-	sp.Preview.GotoTop()
 }
 
 // --- Session split pane ---
 
 func (a *App) renderSessionSplit() string {
+	if a.sessionList.Width() == 0 {
+		return ""
+	}
+	clampPaginator(&a.sessionList)
 	if !a.sessSplit.Show || a.width < 40 || a.height < 10 {
 		return a.sessionList.View()
 	}
@@ -1894,16 +1588,34 @@ func (a *App) renderSessionSplit() string {
 	contentH := max(a.height-3, 1)
 
 	if a.sessionList.Width() > 0 && (a.sessionList.Width() != listW || a.sessionList.Height() != contentH) {
+		idx := a.sessionList.Index()
 		a.sessionList.SetSize(listW, contentH)
+		a.sessionList.Select(idx)
 	}
 
 	a.updateSessionPreview()
 
 	if a.sessSplit.Preview.Width != previewW || a.sessSplit.Preview.Height != contentH {
+		oldOffset := a.sessSplit.Preview.YOffset
+		oldTotal := a.sessSplit.Preview.TotalLineCount()
 		a.sessSplit.Preview.Width = previewW
 		a.sessSplit.Preview.Height = max(contentH, 1)
-		a.sessSplit.CacheKey = "" // force re-render at new width
-		a.updateSessionPreview()
+		// Re-render at new size without reloading data or resetting cursor
+		if a.sessPreviewMode == sessPreviewConversation && len(a.sessConvEntries) > 0 {
+			a.refreshConvPreview()
+		} else {
+			a.sessSplit.CacheKey = ""
+			a.updateSessionPreview()
+			// Restore scroll position proportionally after re-render
+			newTotal := a.sessSplit.Preview.TotalLineCount()
+			maxOff := max(newTotal-a.sessSplit.Preview.Height, 0)
+			if oldTotal > 0 {
+				prop := float64(oldOffset) / float64(oldTotal)
+				a.sessSplit.Preview.YOffset = min(int(prop*float64(newTotal)+0.5), maxOff)
+			} else {
+				a.sessSplit.Preview.YOffset = min(oldOffset, maxOff)
+			}
+		}
 	}
 
 	borderColor := colorBorderDim
@@ -1915,11 +1627,44 @@ func (a *App) renderSessionSplit() string {
 	rightStyle := lipgloss.NewStyle().Width(previewW).MaxWidth(previewW).Height(contentH).MaxHeight(contentH)
 	borderStyle := lipgloss.NewStyle().Foreground(borderColor).Height(contentH).MaxHeight(contentH)
 
+	clampPaginator(&a.sessionList)
+
 	left := leftStyle.Render(a.sessionList.View())
 	border := borderStyle.Render(strings.Repeat("│\n", max(contentH-1, 0)) + "│")
 	right := rightStyle.Render(a.sessSplit.Preview.View())
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, border, right)
+}
+
+// toggleSessionPreviewMode switches session preview to the given mode,
+// or back to messages if already in that mode. Opens preview if closed.
+func (a *App) toggleSessionPreviewMode(mode sessPreview) {
+	if !a.sessSplit.Show {
+		idx := a.sessionList.Index()
+		a.sessSplit.Show = true
+		a.sessSplit.CacheKey = ""
+		contentH := max(a.height-3, 1)
+		a.sessionList.SetSize(a.sessSplit.ListWidth(a.width, a.splitRatio), contentH)
+		a.sessionList.Select(idx)
+	}
+	if a.sessPreviewMode == mode {
+		a.sessPreviewMode = sessPreviewConversation
+	} else {
+		a.sessPreviewMode = mode
+	}
+	a.sessSplit.CacheKey = "" // force re-render
+}
+
+// cycleSessionPreviewMode advances to the next preview tab.
+func (a *App) cycleSessionPreviewMode() {
+	a.sessPreviewMode = (a.sessPreviewMode + 1) % numSessPreviewModes
+	a.sessSplit.CacheKey = ""
+}
+
+// cycleSessionPreviewModeReverse goes to the previous preview tab.
+func (a *App) cycleSessionPreviewModeReverse() {
+	a.sessPreviewMode = (a.sessPreviewMode + numSessPreviewModes - 1) % numSessPreviewModes
+	a.sessSplit.CacheKey = ""
 }
 
 func (a *App) updateSessionPreview() {
@@ -1930,41 +1675,543 @@ func (a *App) updateSessionPreview() {
 	if !ok {
 		return
 	}
-	if item.sess.ID == a.sessSplit.CacheKey {
+
+	cacheKey := fmt.Sprintf("%d:%s", a.sessPreviewMode, item.sess.ID)
+	if cacheKey == a.sessSplit.CacheKey {
 		return
 	}
-	a.sessSplit.CacheKey = item.sess.ID
+
+	// If conversation data is already loaded for this session, just re-render
+	// at the new size without reloading data or resetting the cursor.
+	if a.sessPreviewMode == sessPreviewConversation && len(a.sessConvEntries) > 0 && a.sessConvCacheID == item.sess.ID {
+		a.sessSplit.CacheKey = cacheKey
+		a.refreshConvPreview()
+		return
+	}
+
+	a.sessSplit.CacheKey = cacheKey
 	a.sessPreviewPinned = false
 
-	const headN, tailN = 3, 2
-	head, tail, total, err := session.LoadMessagesSummary(item.sess.FilePath, headN, tailN)
+	switch a.sessPreviewMode {
+	case sessPreviewStats:
+		a.updateSessionStatsPreview(item.sess)
+	case sessPreviewMemory:
+		a.updateSessionMemoryPreview(item.sess)
+	case sessPreviewTasksPlan:
+		a.updateSessionTasksPlanPreview(item.sess)
+	default:
+		a.updateSessionConvPreview(item.sess)
+	}
+}
+
+func (a *App) updateSessionConvPreview(sess session.Session) {
+	const previewHead, previewTail = 50, 50
+	head, tail, total, err := session.LoadMessagesSummary(sess.FilePath, previewHead, previewTail)
 	if err != nil || total == 0 {
+		a.sessSplit.Preview.SetContent(dimStyle.Render("(no messages)"))
+		a.sessConvEntries = nil
+		a.sessConvFiltered = nil
+		a.sessConvFilterTerm = ""
+		return
+	}
+
+	// Merge head and tail separately, join with gap indicator
+	headMerged := mergeConversationTurns(head)
+	var merged []mergedMsg
+	if len(tail) == 0 {
+		merged = headMerged
+	} else {
+		tailMerged := mergeConversationTurns(tail)
+		// Adjust tail startIdx/endIdx to reflect position in full file
+		tailOffset := total - len(tail)
+		for i := range tailMerged {
+			tailMerged[i].startIdx += tailOffset
+			tailMerged[i].endIdx += tailOffset
+		}
+		merged = append(headMerged, tailMerged...)
+	}
+	a.sessConvEntries = filterConversation(merged)
+	a.sessConvCacheID = sess.ID
+
+	if len(a.sessConvEntries) == 0 {
 		a.sessSplit.Preview.SetContent(dimStyle.Render("(no messages)"))
 		return
 	}
 
+	// Reset state; start cursor at bottom for live sessions
+	a.sessConvExpanded = nil
+	a.sessConvFiltered = nil
+	a.sessConvFilterTerm = ""
+	a.sessConvSearching = false
+
+	visible := a.sessConvEntries
+	if sess.IsLive {
+		a.sessConvCursor = len(visible) - 1
+	} else {
+		a.sessConvCursor = 0
+	}
+
 	previewW := max(a.width-a.sessSplit.ListWidth(a.width, a.splitRatio)-1, 1)
-	var sb strings.Builder
-
-	for _, e := range head {
-		sb.WriteString(renderCompactMessage(e, previewW, 2))
-	}
-	if len(tail) > 0 {
-		skipped := total - len(head) - len(tail)
-		if skipped > 0 {
-			sb.WriteString(dimStyle.Render(fmt.Sprintf("  ... %d more messages ...\n", skipped)))
-		}
-		for _, e := range tail {
-			sb.WriteString(renderCompactMessage(e, previewW, 2))
-		}
-	}
-
 	contentH := max(a.height-3, 1)
+	rendered := renderConversationPreview(visible, previewW, a.sessConvCursor, a.sessConvExpanded, a.sessConvFilterTerm, sess.IsLive)
+
+	// Prepend todo progress header if session has todos
+	content := rendered
+	if len(sess.Todos) > 0 {
+		completed := 0
+		for _, t := range sess.Todos {
+			if t.Status == "completed" {
+				completed++
+			}
+		}
+		header := dimStyle.Render(fmt.Sprintf("── Todos [%d/%d] ──", completed, len(sess.Todos))) + "\n\n"
+		content = header + content
+	}
+
 	a.sessSplit.Preview = viewport.New(previewW, contentH)
-	a.sessSplit.Preview.SetContent(sb.String())
-	if item.sess.IsLive {
+	a.sessSplit.Preview.SetContent(content)
+	if sess.IsLive {
 		a.sessSplit.Preview.GotoBottom()
 	}
+}
+
+// convVisibleEntries returns the entries to display: filtered if a filter is
+// applied, otherwise all entries. When a filter term is set but nothing matches,
+// returns an empty slice (not all entries).
+func (a *App) convVisibleEntries() []mergedMsg {
+	if a.sessConvFilterTerm != "" {
+		visible := make([]mergedMsg, len(a.sessConvFiltered))
+		for i, idx := range a.sessConvFiltered {
+			visible[i] = a.sessConvEntries[idx]
+		}
+		return visible
+	}
+	return a.sessConvEntries
+}
+
+// refreshConvPreview re-renders the conversation preview without reloading entries.
+func (a *App) refreshConvPreview() {
+	visible := a.convVisibleEntries()
+	isLive := false
+	if item, ok := a.sessionList.SelectedItem().(sessionItem); ok {
+		isLive = item.sess.IsLive
+	}
+	if len(visible) == 0 {
+		a.sessSplit.Preview.SetContent(dimStyle.Render("(no matches)"))
+		return
+	}
+	previewW := max(a.width-a.sessSplit.ListWidth(a.width, a.splitRatio)-1, 1)
+	content := renderConversationPreview(visible, previewW, a.sessConvCursor, a.sessConvExpanded, a.sessConvFilterTerm, isLive)
+	oldOffset := a.sessSplit.Preview.YOffset
+	a.sessSplit.Preview.SetContent(content)
+
+	// Scroll to keep cursor visible: estimate cursor line position
+	cursorLine := convCursorLine(visible, a.sessConvCursor, a.sessConvExpanded, previewW)
+	vpH := a.sessSplit.Preview.Height
+	totalLines := strings.Count(content, "\n") + 1
+	maxOffset := max(totalLines-vpH, 0)
+
+	if cursorLine < oldOffset {
+		a.sessSplit.Preview.YOffset = max(cursorLine-1, 0)
+	} else if cursorLine >= oldOffset+vpH {
+		a.sessSplit.Preview.YOffset = min(cursorLine-vpH/2, maxOffset)
+	} else {
+		a.sessSplit.Preview.YOffset = min(oldOffset, maxOffset)
+	}
+}
+
+// startConvSearch activates the search input for the conversation preview.
+func (a *App) startConvSearch() {
+	a.sessConvSearching = true
+	ti := textinput.New()
+	ti.Prompt = "Search: "
+	ti.Focus()
+	a.sessConvSearchInput = ti
+}
+
+// handleConvSearch processes keys while the conversation preview search is active.
+func (a *App) handleConvSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		term := a.sessConvSearchInput.Value()
+		a.sessConvSearching = false
+		if term == "" {
+			a.clearConvFilter()
+		} else {
+			a.sessConvFilterTerm = term
+			a.applyConvFilter(term)
+		}
+		return a, nil
+	case "esc":
+		a.sessConvSearching = false
+		return a, nil
+	}
+	var cmd tea.Cmd
+	a.sessConvSearchInput, cmd = a.sessConvSearchInput.Update(msg)
+	// Live filter as user types
+	term := a.sessConvSearchInput.Value()
+	if term != "" {
+		a.applyConvFilter(term)
+	} else {
+		a.sessConvFiltered = nil
+		a.sessConvCursor = 0
+		a.refreshConvPreview()
+	}
+	return a, cmd
+}
+
+// applyConvFilter filters conversation entries by the search term.
+func (a *App) applyConvFilter(term string) {
+	lower := strings.ToLower(term)
+	a.sessConvFiltered = nil
+	for i, m := range a.sessConvEntries {
+		text := strings.ToLower(session.EntryPreview(m.entry))
+		role := m.entry.Role
+		tools := strings.ToLower(mergedToolSummary(m.entry))
+		if strings.Contains(text, lower) || strings.Contains(role, lower) || strings.Contains(tools, lower) {
+			a.sessConvFiltered = append(a.sessConvFiltered, i)
+		}
+	}
+	visible := a.convVisibleEntries()
+	if a.sessConvCursor >= len(visible) {
+		a.sessConvCursor = max(len(visible)-1, 0)
+	}
+	a.sessConvExpanded = nil
+	a.refreshConvPreview()
+}
+
+// clearConvFilter removes the conversation preview filter.
+func (a *App) clearConvFilter() {
+	a.sessConvFilterTerm = ""
+	a.sessConvFiltered = nil
+	a.sessConvCursor = 0
+	a.sessConvExpanded = nil
+	a.refreshConvPreview()
+}
+
+// convCursorLine estimates the line number where the cursor entry starts.
+// Each entry is 1 line, plus wrapped text lines if expanded.
+// convMsgLines returns how many rendered lines a single conversation message takes.
+func convMsgLines(entry mergedMsg, idx int, expanded map[int]bool, width int) int {
+	lines := 1 // the one-line summary
+	if expanded != nil && expanded[idx] {
+		text := entryFullText(entry.entry)
+		if text != "" {
+			textW := max(width-4, 10)
+			lines += strings.Count(wrapText(text, textW), "\n") + 1
+		}
+	}
+	return lines
+}
+
+// convPageDown returns the cursor position after scrolling down by approximately vpHeight lines.
+func convPageDown(entries []mergedMsg, cursor int, expanded map[int]bool, width, vpHeight int) int {
+	budget := max(vpHeight-2, 1)
+	i := cursor
+	for i < len(entries)-1 && budget > 0 {
+		i++
+		budget -= convMsgLines(entries[i], i, expanded, width)
+	}
+	if i == cursor && i < len(entries)-1 {
+		i++ // always move at least one
+	}
+	return i
+}
+
+// convPageUp returns the cursor position after scrolling up by approximately vpHeight lines.
+func convPageUp(entries []mergedMsg, cursor int, expanded map[int]bool, width, vpHeight int) int {
+	budget := max(vpHeight-2, 1)
+	i := cursor
+	for i > 0 && budget > 0 {
+		i--
+		budget -= convMsgLines(entries[i], i, expanded, width)
+	}
+	if i == cursor && i > 0 {
+		i-- // always move at least one
+	}
+	return i
+}
+
+// convFirstVisible returns the index of the first message whose summary line is within [vpTop, vpBottom).
+func convFirstVisible(entries []mergedMsg, expanded map[int]bool, width, vpTop, vpBottom int) int {
+	line := 0
+	textW := max(width-4, 10)
+	for i, e := range entries {
+		if line >= vpTop && line < vpBottom {
+			return i
+		}
+		line++
+		if expanded != nil && expanded[i] {
+			text := entryFullText(e.entry)
+			if text != "" {
+				line += strings.Count(wrapText(text, textW), "\n") + 1
+			}
+		}
+	}
+	return len(entries) - 1
+}
+
+// convLastVisible returns the index of the last message whose summary line is within [vpTop, vpBottom).
+func convLastVisible(entries []mergedMsg, expanded map[int]bool, width, vpTop, vpBottom int) int {
+	line := 0
+	textW := max(width-4, 10)
+	last := 0
+	for i, e := range entries {
+		if line >= vpBottom {
+			break
+		}
+		if line >= vpTop {
+			last = i
+		}
+		line++
+		if expanded != nil && expanded[i] {
+			text := entryFullText(e.entry)
+			if text != "" {
+				line += strings.Count(wrapText(text, textW), "\n") + 1
+			}
+		}
+	}
+	return last
+}
+
+func convCursorLine(entries []mergedMsg, cursor int, expanded map[int]bool, width int) int {
+	line := 0
+	textW := max(width-4, 10)
+	for i := 0; i < cursor && i < len(entries); i++ {
+		line++ // the one-line summary
+		if expanded != nil && expanded[i] {
+			text := entryFullText(entries[i].entry)
+			if text != "" {
+				line += strings.Count(wrapText(text, textW), "\n") + 1
+			}
+		}
+	}
+	return line
+}
+
+// jumpToConvMessage opens the conversation view and selects the message
+// corresponding to the current conversation preview cursor.
+func (a *App) jumpToConvMessage() (tea.Model, tea.Cmd) {
+	visible := a.convVisibleEntries()
+	if len(visible) == 0 || a.sessConvCursor >= len(visible) {
+		return a, nil
+	}
+
+	item, ok := a.sessionList.SelectedItem().(sessionItem)
+	if !ok {
+		return a, nil
+	}
+
+	target := visible[a.sessConvCursor]
+
+	// Clear conversation filter state before switching views
+	a.sessConvFilterTerm = ""
+	a.sessConvFiltered = nil
+	a.sessConvSearching = false
+
+	// Open conversation (loads messages, builds items, creates list)
+	cmd := a.openConversation(item.sess)
+
+	// Find the target message in the conversation list by UUID or timestamp
+	bestIdx := 0
+	items := a.convList.Items()
+	found := false
+
+	if target.entry.UUID != "" {
+		for i, ci := range a.conv.items {
+			if ci.kind == convMsg && ci.merged.entry.UUID == target.entry.UUID {
+				bestIdx = i
+				found = true
+				break
+			}
+		}
+	}
+	if !found && !target.entry.Timestamp.IsZero() {
+		bestDist := time.Duration(math.MaxInt64)
+		for i, ci := range a.conv.items {
+			if ci.kind != convMsg || ci.merged.entry.Role != target.entry.Role {
+				continue
+			}
+			dist := ci.merged.entry.Timestamp.Sub(target.entry.Timestamp)
+			if dist < 0 {
+				dist = -dist
+			}
+			if dist < bestDist {
+				bestDist = dist
+				bestIdx = i
+			}
+		}
+	}
+
+	if bestIdx < len(items) {
+		a.convList.Select(bestIdx)
+	}
+	// Don't auto-snap for targeted jumps
+	a.liveTail = false
+	a.conv.split.BottomAlign = false
+	a.updateConvPreview()
+
+	return a, cmd
+}
+
+func (a *App) updateSessionStatsPreview(sess session.Session) {
+	// Use cached stats if available for this session
+	if a.sessStatsCacheKey != sess.ID || a.sessStatsCache == nil {
+		stats, err := session.ScanSessionStats(sess.FilePath)
+		if err != nil {
+			a.sessSplit.Preview.SetContent(dimStyle.Render("(stats error)"))
+			return
+		}
+		a.sessStatsCache = &stats
+		a.sessStatsCacheKey = sess.ID
+	}
+
+	previewW := max(a.width-a.sessSplit.ListWidth(a.width, a.splitRatio)-1, 1)
+	contentH := max(a.height-3, 1)
+	content := renderSessionStats(*a.sessStatsCache, previewW)
+	a.sessSplit.Preview = viewport.New(previewW, contentH)
+	a.sessSplit.Preview.SetContent(content)
+}
+
+func (a *App) updateSessionMemoryPreview(sess session.Session) {
+	if a.sessMemoryCacheKey != sess.ID {
+		a.sessMemoryCache = a.buildMemoryContent(sess)
+		a.sessMemoryCacheKey = sess.ID
+	}
+
+	previewW := max(a.width-a.sessSplit.ListWidth(a.width, a.splitRatio)-1, 1)
+	contentH := max(a.height-3, 1)
+	a.sessSplit.Preview = viewport.New(previewW, contentH)
+	a.sessSplit.Preview.SetContent(a.sessMemoryCache)
+}
+
+func (a *App) updateSessionTasksPlanPreview(sess session.Session) {
+	if a.sessTasksCacheKey != sess.ID {
+		a.sessTasksCache = a.buildTasksPlanContent(sess)
+		a.sessTasksCacheKey = sess.ID
+	}
+
+	previewW := max(a.width-a.sessSplit.ListWidth(a.width, a.splitRatio)-1, 1)
+	contentH := max(a.height-3, 1)
+	a.sessSplit.Preview = viewport.New(previewW, contentH)
+	a.sessSplit.Preview.SetContent(a.sessTasksCache)
+}
+
+func (a *App) buildTasksPlanContent(sess session.Session) string {
+	home, _ := os.UserHomeDir()
+	var sb strings.Builder
+
+	// Tasks
+	if len(sess.Tasks) > 0 {
+		completed := 0
+		for _, t := range sess.Tasks {
+			if t.Status == "completed" {
+				completed++
+			}
+		}
+		sb.WriteString(dimStyle.Render(fmt.Sprintf("── Tasks [%d/%d] ──", completed, len(sess.Tasks))) + "\n\n")
+		for _, t := range sess.Tasks {
+			icon := "○"
+			style := dimStyle
+			switch t.Status {
+			case "completed":
+				icon = "✓"
+				style = lipgloss.NewStyle().Foreground(colorAccent)
+			case "in_progress":
+				icon = "◉"
+				style = lipgloss.NewStyle().Foreground(colorAssistant)
+			}
+			sb.WriteString(style.Render(fmt.Sprintf("  %s %s", icon, t.Subject)) + "\n")
+			if t.Description != "" {
+				desc := t.Description
+				if idx := strings.Index(desc, "\n"); idx > 0 {
+					desc = desc[:idx]
+				}
+				if len(desc) > 80 {
+					desc = desc[:77] + "..."
+				}
+				sb.WriteString(dimStyle.Render("    "+desc) + "\n")
+			}
+		}
+		sb.WriteString("\n")
+	}
+
+	// Plans (show all distinct plans in order)
+	for i, slug := range sess.PlanSlugs {
+		path := filepath.Join(home, ".claude", "plans", slug+".md")
+		data, err := os.ReadFile(path)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		label := fmt.Sprintf("── Plan %d/%d: %s ──", i+1, len(sess.PlanSlugs), slug)
+		if len(sess.PlanSlugs) == 1 {
+			label = "── Plan: " + slug + " ──"
+		}
+		sb.WriteString(dimStyle.Render(label) + "\n\n")
+		sb.WriteString(strings.TrimRight(string(data), "\n") + "\n\n")
+	}
+
+	if sb.Len() == 0 {
+		return dimStyle.Render("No tasks or plans found for this session.")
+	}
+	return sb.String()
+}
+
+// buildMemoryContent produces the styled memory text for a session.
+func (a *App) buildMemoryContent(sess session.Session) string {
+	if sess.ProjectPath == "" {
+		return dimStyle.Render("(no project path)")
+	}
+
+	home, _ := os.UserHomeDir()
+	var sb strings.Builder
+
+	// Todos
+	if len(sess.Todos) > 0 {
+		completed := 0
+		for _, t := range sess.Todos {
+			if t.Status == "completed" {
+				completed++
+			}
+		}
+		sb.WriteString(dimStyle.Render(fmt.Sprintf("── Todos [%d/%d] ──", completed, len(sess.Todos))) + "\n\n")
+		for _, t := range sess.Todos {
+			icon := "○"
+			style := dimStyle
+			switch t.Status {
+			case "completed":
+				icon = "✓"
+				style = lipgloss.NewStyle().Foreground(colorAccent)
+			case "in_progress":
+				icon = "◉"
+				style = lipgloss.NewStyle().Foreground(colorAssistant)
+			}
+			sb.WriteString(style.Render(fmt.Sprintf("  %s %s", icon, t.Content)) + "\n")
+		}
+		sb.WriteString("\n")
+	}
+
+	// Auto-memory files
+	encoded := session.EncodeProjectPath(sess.ProjectPath)
+	memDir := home + "/.claude/projects/" + encoded + "/memory"
+	if entries, err := os.ReadDir(memDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			data, err := os.ReadFile(memDir + "/" + e.Name())
+			if err != nil || len(data) == 0 {
+				continue
+			}
+			sb.WriteString(dimStyle.Render("── "+e.Name()+" ──") + "\n\n")
+			sb.WriteString(strings.TrimRight(string(data), "\n") + "\n\n")
+		}
+	}
+
+	if sb.Len() == 0 {
+		return dimStyle.Render("No memory or todos found.")
+	}
+	return sb.String()
 }
 
 // --- Agent split pane ---
@@ -1989,69 +2236,6 @@ func (a *App) adjustSplitRatio(delta int) {
 	a.resizeAll()
 }
 
-func (a *App) renderAgentSplit() string {
-	if !a.agentSplit.Show || a.width < 40 || a.height < 10 {
-		return a.agentList.View()
-	}
-
-	listW := a.agentSplit.ListWidth(a.width, a.splitRatio)
-	previewW := max(a.width-listW-1, 1)
-	contentH := max(a.height-3, 1)
-
-	if a.agentList.Width() > 0 && (a.agentList.Width() != listW || a.agentList.Height() != contentH) {
-		a.agentList.SetSize(listW, contentH)
-	}
-
-	a.updateAgentPreview()
-
-	if a.agentSplit.Preview.Width != previewW || a.agentSplit.Preview.Height != contentH {
-		a.agentSplit.Preview.Width = previewW
-		a.agentSplit.Preview.Height = max(contentH, 1)
-		a.agentSplit.CacheKey = "" // force re-render at new width
-		a.updateAgentPreview()
-	}
-
-	borderColor := colorBorderDim
-	if a.agentSplit.Focus {
-		borderColor = colorBorderFocused
-	}
-
-	leftStyle := lipgloss.NewStyle().Width(listW).MaxWidth(listW).Height(contentH).MaxHeight(contentH)
-	rightStyle := lipgloss.NewStyle().Width(previewW).MaxWidth(previewW).Height(contentH).MaxHeight(contentH)
-	borderStyle := lipgloss.NewStyle().Foreground(borderColor).Height(contentH).MaxHeight(contentH)
-
-	left := leftStyle.Render(a.agentList.View())
-	border := borderStyle.Render(strings.Repeat("│\n", max(contentH-1, 0)) + "│")
-	right := rightStyle.Render(a.agentSplit.Preview.View())
-
-	return lipgloss.JoinHorizontal(lipgloss.Top, left, border, right)
-}
-
-func (a *App) updateAgentPreview() {
-	item, ok := a.agentList.SelectedItem().(agentItem)
-	if !ok {
-		return
-	}
-	if item.agent.ID == a.agentSplit.CacheKey {
-		return
-	}
-	a.agentSplit.CacheKey = item.agent.ID
-
-	entries, err := session.LoadMessages(item.agent.FilePath)
-	if err != nil || len(entries) == 0 {
-		a.agentSplit.Preview.SetContent(dimStyle.Render("(no messages)"))
-		return
-	}
-
-	previewW := max(a.width-a.agentSplit.ListWidth(a.width, a.splitRatio)-1, 1)
-	var sb strings.Builder
-	for _, e := range entries {
-		sb.WriteString(renderCompactMessage(e, previewW, 2))
-	}
-	contentH := max(a.height-3, 1)
-	a.agentSplit.Preview = viewport.New(previewW, contentH)
-	a.agentSplit.Preview.SetContent(sb.String())
-}
 
 // --- Helpers ---
 
@@ -2075,67 +2259,156 @@ func (a *App) refreshSessionPreviewLive() {
 		return
 	}
 
-	const headN, tailN = 3, 5
-	head, tail, total, err := session.LoadMessagesSummary(item.sess.FilePath, headN, tailN)
-	if err != nil || total == 0 {
+	if a.sessPreviewMode != sessPreviewConversation {
+		// Re-render non-message preview for live session
+		a.sessSplit.CacheKey = ""
+		if a.sessPreviewMode == sessPreviewStats {
+			a.sessStatsCache = nil
+			a.sessStatsCacheKey = ""
+			a.updateSessionStatsPreview(item.sess)
+		} else if a.sessPreviewMode == sessPreviewTasksPlan {
+			a.sessTasksCacheKey = ""
+			a.updateSessionTasksPlanPreview(item.sess)
+		} else {
+			a.sessMemoryCacheKey = ""
+			a.updateSessionMemoryPreview(item.sess)
+		}
 		return
 	}
 
+	// Reload entries (head+tail) and refresh conversation preview for live session
+	const liveHead, liveTail = 50, 50
+	head, tail, total, err := session.LoadMessagesSummary(item.sess.FilePath, liveHead, liveTail)
+	if err != nil || total == 0 {
+		return
+	}
+	headMerged := mergeConversationTurns(head)
+	var newConv []mergedMsg
+	if len(tail) == 0 {
+		newConv = headMerged
+	} else {
+		tailMerged := mergeConversationTurns(tail)
+		tailOffset := total - len(tail)
+		for i := range tailMerged {
+			tailMerged[i].startIdx += tailOffset
+			tailMerged[i].endIdx += tailOffset
+		}
+		newConv = append(headMerged, tailMerged...)
+	}
+	if len(newConv) == 0 {
+		return
+	}
+
+	oldCount := len(a.sessConvEntries)
+	a.sessConvEntries = filterConversation(newConv)
+
+	// Re-apply filter if active
+	if a.sessConvFilterTerm != "" {
+		a.applyConvFilter(a.sessConvFilterTerm)
+		return
+	}
+
+	// If new messages appeared and user hasn't scrolled up, move cursor to end
+	visible := a.convVisibleEntries()
+	if len(newConv) > oldCount && !a.sessPreviewPinned {
+		a.sessConvCursor = len(visible) - 1
+	}
+	if a.sessConvCursor >= len(visible) {
+		a.sessConvCursor = max(len(visible)-1, 0)
+	}
+
 	previewW := max(a.width-a.sessSplit.ListWidth(a.width, a.splitRatio)-1, 1)
-	var sb strings.Builder
-
-	for _, e := range head {
-		sb.WriteString(renderCompactMessage(e, previewW, 2))
-	}
-	if len(tail) > 0 {
-		skipped := total - len(head) - len(tail)
-		if skipped > 0 {
-			sb.WriteString(dimStyle.Render(fmt.Sprintf("  ... %d more messages ...\n", skipped)))
-		}
-		for _, e := range tail {
-			sb.WriteString(renderCompactMessage(e, previewW, 2))
-		}
-	}
-
-	a.sessSplit.Preview.SetContent(sb.String())
+	content := renderConversationPreview(visible, previewW, a.sessConvCursor, a.sessConvExpanded, a.sessConvFilterTerm, true)
+	a.sessSplit.Preview.SetContent(content)
 	if !a.sessPreviewPinned {
 		a.sessSplit.Preview.GotoBottom()
 	}
 }
 
-func (a *App) searchHints() string {
-	hintStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8"))
-	switch a.state {
-	case viewMessages, viewAgentMessages:
-		return helpStyle.Render("  hints: ") +
-			hintStyle.Render("role=user") + helpStyle.Render("  ") +
-			hintStyle.Render("role=asst") + helpStyle.Render("  ") +
-			hintStyle.Render("tool=Bash") + helpStyle.Render("  ") +
-			hintStyle.Render("tool=Read") + helpStyle.Render("  ") +
-			hintStyle.Render("tool=Edit") + helpStyle.Render("  ") +
-			hintStyle.Render("tool=Write") +
-			helpStyle.Render("  (space = AND)  enter: apply  esc: cancel")
-	case viewSessions:
-		return helpStyle.Render("  search by project, branch, session ID, or prompt text  enter: apply  esc: cancel")
-	default:
-		return helpStyle.Render("  enter: apply  esc: cancel")
+// formatHelp renders help text with highlighted shortcut keys.
+// Tokens with "key:desc" get the key part highlighted; others stay dim.
+func formatHelp(h string) string {
+	var sb strings.Builder
+	sb.WriteString("  ")
+	for i, token := range strings.Split(h, " ") {
+		if i > 0 {
+			sb.WriteString(" ")
+		}
+		if idx := strings.Index(token, ":"); idx > 0 && idx < len(token)-1 {
+			sb.WriteString(helpKeyStyle.Render(token[:idx]))
+			sb.WriteString(helpStyle.Render(":" + token[idx+1:]))
+		} else {
+			sb.WriteString(helpStyle.Render(token))
+		}
 	}
+	return sb.String()
+}
+
+func (a *App) searchHints() string {
+	h := lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8"))
+	d := helpStyle
+	sp := d.Render(" ")
+	tail := d.Render("  (space=AND)  enter:apply  esc:cancel")
+	switch a.state {
+	case viewSessions:
+		return d.Render("  ") +
+			h.Render("is:live") + sp + h.Render("is:wt") + sp + h.Render("is:team") + sp +
+			h.Render("has:mem") + sp + h.Render("has:todo") + sp + h.Render("has:task") + sp +
+			h.Render("has:plan") + sp + h.Render("has:agent") + sp + h.Render("has:compact") + sp +
+			h.Render("has:skill") + sp + h.Render("has:mcp") +
+			d.Render("  project  branch  prompt") + tail
+	case viewConversation:
+		return d.Render("  ") +
+			h.Render("role=user") + sp + h.Render("role=asst") + sp +
+			h.Render("tool=Bash") + sp + h.Render("tool=Read") + sp +
+			h.Render("tool=Edit") + sp + h.Render("tool=Write") + tail
+	default:
+		return d.Render("  enter:apply  esc:cancel")
+	}
+}
+
+func (a *App) syncAllFilterVisibility() {
+	syncFilterVisibility(&a.sessionList)
+	syncFilterVisibility(&a.convList)
 }
 
 func (a *App) isFiltering() bool {
 	switch a.state {
 	case viewSessions:
 		return a.sessionList.FilterState() == list.Filtering
-	case viewMessages:
-		return a.messageList.FilterState() == list.Filtering
-	case viewAgents:
-		return a.agentList.FilterState() == list.Filtering
-	case viewAgentMessages:
-		return a.agentMsgList.FilterState() == list.Filtering
-	case viewToolCalls:
-		return a.toolList.FilterState() == list.Filtering
+	case viewConversation:
+		return a.convList.FilterState() == list.Filtering
 	}
 	return false
+}
+
+func (a *App) hasFilterApplied() bool {
+	switch a.state {
+	case viewSessions:
+		return a.sessionList.FilterState() == list.FilterApplied
+	case viewConversation:
+		return a.convList.FilterState() == list.FilterApplied
+	}
+	return false
+}
+
+func (a *App) activeFilterValue() string {
+	switch a.state {
+	case viewSessions:
+		return a.sessionList.FilterInput.Value()
+	case viewConversation:
+		return a.convList.FilterInput.Value()
+	}
+	return ""
+}
+
+func (a *App) resetActiveFilter() {
+	switch a.state {
+	case viewSessions:
+		a.sessionList.ResetFilter()
+	case viewConversation:
+		a.convList.ResetFilter()
+	}
 }
 
 func (a *App) updateActiveList(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -2144,20 +2417,10 @@ func (a *App) updateActiveList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m, cmd := a.updateSessionList(msg)
 		a.updateSessionPreview()
 		return m, cmd
-	case viewMessages:
-		return a.updateMessageList(msg)
-	case viewAgents:
-		m, cmd := a.updateAgentList(msg)
-		if a.agentSplit.Show {
-			a.updateAgentPreview()
-		}
-		return m, cmd
-	case viewAgentMessages:
-		return a.updateAgentMsgList(msg)
-	case viewToolCalls:
-		if a.listReady(&a.toolList) {
+	case viewConversation:
+		if a.listReady(&a.convList) {
 			var cmd tea.Cmd
-			a.toolList, cmd = a.toolList.Update(msg)
+			a.convList, cmd = a.convList.Update(msg)
 			return a, cmd
 		}
 		return a, nil
@@ -2168,56 +2431,77 @@ func (a *App) updateActiveList(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (a *App) updateActiveComponent(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch a.state {
 	case viewSessions:
+		if a.moveMode {
+			var cmd tea.Cmd
+			a.moveInput, cmd = a.moveInput.Update(msg)
+			return a, cmd
+		}
+		if a.worktreeMode {
+			var cmd tea.Cmd
+			a.worktreeInput, cmd = a.worktreeInput.Update(msg)
+			return a, cmd
+		}
 		m, cmd := a.updateSessionList(msg)
 		a.updateSessionPreview()
 		return m, cmd
-	case viewMessages:
-		m, cmd := a.updateMessageList(msg)
-		a.updateMsgPreview(&a.msgSplit)
-		return m, cmd
-	case viewDetail:
-		var cmd tea.Cmd
-		a.detailVP, cmd = a.detailVP.Update(msg)
-		return a, cmd
-	case viewAgents:
-		m, cmd := a.updateAgentList(msg)
-		if a.agentSplit.Show {
-			a.updateAgentPreview()
-		}
-		return m, cmd
-	case viewAgentMessages:
-		m, cmd := a.updateAgentMsgList(msg)
-		a.updateMsgPreview(&a.agentMsgSplit)
-		return m, cmd
-	case viewAgentDetail:
-		var cmd tea.Cmd
-		a.agentDetailVP, cmd = a.agentDetailVP.Update(msg)
-		return a, cmd
-	case viewToolCalls:
-		if a.listReady(&a.toolList) {
+	case viewConversation:
+		if a.listReady(&a.convList) {
 			var cmd tea.Cmd
-			a.toolList, cmd = a.toolList.Update(msg)
-			if a.toolSplit.Show {
-				a.updateToolPreview(&a.toolSplit)
-			}
+			a.convList, cmd = a.convList.Update(msg)
 			return a, cmd
 		}
 		return a, nil
-	case viewMemory:
+	case viewMessageFull:
 		var cmd tea.Cmd
-		a.memoryVP, cmd = a.memoryVP.Update(msg)
+		a.msgFull.vp, cmd = a.msgFull.vp.Update(msg)
+		return a, cmd
+	case viewGlobalStats:
+		var cmd tea.Cmd
+		a.globalStatsVP, cmd = a.globalStatsVP.Update(msg)
 		return a, cmd
 	}
 	return a, nil
 }
 
-func (a *App) resizeAll() {
+// autoSelectSession selects the session matching a Claude process in the same tmux window.
+// When multiple sessions share the same project path, prefer the most recently modified
+// one (sessions are sorted by ModTime descending, so first match wins).
+// If the matched session is live, auto-enters it with live tail enabled.
+func (a *App) autoSelectSession() tea.Cmd {
+	for _, projPath := range currentTmuxWindowClaudes() {
+		absProj, _ := filepath.Abs(projPath)
+		if absProj == "" {
+			absProj = projPath
+		}
+		for i, s := range a.sessions {
+			sp := s.ProjectPath
+			absSP, _ := filepath.Abs(sp)
+			if absSP == "" {
+				absSP = sp
+			}
+			if absSP == absProj {
+				a.sessionList.Select(i)
+				// Auto-enter live sessions (only if TmuxAutoLive is enabled)
+				if s.IsLive && a.config.TmuxAutoLive {
+					a.currentSess = s
+					return a.openConversation(s)
+				}
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+func (a *App) resizeAll() tea.Cmd {
 	contentH := a.height - 3
+	var cmd tea.Cmd
 
 	sessW := a.sessSplit.ListWidth(a.width, a.splitRatio)
 	if a.sessionList.Width() == 0 {
-		a.sessionList = newSessionList(a.sessions, sessW, contentH)
+		a.sessionList = newSessionList(a.sessions, sessW, contentH, a.sessGroupMode)
 		a.sessSplit.CacheKey = ""
+		cmd = a.autoSelectSession()
 	} else if a.state == viewSessions {
 		idx := a.sessionList.Index()
 		a.sessionList.SetSize(sessW, contentH)
@@ -2228,63 +2512,56 @@ func (a *App) resizeAll() {
 		a.sessionList.SetSize(a.width, contentH)
 		a.sessionList.Select(idx)
 	}
-	if a.messageList.Width() > 0 {
-		idx := a.messageList.Index()
-		a.messageList.SetSize(a.msgSplit.ListWidth(a.width, a.splitRatio), contentH)
-		a.messageList.Select(idx)
-		a.msgSplit.CacheKey = ""
+	if a.globalStatsVP.Width > 0 {
+		a.globalStatsVP.Width = a.width
+		a.globalStatsVP.Height = contentH
 	}
-	if a.agentList.Width() > 0 {
-		idx := a.agentList.Index()
-		a.agentList.SetSize(a.agentSplit.ListWidth(a.width, a.splitRatio), contentH)
-		a.agentList.Select(idx)
-		a.agentSplit.CacheKey = ""
+	if a.liveModal && a.liveModalVP.Width > 0 {
+		a.liveModalVP.Width = a.liveModalWidth() - 2
+		a.liveModalVP.Height = a.liveModalHeight() - 2
 	}
-	if a.agentMsgList.Width() > 0 {
-		idx := a.agentMsgList.Index()
-		a.agentMsgList.SetSize(a.agentMsgSplit.ListWidth(a.width, a.splitRatio), contentH)
-		a.agentMsgList.Select(idx)
-		a.agentMsgSplit.CacheKey = ""
+	// Conversation split view
+	if a.convList.Width() > 0 {
+		idx := a.convList.Index()
+		a.convList.SetSize(a.conv.split.ListWidth(a.width, a.splitRatio), contentH)
+		a.convList.Select(idx)
 	}
-	if a.detailVP.Width > 0 {
-		a.detailVP.Width = a.width
-		a.detailVP.Height = contentH
+	// Message full view
+	if a.msgFull.vp.Width > 0 {
+		a.msgFull.vp.Width = a.width
+		a.msgFull.vp.Height = contentH
+		if a.msgFull.allMessages {
+			// Re-render all messages for new width
+			content := renderAllMessages(a.msgFull.merged, a.width)
+			a.msgFull.content = content
+			a.msgFull.vp.SetContent(content)
+		} else {
+			a.refreshMsgFullPreview()
+		}
 	}
-	if a.agentDetailVP.Width > 0 {
-		a.agentDetailVP.Width = a.width
-		a.agentDetailVP.Height = contentH
-	}
-	if a.toolList.Width() > 0 {
-		idx := a.toolList.Index()
-		a.toolList.SetSize(a.toolSplit.ListWidth(a.width, a.splitRatio), contentH)
-		a.toolList.Select(idx)
-		a.toolSplit.CacheKey = ""
-	}
-	if a.memoryVP.Width > 0 {
-		a.memoryVP.Width = a.width
-		a.memoryVP.Height = contentH
-	}
+	return cmd
 }
 
-// listPageEdge handles pgup on first page → select first item,
-// pgdown on last page → select last item. Returns true if handled.
-func listPageEdge(l *list.Model, key string) bool {
-	switch key {
-	case "pgup":
-		if l.Paginator.Page == 0 {
-			l.Select(0)
-			return true
-		}
-	case "pgdown":
-		if l.Paginator.Page >= l.Paginator.TotalPages-1 {
-			items := l.Items()
-			if len(items) > 0 {
-				l.Select(len(items) - 1)
+func (a *App) rebuildSessionList() {
+	selectedID := ""
+	if sel, ok := a.sessionList.SelectedItem().(sessionItem); ok {
+		selectedID = sel.sess.ID
+	}
+
+	contentH := max(a.height-3, 1)
+	sessW := a.sessSplit.ListWidth(a.width, a.splitRatio)
+	a.sessionList = newSessionList(a.sessions, sessW, contentH, a.sessGroupMode)
+	a.sessSplit.CacheKey = ""
+
+	// Restore cursor to previously selected session
+	if selectedID != "" {
+		for i, item := range a.sessionList.Items() {
+			if si, ok := item.(sessionItem); ok && si.sess.ID == selectedID {
+				a.sessionList.Select(i)
+				break
 			}
-			return true
 		}
 	}
-	return false
 }
 
 func (a *App) listReady(l *list.Model) bool {
@@ -2300,45 +2577,291 @@ func (a *App) updateSessionList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return a, cmd
 }
 
-func (a *App) updateMessageList(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if !a.listReady(&a.messageList) {
-		return a, nil
-	}
-	var cmd tea.Cmd
-	a.messageList, cmd = a.messageList.Update(msg)
-	return a, cmd
+
+// breadcrumbSegment tracks the X range and target for a clickable breadcrumb part.
+type breadcrumbSegment struct {
+	startX int
+	endX   int
+	state  viewState
+	action string // empty = navigate to state, non-empty = named action
 }
 
-func (a *App) updateAgentList(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if !a.listReady(&a.agentList) {
-		return a, nil
+// renderBreadcrumb builds the title bar with clickable segments and right-aligned item count.
+func (a *App) renderBreadcrumb() string {
+	type crumb struct {
+		label string
+		state viewState
 	}
-	var cmd tea.Cmd
-	a.agentList, cmd = a.agentList.Update(msg)
-	return a, cmd
-}
 
-func (a *App) updateAgentMsgList(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if !a.listReady(&a.agentMsgList) {
-		return a, nil
-	}
-	var cmd tea.Cmd
-	a.agentMsgList, cmd = a.agentMsgList.Update(msg)
-	return a, cmd
-}
+	var crumbs []crumb
 
-func (a *App) breadcrumb(parts ...string) string {
-	var rendered []string
-	for i, p := range parts {
-		if i == len(parts)-1 {
-			rendered = append(rendered, lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Render(p))
-		} else {
-			rendered = append(rendered, lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Render(p))
+	switch a.state {
+	case viewSessions:
+		crumbs = []crumb{{" Sessions", viewSessions}}
+		// Show selected project name in breadcrumb
+		if item, ok := a.sessionList.SelectedItem().(sessionItem); ok && a.sessionList.Width() > 0 {
+			proj := item.sess.ProjectName
+			if item.sess.GitBranch != "" {
+				proj += " (" + item.sess.GitBranch + ")"
+			}
+			crumbs = append(crumbs, crumb{proj, viewSessions})
+		}
+	case viewGlobalStats:
+		crumbs = []crumb{
+			{" Sessions", viewSessions},
+			{"Global Stats", viewGlobalStats},
+		}
+	case viewConversation:
+		crumbs = []crumb{
+			{" Sessions", viewSessions},
+			{a.currentSess.ShortID, viewConversation},
+		}
+		if a.conv.agent.ShortID != "" {
+			crumbs = append(crumbs, crumb{
+				"agent:" + a.conv.agent.ShortID,
+				viewConversation,
+			})
+		}
+	case viewMessageFull:
+		crumbs = []crumb{
+			{" Sessions", viewSessions},
+			{a.currentSess.ShortID, viewConversation},
+		}
+		// Add nav stack context
+		if a.msgFull.agent.ShortID != "" {
+			crumbs = append(crumbs, crumb{
+				"agent:" + a.msgFull.agent.ShortID,
+				viewMessageFull,
+			})
+		}
+		if a.msgFull.allMessages {
+			crumbs = append(crumbs, crumb{"Full", viewMessageFull})
+		} else if a.msgFull.idx < len(a.msgFull.merged) {
+			m := a.msgFull.merged[a.msgFull.idx]
+			crumbs = append(crumbs, crumb{
+				fmt.Sprintf("#%d %s", m.startIdx+1, strings.ToUpper(m.entry.Role)),
+				viewMessageFull,
+			})
 		}
 	}
-	sep := lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280")).Render(" > ")
-	text := strings.Join(rendered, sep)
-	return lipgloss.NewStyle().Background(colorPrimary).Padding(0, 1).Render(text)
+
+	// Build the styled breadcrumb and track click regions
+	a.breadcrumbSegs = a.breadcrumbSegs[:0]
+	sepText := " > "
+	sepStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280")).Background(colorPrimary)
+	parentStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Background(colorPrimary)
+	activeStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(colorPrimary)
+
+	var text string
+	x := 0
+	for i, c := range crumbs {
+		var part string
+		if i == len(crumbs)-1 {
+			part = activeStyle.Render(c.label)
+		} else {
+			part = parentStyle.Render(c.label)
+		}
+		partW := lipgloss.Width(part)
+		a.breadcrumbSegs = append(a.breadcrumbSegs, breadcrumbSegment{
+			startX: x,
+			endX:   x + partW,
+			state:  c.state,
+		})
+		text += part
+		x += partW
+		if i < len(crumbs)-1 {
+			sep := sepStyle.Render(sepText)
+			text += sep
+			x += lipgloss.Width(sep)
+		}
+	}
+
+	// Context action links (e.g. Agents, Tools, Memory)
+	type actionLink struct {
+		label  string
+		action string
+	}
+	var actions []actionLink
+	switch a.state {
+	case viewSessions:
+		if a.sessSplit.Show && a.sessPreviewMode != sessPreviewConversation {
+			label := "[Stats]"
+			if a.sessPreviewMode == sessPreviewMemory {
+				label = "[Memory]"
+			} else if a.sessPreviewMode == sessPreviewTasksPlan {
+				label = "[Tasks]"
+			}
+			actions = []actionLink{{label, ""}}
+		}
+	}
+
+	if len(actions) > 0 {
+		actionStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Background(colorPrimary)
+		sepAction := lipgloss.NewStyle().Foreground(lipgloss.Color("#4B5563")).Background(colorPrimary).Render("  ")
+		text += sepAction
+		x += lipgloss.Width(sepAction)
+		for i, act := range actions {
+			if i > 0 {
+				divider := lipgloss.NewStyle().Foreground(lipgloss.Color("#4B5563")).Background(colorPrimary).Render(" ")
+				text += divider
+				x += lipgloss.Width(divider)
+			}
+			label := actionStyle.Render(act.label)
+			labelW := lipgloss.Width(label)
+			a.breadcrumbSegs = append(a.breadcrumbSegs, breadcrumbSegment{
+				startX: x,
+				endX:   x + labelW,
+				action: act.action,
+			})
+			text += label
+			x += labelW
+		}
+	}
+
+	// Right-aligned status: item count + scroll % + loading
+	rightParts := a.breadcrumbRightStatus()
+	if rightParts != "" {
+		countStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#A1A1AA")).Background(colorPrimary)
+		rightStr := countStyle.Render(rightParts + " ")
+		rightW := lipgloss.Width(rightStr)
+		gap := max(a.width-x-rightW, 1)
+		text += lipgloss.NewStyle().Background(colorPrimary).Render(strings.Repeat(" ", gap)) + rightStr
+	}
+
+	// Fill remaining width
+	titleW := lipgloss.Width(text)
+	if titleW < a.width {
+		text += lipgloss.NewStyle().Background(colorPrimary).Render(strings.Repeat(" ", a.width-titleW))
+	}
+
+	return text
+}
+
+// breadcrumbRightStatus returns the right-aligned status text for the title bar.
+// Shows: item count, scroll %, and loading indicators.
+func (a *App) breadcrumbRightStatus() string {
+	var parts []string
+
+	// Session group mode badge
+	if a.state == viewSessions {
+		modeLabel := []string{"flat", "proj", "tree"}
+		parts = append(parts, modeLabel[a.sessGroupMode])
+	}
+
+	// Loading indicator
+	if a.globalStatsLoading {
+		idx := a.spinnerFrame % len(spinnerFrames)
+		frame := spinnerFrames[idx]
+		spinnerColors := []lipgloss.Color{"#10B981", "#3B82F6", "#F59E0B", "#7C3AED", "#EC4899"}
+		c := spinnerColors[a.spinnerFrame/len(spinnerFrames)%len(spinnerColors)]
+		s := lipgloss.NewStyle().Foreground(c).Bold(true)
+		parts = append(parts, s.Render(fmt.Sprintf("%s scanning %d sessions", frame, len(a.sessions))))
+	}
+
+	// Item count + page indicator for list views
+	count := a.activeListItemCount()
+	if count >= 0 {
+		l := a.activeList()
+		if l != nil && l.Paginator.TotalPages > 1 {
+			parts = append(parts, fmt.Sprintf("%d items  %d/%d", count, l.Paginator.Page+1, l.Paginator.TotalPages))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d items", count))
+		}
+	}
+
+	// Scroll position for viewports
+	var pct int = -1
+	switch a.state {
+	case viewSessions:
+		if a.sessSplit.Show {
+			pct = int(a.sessSplit.Preview.ScrollPercent() * 100)
+		}
+	case viewConversation:
+		if a.conv.split.Show {
+			pct = int(a.conv.split.Preview.ScrollPercent() * 100)
+		}
+	case viewMessageFull:
+		pct = int(a.msgFull.vp.ScrollPercent() * 100)
+	case viewGlobalStats:
+		pct = int(a.globalStatsVP.ScrollPercent() * 100)
+	}
+	if pct >= 0 {
+		parts = append(parts, fmt.Sprintf("%d%%", pct))
+	}
+
+	return strings.Join(parts, "  ")
+}
+
+func (a *App) activeList() *list.Model {
+	switch a.state {
+	case viewSessions:
+		if a.sessionList.Width() > 0 {
+			return &a.sessionList
+		}
+	case viewConversation:
+		if a.convList.Width() > 0 {
+			return &a.convList
+		}
+	}
+	return nil
+}
+
+func (a *App) activeListItemCount() int {
+	if l := a.activeList(); l != nil {
+		return len(l.Items())
+	}
+	return -1
+}
+
+// handleBreadcrumbClick checks if a title bar click is on a breadcrumb segment
+// and navigates to that view using proper open/load functions.
+func (a *App) handleBreadcrumbClick(mouseX int) (tea.Model, tea.Cmd) {
+	for _, seg := range a.breadcrumbSegs {
+		if mouseX >= seg.startX && mouseX < seg.endX {
+			if seg.action != "" {
+				return a.handleBreadcrumbAction(seg.action)
+			}
+			if seg.state != a.state {
+				return a.navigateTo(seg.state)
+			}
+		}
+	}
+	return a, nil
+}
+
+// handleBreadcrumbAction handles clicks on action links in the breadcrumb bar.
+func (a *App) handleBreadcrumbAction(action string) (tea.Model, tea.Cmd) {
+	// No action links in the new views
+	return a, nil
+}
+
+// navigateTo handles navigation to a target view state, loading data as needed.
+func (a *App) navigateTo(target viewState) (tea.Model, tea.Cmd) {
+	switch target {
+	case viewSessions:
+		a.state = viewSessions
+		return a, nil
+
+	case viewConversation:
+		if len(a.conv.items) > 0 {
+			a.state = viewConversation
+			return a, nil
+		}
+		return a, a.openConversation(a.currentSess)
+	}
+	return a, nil
+}
+
+// clampPaginator prevents stale page bounds that cause panics in bubbles list.View().
+func clampPaginator(l *list.Model) {
+	if items := l.VisibleItems(); len(items) > 0 {
+		maxPage := max((len(items)-1)/max(l.Paginator.PerPage, 1), 0)
+		if l.Paginator.Page > maxPage {
+			l.Paginator.Page = maxPage
+		}
+	} else {
+		l.Paginator.Page = 0
+	}
 }
 
 func scrollPreview(vp *viewport.Model, key string) {

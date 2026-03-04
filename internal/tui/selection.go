@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // configureListSearch customizes list search: changes prompt to "Search: ",
@@ -31,27 +32,151 @@ func configureListSearch(l *list.Model) {
 	)
 }
 
-// isSearchTrigger returns true for printable letter/digit keys that should
-// auto-activate the search prompt from a list view.
-func isSearchTrigger(k string) bool {
-	if len(k) != 1 {
-		return false
-	}
-	c := k[0]
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
-}
-
-// startListSearch activates the search prompt and seeds it with the given key.
-func startListSearch(l *list.Model, k string) tea.Cmd {
+// startListSearch activates the search prompt.
+// The filter input is rendered in the help line (not in the list header) so
+// that list items stay at a stable position.
+func startListSearch(l *list.Model) tea.Cmd {
 	if l.Width() == 0 {
 		return nil
 	}
-	// Simulate "/" to open filter, then type the letter
+	// Simulate "/" to open filter — must assign back because Update is a value receiver
 	openMsg := tea.KeyMsg(tea.Key{Type: tea.KeyRunes, Runes: []rune{'/'}})
-	_, cmd1 := l.Update(openMsg)
-	letterMsg := tea.KeyMsg(tea.Key{Type: tea.KeyRunes, Runes: []rune(k)})
-	_, cmd2 := l.Update(letterMsg)
-	return tea.Batch(cmd1, cmd2)
+	newL, cmd := l.Update(openMsg)
+	*l = newL
+	return cmd
+}
+
+// syncFilterVisibility is intentionally a no-op. The filter bar inside the
+// list is always hidden; the filter input is rendered in the bottom help line.
+func syncFilterVisibility(_ *list.Model) {}
+
+// highlightSnippet truncates text to maxW, centering the window around the
+// first case-insensitive match of term. The matched portion is rendered with
+// matchHighlight; the rest with baseStyle. If term is empty or not found, falls
+// back to normal head-truncation styled entirely in baseStyle.
+func highlightSnippet(text, term string, maxW int, baseStyle lipgloss.Style) string {
+	if maxW <= 0 {
+		return ""
+	}
+	// Fallback: simple truncation from head
+	truncate := func(s string) string {
+		if len(s) <= maxW {
+			return baseStyle.Render(s)
+		}
+		if maxW <= 3 {
+			return baseStyle.Render(s[:maxW])
+		}
+		return baseStyle.Render(s[:maxW-3] + "...")
+	}
+
+	if term == "" {
+		return truncate(text)
+	}
+
+	lower := strings.ToLower(text)
+	lowerTerm := strings.ToLower(term)
+	idx := strings.Index(lower, lowerTerm)
+	if idx < 0 {
+		return truncate(text)
+	}
+
+	matchLen := len(term)
+	matchEnd := idx + matchLen
+
+	// Text fits entirely — just highlight in place
+	if len(text) <= maxW {
+		return baseStyle.Render(text[:idx]) +
+			matchHighlight.Render(text[idx:matchEnd]) +
+			baseStyle.Render(text[matchEnd:])
+	}
+
+	// Need to extract a window. Compute how much visible space we have
+	// after reserving room for "..." on each side.
+	needLeft := idx > 0                // will we need left ellipsis?
+	needRight := matchEnd < len(text)  // will we need right ellipsis?
+	const ellipsis = "..."
+	const eW = 3
+
+	// Available chars for the actual snippet content
+	contentW := maxW
+	if needLeft {
+		contentW -= eW
+	}
+	if needRight {
+		contentW -= eW
+	}
+	if contentW < matchLen {
+		// Not enough room even for the match — show as much of match as possible
+		contentW = maxW
+		needLeft = false
+		needRight = false
+	}
+
+	// Center the match within contentW
+	pad := contentW - matchLen
+	leftPad := pad / 2
+	rightPad := pad - leftPad
+
+	winStart := idx - leftPad
+	winEnd := matchEnd + rightPad
+
+	// Clamp to text bounds and adjust
+	if winStart < 0 {
+		winEnd -= winStart // shift right
+		winStart = 0
+	}
+	if winEnd > len(text) {
+		winStart -= winEnd - len(text) // shift left
+		winEnd = len(text)
+	}
+	if winStart < 0 {
+		winStart = 0
+	}
+
+	// Re-evaluate ellipsis need after clamping
+	needLeft = winStart > 0
+	needRight = winEnd < len(text)
+
+	// Final safety: ensure slice bounds are valid
+	if winStart > len(text) {
+		winStart = len(text)
+	}
+	if winEnd > len(text) {
+		winEnd = len(text)
+	}
+	if winStart >= winEnd {
+		return truncate(text)
+	}
+
+	snippet := text[winStart:winEnd]
+	localIdx := idx - winStart
+	localEnd := matchEnd - winStart
+	if localIdx < 0 {
+		localIdx = 0
+	}
+	if localEnd > len(snippet) {
+		localEnd = len(snippet)
+	}
+
+	var sb strings.Builder
+	if needLeft {
+		sb.WriteString(baseStyle.Render(ellipsis))
+	}
+	sb.WriteString(baseStyle.Render(snippet[:localIdx]))
+	sb.WriteString(matchHighlight.Render(snippet[localIdx:localEnd]))
+	sb.WriteString(baseStyle.Render(snippet[localEnd:]))
+	if needRight {
+		sb.WriteString(baseStyle.Render(ellipsis))
+	}
+	return sb.String()
+}
+
+// listFilterTerm returns the active filter term for a list, or "" if not filtering.
+func listFilterTerm(m list.Model) string {
+	if m.FilterState() == list.Filtering || m.FilterState() == list.FilterApplied {
+		return m.FilterValue()
+	}
+	return ""
 }
 
 var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*m`)

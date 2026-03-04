@@ -4,286 +4,18 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/list"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/gavin-jeong/csb/internal/session"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/keyolk/ccx/internal/session"
 )
-
-type filterMode int
-
-const (
-	filterNone      filterMode = iota
-	filterUser                 // show only user messages
-	filterAssistant            // show only assistant messages
-	filterToolCalls            // show only messages with tool calls
-	filterSummary              // first user prompt + last assistant per turn
-	filterAgents               // show only messages with Task tool calls
-	filterSkills               // show only messages with Skill tool calls
-	filterModeCount            // sentinel for cycling
-)
-
-type messageItem struct {
-	entry    session.Entry
-	index    int // first original entry index (0-based)
-	endIndex int // last original entry index; > index when merged
-}
-
-func (m messageItem) FilterValue() string {
-	var parts []string
-
-	// Metadata prefixes for structured search (role=user, tool=Bash)
-	role := m.entry.Role
-	if role == "assistant" {
-		parts = append(parts, "role=assistant", "role=asst")
-	} else {
-		parts = append(parts, "role="+role)
-	}
-
-	// Collect unique tool names
-	toolSeen := make(map[string]bool)
-	for _, block := range m.entry.Content {
-		if block.Type == "tool_use" && !toolSeen[block.ToolName] {
-			parts = append(parts, "tool="+block.ToolName)
-			toolSeen[block.ToolName] = true
-		}
-	}
-
-	// Content for plain text search
-	for _, block := range m.entry.Content {
-		switch block.Type {
-		case "text":
-			text := block.Text
-			if len(text) > 300 {
-				text = text[:300]
-			}
-			parts = append(parts, text)
-		case "tool_use":
-			parts = append(parts, block.ToolName)
-			inp := block.ToolInput
-			if len(inp) > 200 {
-				inp = inp[:200]
-			}
-			parts = append(parts, inp)
-		case "tool_result":
-			text := block.Text
-			if len(text) > 200 {
-				text = text[:200]
-			}
-			parts = append(parts, text)
-		}
-	}
-	return strings.Join(parts, " ")
-}
-
-type messageDelegate struct {
-	idxWidth int // fixed column width for the index field
-}
-
-func (d messageDelegate) Height() int                             { return 1 }
-func (d messageDelegate) Spacing() int                            { return 0 }
-func (d messageDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
-
-func (d messageDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
-	mi, ok := item.(messageItem)
-	if !ok {
-		return
-	}
-
-	e := mi.entry
-	selected := index == m.Index()
-	width := m.Width()
-
-	cursor := "  "
-	if selected {
-		cursor = "> "
-	}
-
-	var role string
-	if e.Role == "user" {
-		role = userLabelStyle.Render("USER")
-	} else {
-		role = assistantLabelStyle.Render("ASST")
-	}
-
-	ts := "     " // 5 chars placeholder for "HH:MM"
-	if !e.Timestamp.IsZero() {
-		ts = e.Timestamp.Format("15:04")
-	}
-	ts = dimStyle.Render(ts)
-
-	// Fixed-width index column
-	var idxRaw string
-	if mi.endIndex > mi.index {
-		idxRaw = fmt.Sprintf("#%d-%d", mi.index+1, mi.endIndex+1)
-	} else {
-		idxRaw = fmt.Sprintf("#%d", mi.index+1)
-	}
-	idxW := d.idxWidth
-	if idxW < len(idxRaw) {
-		idxW = len(idxRaw)
-	}
-	idxStr := dimStyle.Render(fmt.Sprintf("%-*s", idxW, idxRaw))
-
-	// Fixed prefix: "> ASST 03:58 #2-159  "
-	// Columns: cursor(2) + role(4) + sp(1) + time(5) + sp(1) + idx(idxW) + sp(2)
-	prefix := cursor + role + " " + ts + " " + idxStr + "  "
-	prefixW := 2 + 4 + 1 + 5 + 1 + idxW + 2 // plain char width
-
-	preview := session.EntryPreview(e)
-	tools := mergedToolSummary(e)
-
-	// Build suffix (agent badge + tools)
-	var suffix string
-	suffixW := 0
-
-	if isAutoCompacted(e) {
-		badge := " " + compactBadgeStyle.Render("[AC]")
-		suffix = badge
-		suffixW = 1 + 4 // " [AC]"
-	}
-
-	var hasAgent, hasMCP bool
-	for _, block := range e.Content {
-		if block.Type == "tool_use" {
-			if block.ToolName == "Task" {
-				hasAgent = true
-			}
-			if strings.HasPrefix(block.ToolName, "mcp__") {
-				hasMCP = true
-			}
-		}
-	}
-	if hasAgent {
-		suffix += " " + agentBadgeStyle.Render("[A]")
-		suffixW += 1 + 3
-	}
-	if hasMCP {
-		suffix += " " + mcpBadgeStyle.Render("[M]")
-		suffixW += 1 + 3
-	}
-
-	if tools != "" {
-		toolPart := " " + toolStyle.Render(tools)
-		suffix += toolPart
-		suffixW += 1 + len(tools) // plain width
-	}
-
-	// Preview fills remaining space
-	availW := width - prefixW - suffixW
-	if availW > 3 && len(preview) > availW {
-		preview = preview[:availW-3] + "..."
-	} else if availW <= 3 {
-		preview = ""
-	}
-
-	pStyle := dimStyle
-	if selected {
-		pStyle = selectedStyle
-	}
-
-	fmt.Fprint(w, prefix+pStyle.Render(preview)+suffix)
-}
-
-// maxIndexWidth calculates the column width needed for the widest index string.
-func maxIndexWidth(msgs []mergedMsg) int {
-	w := 2 // minimum "#N"
-	for _, m := range msgs {
-		var s string
-		if m.endIdx > m.startIdx {
-			s = fmt.Sprintf("#%d-%d", m.startIdx+1, m.endIdx+1)
-		} else {
-			s = fmt.Sprintf("#%d", m.startIdx+1)
-		}
-		if len(s) > w {
-			w = len(s)
-		}
-	}
-	return w
-}
-
-func newMessageList(msgs []mergedMsg, width, height int) list.Model {
-	items := make([]list.Item, len(msgs))
-	for i, m := range msgs {
-		items[i] = messageItem{entry: m.entry, index: m.startIdx, endIndex: m.endIdx}
-	}
-
-	l := list.New(items, messageDelegate{idxWidth: maxIndexWidth(msgs)}, width, height)
-	l.SetShowTitle(false)
-	l.SetShowStatusBar(true)
-	l.SetFilteringEnabled(true)
-	l.SetShowHelp(false)
-	l.Filter = substringFilter
-	l.DisableQuitKeybindings()
-	configureListSearch(&l)
-	return l
-}
-
-func filterModeShort(mode filterMode) string {
-	switch mode {
-	case filterUser:
-		return "user"
-	case filterAssistant:
-		return "asst"
-	case filterToolCalls:
-		return "tools"
-	case filterSummary:
-		return "summary"
-	case filterAgents:
-		return "agents"
-	case filterSkills:
-		return "skills"
-	default:
-		return "all"
-	}
-}
-
-func filterModeTip(mode filterMode) string {
-	switch mode {
-	case filterUser:
-		return "Filter: user messages only"
-	case filterAssistant:
-		return "Filter: assistant messages only"
-	case filterToolCalls:
-		return "Filter: messages with tool calls"
-	case filterSummary:
-		return "Filter: summary (first prompt + last reply per turn)"
-	case filterAgents:
-		return "Filter: agent (Task) calls only"
-	case filterSkills:
-		return "Filter: skill invocations only"
-	default:
-		return "Filter: showing all messages"
-	}
-}
-
-func filterModeLabel(mode filterMode) string {
-	switch mode {
-	case filterUser:
-		return filterBadge.Render("[USER]")
-	case filterAssistant:
-		return filterBadge.Render("[ASSISTANT]")
-	case filterToolCalls:
-		return filterBadge.Render("[TOOLS]")
-	case filterSummary:
-		return filterBadge.Render("[SUMMARY]")
-	case filterAgents:
-		return filterBadge.Render("[AGENTS]")
-	case filterSkills:
-		return filterBadge.Render("[SKILLS]")
-	default:
-		return ""
-	}
-}
 
 func renderPlainMessage(e session.Entry) string {
 	var sb strings.Builder
 	for _, block := range e.Content {
 		switch block.Type {
 		case "text":
-			text := strings.TrimSpace(block.Text)
+			text := strings.TrimSpace(session.StripXMLTags(block.Text))
 			if text != "" {
 				sb.WriteString(text + "\n\n")
 			}
@@ -294,16 +26,173 @@ func renderPlainMessage(e session.Entry) string {
 			}
 			sb.WriteString("\n")
 		case "tool_result":
+			resultText := session.StripXMLTags(block.Text)
 			if block.IsError {
-				sb.WriteString("Error: " + block.Text + "\n\n")
+				sb.WriteString("Error: " + resultText + "\n\n")
 			} else {
-				sb.WriteString("Result: " + block.Text + "\n\n")
+				sb.WriteString("Result: " + resultText + "\n\n")
 			}
 		case "thinking":
 			sb.WriteString("(thinking) " + block.Text + "\n\n")
 		}
 	}
 	return sb.String()
+}
+
+// renderConversationPreview renders merged messages in the same one-line style
+// as the message list delegate. When expanded, the full text is shown below.
+func renderConversationPreview(msgs []mergedMsg, width, cursor int, expanded map[int]bool, filterTerm string, _ ...bool) string {
+	var sb strings.Builder
+	idxW := 2
+	for _, m := range msgs {
+		var s string
+		if m.endIdx > m.startIdx {
+			s = fmt.Sprintf("#%d-%d", m.startIdx+1, m.endIdx+1)
+		} else {
+			s = fmt.Sprintf("#%d", m.startIdx+1)
+		}
+		if len(s) > idxW {
+			idxW = len(s)
+		}
+	}
+
+	for i, m := range msgs {
+		e := m.entry
+		selected := i == cursor
+
+		// Classify message (same logic as messageDelegate)
+		hasText := false
+		hasTools := false
+		for _, b := range e.Content {
+			if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
+				hasText = true
+			}
+			if b.Type == "tool_use" {
+				hasTools = true
+			}
+		}
+		isToolOnly := e.Role == "assistant" && hasTools && !hasText
+		isCompacted := isAutoCompacted(e)
+
+		// Turn separator
+		isPrevDiffRole := false
+		if i > 0 {
+			isPrevDiffRole = msgs[i-1].entry.Role != e.Role
+		}
+
+		// Cursor
+		cursorStr := "  "
+		if selected {
+			cursorStr = convCursorStyle.Render("> ")
+		}
+
+		// Role
+		var role string
+		if isToolOnly {
+			role = toolOnlySepStyle.Render("│") + "   "
+		} else if e.Role == "user" {
+			if isPrevDiffRole && i > 0 {
+				cursorStr = convSepStyle.Render("─ ")
+				if selected {
+					cursorStr = convCursorStyle.Render("> ")
+				}
+			}
+			role = userLabelStyle.Render("USER")
+		} else {
+			role = assistantLabelStyle.Render("ASST")
+		}
+
+		// Time
+		ts := "     "
+		if !e.Timestamp.IsZero() {
+			ts = dimStyle.Render(e.Timestamp.Format("15:04"))
+		}
+
+		// Index
+		var idxRaw string
+		if m.endIdx > m.startIdx {
+			idxRaw = fmt.Sprintf("#%d-%d", m.startIdx+1, m.endIdx+1)
+		} else {
+			idxRaw = fmt.Sprintf("#%d", m.startIdx+1)
+		}
+		idxStr := dimStyle.Render(fmt.Sprintf("%-*s", idxW, idxRaw))
+
+		// Prefix: cursor(2) + role(4) + sp(1) + time(5) + sp(1) + idx(idxW) + sp(2)
+		prefix := cursorStr + role + " " + ts + " " + idxStr + "  "
+		prefixW := 2 + 4 + 1 + 5 + 1 + idxW + 2
+
+		preview := session.EntryPreview(e)
+
+		// Tool-only rows (no text, just tool calls): show tool count instead
+		toolCount := 0
+		for _, b := range e.Content {
+			if b.Type == "tool_use" {
+				toolCount++
+			}
+		}
+		var suffix string
+		suffixW := 0
+		if isToolOnly {
+			preview = ""
+			if toolCount > 0 {
+				tc := fmt.Sprintf("(%d tools)", toolCount)
+				suffix = " " + dimStyle.Render(tc)
+				suffixW = 1 + len(tc)
+			}
+		}
+
+		// Preview fills remaining space
+		availW := width - prefixW - suffixW
+
+		pStyle := dimStyle
+		if selected {
+			pStyle = selectedStyle
+		} else if isCompacted {
+			pStyle = acDimStyle
+		}
+
+		var styledPreview string
+		if filterTerm != "" && availW > 0 && preview != "" {
+			styledPreview = highlightSnippet(preview, filterTerm, availW, pStyle)
+		} else {
+			if availW > 3 && len(preview) > availW {
+				preview = preview[:availW-3] + "..."
+			} else if availW <= 3 {
+				preview = ""
+			}
+			styledPreview = pStyle.Render(preview)
+		}
+
+		sb.WriteString(prefix + styledPreview + suffix + "\n")
+
+		// Expanded: show full text below
+		if expanded != nil && expanded[i] {
+			textW := max(width-4, 10)
+			text := entryFullText(e)
+			if text != "" {
+				wrapped := wrapText(text, textW)
+				for _, line := range strings.Split(wrapped, "\n") {
+					sb.WriteString("    " + line + "\n")
+				}
+			}
+		}
+	}
+
+	return sb.String()
+}
+
+// entryFullText extracts all text content from an entry.
+func entryFullText(e session.Entry) string {
+	var parts []string
+	for _, b := range e.Content {
+		if b.Type == "text" {
+			text := strings.TrimSpace(session.StripXMLTags(b.Text))
+			if text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 // isAutoCompacted returns true if the entry is a context auto-compaction summary.
@@ -334,6 +223,7 @@ func defaultFolds(e session.Entry) foldSet {
 type renderedPreview struct {
 	content     string
 	blockStarts []int // line number where each content block begins
+	lineCount   int   // total line count (avoids redundant strings.Count)
 }
 
 func renderFullMessage(e session.Entry, width int) string {
@@ -367,14 +257,14 @@ func renderCompactMessage(e session.Entry, width, maxLines int) string {
 	for _, block := range e.Content {
 		switch block.Type {
 		case "text":
-			text := strings.TrimSpace(stripANSI(block.Text))
+			text := strings.TrimSpace(session.StripXMLTags(stripANSI(block.Text)))
 			if text != "" {
 				textParts = append(textParts, text)
 			}
 		case "tool_use":
 			tools = append(tools, block.ToolName)
 		case "tool_result":
-			text := strings.TrimSpace(stripANSI(block.Text))
+			text := strings.TrimSpace(session.StripXMLTags(stripANSI(block.Text)))
 			if text != "" {
 				// Truncate long tool results
 				if len(text) > 200 {
@@ -448,17 +338,35 @@ func truncateLines(text string, width, maxLines int) []string {
 	return lines
 }
 
+// renderAllMessages renders all merged messages into one concatenated string with separators.
+func renderAllMessages(merged []mergedMsg, width int) string {
+	var sb strings.Builder
+	ruler := strings.Repeat("─", max(min(width, 80), 0))
+	for i, m := range merged {
+		if i > 0 {
+			sb.WriteString("\n" + dimStyle.Render(ruler) + "\n\n")
+		}
+		sb.WriteString(renderFullMessage(m.entry, width))
+	}
+	return sb.String()
+}
+
 func renderFullMessageFolded(e session.Entry, width int, folds foldSet) string {
 	rp := renderFullMessageWithCursor(e, width, folds, nil, -1)
 	return rp.content
 }
 
 func renderFullMessageWithCursor(e session.Entry, width int, folds foldSet, formats foldSet, blockCursor int) renderedPreview {
-	var sb strings.Builder
 	w := max(width, 10)
 
+	// nlWriter counts actual newlines written, so blockStarts match the
+	// viewport's line indices exactly (lipgloss Render can add extra \n).
+	var nw nlWriter
+
 	var label string
-	if e.Role == "user" {
+	if isAutoCompacted(e) {
+		label = compactBadgeStyle.Render("COMPACTION SUMMARY")
+	} else if e.Role == "user" {
 		label = userLabelStyle.Render("USER")
 	} else {
 		label = assistantLabelStyle.Render("ASSISTANT")
@@ -472,64 +380,87 @@ func renderFullMessageWithCursor(e session.Entry, width int, folds foldSet, form
 		ts += "  " + dimStyle.Render("model="+e.Model)
 	}
 
-	sb.WriteString(label + ts + "\n")
+	nw.WriteString(label + ts + "\n")
 	ruler := max(min(w, 80), 0)
-	sb.WriteString(strings.Repeat("─", ruler) + "\n\n")
+	nw.WriteString(strings.Repeat("─", ruler) + "\n\n")
 
-	lineCount := 3 // header lines
 	blockStarts := make([]int, len(e.Content))
 
 	for i, block := range e.Content {
-		blockStarts[i] = lineCount
+		blockStarts[i] = nw.nl
 		folded := folds != nil && folds[i]
 		formatted := formats != nil && formats[i]
+		isSelected := blockCursor == i
 
-		// Block cursor marker
-		cursorPrefix := "  "
-		if blockCursor == i {
-			cursorPrefix = blockCursorStyle.Render("▶ ")
+		// Fold/format indicators (only in block-navigation mode)
+		isFoldable := block.Type == "tool_use" || block.Type == "tool_result" || block.Type == "thinking"
+		var cursorPrefix string
+		if blockCursor >= 0 {
+			indicator := " "
+			if isSelected {
+				// Selected block: bright indicator
+				if formatted {
+					indicator = blockCursorStyle.Render("✦")
+				} else if isFoldable {
+					if folded {
+						indicator = blockCursorStyle.Render("▸")
+					} else {
+						indicator = blockCursorStyle.Render("▾")
+					}
+				} else {
+					indicator = blockCursorStyle.Render("›")
+				}
+			} else {
+				// Non-selected block: dim indicator
+				if formatted {
+					indicator = dimStyle.Render("✦")
+				} else if isFoldable {
+					if folded {
+						indicator = dimStyle.Render("▸")
+					} else {
+						indicator = dimStyle.Render("▾")
+					}
+				}
+			}
+			cursorPrefix = indicator + " "
+		} else {
+			cursorPrefix = ""
 		}
+
+		// Write block content to a temp buffer; if selected, apply background
+		var buf strings.Builder
 
 		switch block.Type {
 		case "text":
-			text := strings.TrimSpace(block.Text)
-			if text != "" {
-				if blockCursor >= 0 {
-					sb.WriteString(cursorPrefix)
-				}
+			text := strings.TrimSpace(session.StripXMLTags(block.Text))
+			if text != "" && !isSystemText(text) {
+				buf.WriteString(cursorPrefix)
 				if formatted {
 					text = tryFormatJSON(text)
 				}
 				wrapped := wrapText(text, max(w-2, 10))
-				sb.WriteString(wrapped + "\n\n")
-				lineCount += strings.Count(wrapped, "\n") + 2
+				buf.WriteString(wrapped + "\n\n")
 			}
 		case "tool_use":
-			if blockCursor >= 0 {
-				sb.WriteString(cursorPrefix)
-			}
-			sb.WriteString(toolBlockStyle.Render("Tool: " + block.ToolName))
+			buf.WriteString(cursorPrefix)
+			buf.WriteString(toolBlockStyle.Render("Tool: " + block.ToolName))
 			if folded {
-				summary := stripANSI(block.ToolInput)
+				summary := session.StripXMLTags(stripANSI(block.ToolInput))
 				if len(summary) > 60 {
 					summary = summary[:57] + "..."
 				}
-				sb.WriteString("  " + dimStyle.Render(summary) + "\n")
-				lineCount++
+				buf.WriteString("  " + dimStyle.Render(summary) + "\n")
 			} else {
-				sb.WriteString("\n")
-				lineCount++
+				buf.WriteString("\n")
 				if block.ToolInput != "" {
-					input := stripANSI(block.ToolInput)
+					input := session.StripXMLTags(stripANSI(block.ToolInput))
 					if formatted {
 						input = tryFormatJSON(input)
 					}
 					wrapped := wrapText(input, w)
-					sb.WriteString(dimStyle.Render(wrapped) + "\n")
-					lineCount += strings.Count(wrapped, "\n") + 1
+					buf.WriteString(dimStyle.Render(wrapped) + "\n")
 				}
-				sb.WriteString("\n")
-				lineCount++
+				buf.WriteString("\n")
 			}
 		case "tool_result":
 			prefix := "Result: "
@@ -538,49 +469,91 @@ func renderFullMessageWithCursor(e session.Entry, width int, folds foldSet, form
 				prefix = "Error: "
 				style = errorStyle
 			}
-			if blockCursor >= 0 {
-				sb.WriteString(cursorPrefix)
-			}
+			buf.WriteString(cursorPrefix)
 			if folded {
-				summary := stripANSI(block.Text)
+				summary := session.StripXMLTags(stripANSI(block.Text))
 				if len(summary) > 60 {
 					summary = summary[:57] + "..."
 				}
-				sb.WriteString(style.Render(prefix+summary) + "\n")
-				lineCount++
+				buf.WriteString(style.Render(prefix+summary) + "\n")
 			} else {
-				sb.WriteString(style.Render(prefix) + "\n")
-				lineCount++
-				text := stripANSI(block.Text)
+				buf.WriteString(style.Render(prefix) + "\n")
+				text := session.StripXMLTags(stripANSI(block.Text))
 				if formatted {
 					text = tryFormatJSON(text)
 				}
 				wrapped := wrapText(text, w)
-				sb.WriteString(style.Render(wrapped) + "\n\n")
-				lineCount += strings.Count(wrapped, "\n") + 2
+				buf.WriteString(style.Render(wrapped) + "\n\n")
 			}
 		case "thinking":
-			if blockCursor >= 0 {
-				sb.WriteString(cursorPrefix)
-			}
+			buf.WriteString(cursorPrefix)
 			if folded {
 				summary := block.Text
 				if len(summary) > 60 {
 					summary = summary[:57] + "..."
 				}
-				sb.WriteString(dimStyle.Render("(thinking) "+summary) + "\n")
-				lineCount++
+				buf.WriteString(dimStyle.Render("(thinking) "+summary) + "\n")
 			} else {
-				sb.WriteString(dimStyle.Render("(thinking)") + "\n")
-				lineCount++
+				buf.WriteString(dimStyle.Render("(thinking)") + "\n")
 				wrapped := wrapText(block.Text, w)
-				sb.WriteString(dimStyle.Render(wrapped) + "\n\n")
-				lineCount += strings.Count(wrapped, "\n") + 2
+				buf.WriteString(dimStyle.Render(wrapped) + "\n\n")
 			}
+		}
+
+		// Apply background highlight to the selected block
+		if isSelected && buf.Len() > 0 {
+			raw := buf.String()
+			// Remove final newline so Split doesn't create an extra empty element
+			hasFinalNL := strings.HasSuffix(raw, "\n")
+			if hasFinalNL {
+				raw = raw[:len(raw)-1]
+			}
+			lines := strings.Split(raw, "\n")
+			for j, line := range lines {
+				nw.WriteString(applyBgToLine(line, w))
+				if j < len(lines)-1 || hasFinalNL {
+					nw.WriteString("\n")
+				}
+			}
+		} else {
+			nw.WriteString(buf.String())
 		}
 	}
 
-	return renderedPreview{content: sb.String(), blockStarts: blockStarts}
+	return renderedPreview{content: nw.sb.String(), blockStarts: blockStarts, lineCount: nw.nl}
+}
+
+// nlWriter wraps strings.Builder and counts newlines written,
+// so blockStarts always match the viewport's actual line indices.
+type nlWriter struct {
+	sb strings.Builder
+	nl int
+}
+
+func (w *nlWriter) WriteString(s string) {
+	w.sb.WriteString(s)
+	w.nl += strings.Count(s, "\n")
+}
+
+// padToWidth pads a line with spaces so background color fills the full width.
+// Uses lipgloss.Width for ANSI-aware measurement.
+func padToWidth(line string, width int) string {
+	visible := lipgloss.Width(line)
+	if visible >= width {
+		return line
+	}
+	return line + strings.Repeat(" ", width-visible)
+}
+
+// applyBgToLine applies the selected-block background to a line that may
+// contain inner ANSI resets. It re-applies the background after every \x1b[0m
+// so the highlight covers the full width without gaps.
+func applyBgToLine(line string, width int) string {
+	const bgCode = "\x1b[48;2;30;41;59m" // #1E293B
+	const resetCode = "\x1b[0m"
+	padded := padToWidth(line, width)
+	inner := strings.ReplaceAll(padded, resetCode, resetCode+bgCode)
+	return bgCode + inner + resetCode
 }
 
 // wrapText wraps text to the given width, preserving existing line breaks.

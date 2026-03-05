@@ -46,6 +46,27 @@ func renderSessionStats(stats session.SessionStats, width int) string {
 		sb.WriteString(fmt.Sprintf("  Rate      %s\n",
 			labelStyle.Render(fmt.Sprintf("%.1f msg/min", rate))))
 	}
+	if stats.CompactionCount > 0 {
+		warnStyle := lipgloss.NewStyle().Foreground(colorError)
+		sb.WriteString(fmt.Sprintf("  Compacted %s\n",
+			warnStyle.Render(fmt.Sprintf("%d×", stats.CompactionCount))))
+	}
+	if len(stats.TurnsPerRequest) > 0 {
+		avg, maxT := turnsStats(stats.TurnsPerRequest)
+		sb.WriteString(fmt.Sprintf("  Turns/Req %s",
+			numStyle.Render(fmt.Sprintf("%.1f avg", avg))))
+		sb.WriteString(labelStyle.Render(fmt.Sprintf("  (max %d, %d reqs)", maxT, len(stats.TurnsPerRequest))))
+		sb.WriteString("\n")
+		// Sparkline of turns per request
+		if len(stats.TurnsPerRequest) > 2 {
+			sparkW := min(width-12, 40)
+			if sparkW > 5 {
+				spark := sparkline(stats.TurnsPerRequest, sparkW)
+				sb.WriteString(fmt.Sprintf("  Per Req   %s\n",
+					labelStyle.Render(spark)))
+			}
+		}
+	}
 	sb.WriteString("\n")
 
 	// ── TOKENS ──
@@ -70,6 +91,13 @@ func renderSessionStats(stats session.SessionStats, width int) string {
 	sb.WriteString(fmt.Sprintf("  Cache Read  %s\n", labelStyle.Render(fmtNum(stats.TotalCacheReadTokens))))
 	sb.WriteString(fmt.Sprintf("  Cache Write %s\n", labelStyle.Render(fmtNum(stats.TotalCacheCreationTokens))))
 
+	// Cost estimate
+	cost := session.EstimateCost(stats.ModelTokens)
+	if cost > 0 {
+		costStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("214")) // orange
+		sb.WriteString(fmt.Sprintf("  Cost        %s\n", costStyle.Render(fmtCost(cost))))
+	}
+
 	// Sparkline for output tokens
 	if len(stats.OutputTokenSeries) > 1 {
 		sparkW := min(width-12, 60)
@@ -79,7 +107,37 @@ func renderSessionStats(stats session.SessionStats, width int) string {
 				outputStyle.Render(spark)))
 		}
 	}
+
+	// Tokens per turn
+	if stats.AsstMsgCount > 0 {
+		tokPerTurn := stats.TotalOutputTokens / int64(stats.AsstMsgCount)
+		sb.WriteString(fmt.Sprintf("  Out/Turn    %s\n", labelStyle.Render(fmtNum(tokPerTurn))))
+	}
 	sb.WriteString("\n")
+
+	// ── EFFICIENCY ──
+	hasEfficiency := stats.ModelSwitches > 0 || stats.AvgMsgGap > 0 || stats.ToolCounts["Agent"] > 0
+	if hasEfficiency {
+		sb.WriteString(titleStyle.Render("EFFICIENCY") + "\n")
+		sb.WriteString(ruler + "\n")
+		if stats.ModelSwitches > 0 {
+			sb.WriteString(fmt.Sprintf("  Model Switches  %s\n",
+				numStyle.Render(fmt.Sprintf("%d", stats.ModelSwitches))))
+		}
+		if agentCount := stats.ToolCounts["Agent"]; agentCount > 0 {
+			sb.WriteString(fmt.Sprintf("  Agent Spawns    %s\n",
+				numStyle.Render(fmt.Sprintf("%d", agentCount))))
+		}
+		if stats.AvgMsgGap > 0 {
+			sb.WriteString(fmt.Sprintf("  Avg Msg Gap     %s",
+				labelStyle.Render(fmtDuration(stats.AvgMsgGap))))
+			if stats.MaxMsgGap > 0 {
+				sb.WriteString(labelStyle.Render(fmt.Sprintf("  (max %s)", fmtDuration(stats.MaxMsgGap))))
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	}
 
 	// ── TOOLS ──
 	if len(stats.ToolCounts) > 0 {
@@ -311,6 +369,31 @@ func sparkline(values []int, maxWidth int) string {
 	return sb.String()
 }
 
+func turnsStats(turns []int) (avg float64, maxT int) {
+	if len(turns) == 0 {
+		return 0, 0
+	}
+	sum := 0
+	for _, t := range turns {
+		sum += t
+		if t > maxT {
+			maxT = t
+		}
+	}
+	avg = float64(sum) / float64(len(turns))
+	return
+}
+
+func fmtCost(usd float64) string {
+	if usd < 0.01 {
+		return fmt.Sprintf("$%.4f", usd)
+	}
+	if usd < 1.0 {
+		return fmt.Sprintf("$%.3f", usd)
+	}
+	return fmt.Sprintf("$%.2f", usd)
+}
+
 func fmtNum(n int64) string {
 	if n < 0 {
 		return "-" + fmtNum(-n)
@@ -393,6 +476,21 @@ func renderGlobalStats(stats session.GlobalStats, width int) string {
 		avgMsgs := stats.TotalMessages / stats.SessionCount
 		sb.WriteString(fmt.Sprintf("  Avg Msgs/Sess %s\n", labelStyle.Render(fmt.Sprintf("%d", avgMsgs))))
 	}
+	if stats.TotalCompactions > 0 {
+		warnStyle := lipgloss.NewStyle().Foreground(colorError)
+		sb.WriteString(fmt.Sprintf("  Compactions   %s",
+			warnStyle.Render(fmt.Sprintf("%d×", stats.TotalCompactions))))
+		sb.WriteString(labelStyle.Render(fmt.Sprintf(" (%d/%d sessions)",
+			stats.SessionsWithCompaction, stats.SessionCount)))
+		sb.WriteString("\n")
+	}
+	if len(stats.AllTurnsPerRequest) > 0 {
+		avg, maxT := turnsStats(stats.AllTurnsPerRequest)
+		sb.WriteString(fmt.Sprintf("  Turns/Req     %s",
+			numStyle.Render(fmt.Sprintf("%.1f avg", avg))))
+		sb.WriteString(labelStyle.Render(fmt.Sprintf("  (max %d, %d reqs)", maxT, len(stats.AllTurnsPerRequest))))
+		sb.WriteString("\n")
+	}
 	sb.WriteString("\n")
 
 	// ── TOKENS ──
@@ -416,11 +514,38 @@ func renderGlobalStats(stats session.GlobalStats, width int) string {
 	sb.WriteString(fmt.Sprintf("  Output      %s\n", outputStyle.Render(fmtNum(stats.TotalOutputTokens))))
 	sb.WriteString(fmt.Sprintf("  Cache Read  %s\n", labelStyle.Render(fmtNum(stats.TotalCacheReadTokens))))
 	sb.WriteString(fmt.Sprintf("  Cache Write %s\n", labelStyle.Render(fmtNum(stats.TotalCacheCreationTokens))))
+	if stats.TotalCostUSD > 0 {
+		costStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+		sb.WriteString(fmt.Sprintf("  Cost        %s", costStyle.Render(fmtCost(stats.TotalCostUSD))))
+		if stats.SessionCount > 0 {
+			avgCost := stats.TotalCostUSD / float64(stats.SessionCount)
+			sb.WriteString(labelStyle.Render(fmt.Sprintf("  (avg %s/sess)", fmtCost(avgCost))))
+		}
+		sb.WriteString("\n")
+	}
 	if stats.SessionCount > 0 {
 		avgOut := stats.TotalOutputTokens / int64(stats.SessionCount)
 		sb.WriteString(fmt.Sprintf("  Avg Out/Sess %s\n", labelStyle.Render(fmtNum(avgOut))))
 	}
 	sb.WriteString("\n")
+
+	// ── EFFICIENCY ──
+	hasEff := stats.TotalModelSwitches > 0 || stats.ToolCounts["Agent"] > 0
+	if hasEff {
+		sb.WriteString(titleStyle.Render("EFFICIENCY") + "\n")
+		sb.WriteString(ruler + "\n")
+		if stats.TotalModelSwitches > 0 {
+			sb.WriteString(fmt.Sprintf("  Model Switches  %s",
+				numStyle.Render(fmt.Sprintf("%d", stats.TotalModelSwitches))))
+			sb.WriteString(labelStyle.Render(fmt.Sprintf("  (%d sessions)", stats.SessionsWithSwitches)))
+			sb.WriteString("\n")
+		}
+		if agentCount := stats.ToolCounts["Agent"]; agentCount > 0 {
+			sb.WriteString(fmt.Sprintf("  Agent Spawns    %s\n",
+				numStyle.Render(fmt.Sprintf("%d", agentCount))))
+		}
+		sb.WriteString("\n")
+	}
 
 	// ── TOOLS ──
 	if len(stats.ToolCounts) > 0 {

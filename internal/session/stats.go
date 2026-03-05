@@ -52,6 +52,22 @@ type SessionStats struct {
 	UserMsgCount   int
 	AsstMsgCount   int
 
+	// Compaction
+	CompactionCount int // number of context compactions
+
+	// Turns per user request (assistant messages between consecutive fresh user messages)
+	TurnsPerRequest []int
+
+	// Per-model token usage (for cost estimation)
+	ModelTokens map[string]*ModelUsage
+
+	// Model switching: how many times the model changed between consecutive assistant messages
+	ModelSwitches int
+
+	// Message timing
+	AvgMsgGap time.Duration
+	MaxMsgGap time.Duration
+
 	// Models used
 	Models map[string]int
 }
@@ -83,6 +99,14 @@ var (
 	bTUIDColS  = []byte(`"tool_use_id": "`)
 )
 
+// ModelUsage tracks token counts per model for cost estimation.
+type ModelUsage struct {
+	InputTokens         int64
+	OutputTokens        int64
+	CacheReadTokens     int64
+	CacheCreationTokens int64
+}
+
 type rawUsage struct {
 	InputTokens         int64 `json:"input_tokens"`
 	OutputTokens        int64 `json:"output_tokens"`
@@ -106,6 +130,7 @@ func ScanSessionStats(path string) (SessionStats, error) {
 		SkillCounts:   make(map[string]int),
 		FilesTouched:  make(map[string]bool),
 		Models:        make(map[string]int),
+		ModelTokens:   make(map[string]*ModelUsage),
 		ToolErrors:    make(map[string]int),
 		SkillErrors:   make(map[string]int),
 		CommandErrors: make(map[string]int),
@@ -114,6 +139,18 @@ func ScanSessionStats(path string) (SessionStats, error) {
 	// Context tracking for error attribution
 	var toolIDMap map[string]string // tool_use_id -> tool_name (from last assistant msg)
 	var currentSkill, currentCommand string
+
+	// Turns-per-request tracking
+	asstTurnCount := 0  // assistant messages since last fresh user message
+	seenFirstUser := false
+
+	// Model switching tracking
+	var lastModel string
+
+	// Message gap tracking
+	var lastMsgTime time.Time
+	var totalGap time.Duration
+	var gapCount int
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 256*1024), 10*1024*1024)
@@ -124,8 +161,12 @@ func ScanSessionStats(path string) (SessionStats, error) {
 			continue
 		}
 
-		// Skip meta entries
-		if bytes.Contains(line, bIsMeta) || bytes.Contains(line, bIsMetaSpaced) {
+		// Count compactions (meta entries with isCompactSummary)
+		isMeta := bytes.Contains(line, bIsMeta) || bytes.Contains(line, bIsMetaSpaced)
+		if isMeta {
+			if bytes.Contains(line, bIsCompactSummary) || bytes.Contains(line, bIsCompactSummaryS) {
+				stats.CompactionCount++
+			}
 			continue
 		}
 
@@ -162,12 +203,29 @@ func ScanSessionStats(path string) (SessionStats, error) {
 			if ts.After(stats.LastTimestamp) {
 				stats.LastTimestamp = ts
 			}
+			// Message gap tracking
+			if !lastMsgTime.IsZero() {
+				gap := ts.Sub(lastMsgTime)
+				if gap > 0 {
+					totalGap += gap
+					gapCount++
+					if gap > stats.MaxMsgGap {
+						stats.MaxMsgGap = gap
+					}
+				}
+			}
+			lastMsgTime = ts
 		}
 
 		// Model (assistant messages)
 		if isAsst {
 			if model := extractStringField(line, bModelQ, bModelQS); model != "" {
 				stats.Models[model]++
+				// Model switching
+				if lastModel != "" && model != lastModel {
+					stats.ModelSwitches++
+				}
+				lastModel = model
 			}
 		}
 
@@ -179,6 +237,19 @@ func ScanSessionStats(path string) (SessionStats, error) {
 				stats.TotalCacheReadTokens += usage.CacheReadTokens
 				stats.TotalCacheCreationTokens += usage.CacheCreationTokens
 				stats.OutputTokenSeries = append(stats.OutputTokenSeries, int(usage.OutputTokens))
+				// Per-model token usage
+				model := extractStringField(line, bModelQ, bModelQS)
+				if model != "" {
+					mu := stats.ModelTokens[model]
+					if mu == nil {
+						mu = &ModelUsage{}
+						stats.ModelTokens[model] = mu
+					}
+					mu.InputTokens += usage.InputTokens
+					mu.OutputTokens += usage.OutputTokens
+					mu.CacheReadTokens += usage.CacheReadTokens
+					mu.CacheCreationTokens += usage.CacheCreationTokens
+				}
 			}
 		}
 
@@ -186,12 +257,23 @@ func ScanSessionStats(path string) (SessionStats, error) {
 		if isUser {
 			hasToolResult := bytes.Contains(line, bToolRes) || bytes.Contains(line, bToolResS)
 			if !hasToolResult {
+				// Fresh user request — record turns from previous request
+				if seenFirstUser && asstTurnCount > 0 {
+					stats.TurnsPerRequest = append(stats.TurnsPerRequest, asstTurnCount)
+				}
+				asstTurnCount = 0
+				seenFirstUser = true
 				currentSkill = ""
 				currentCommand = ""
 				if bytes.Contains(line, bCmdTag) {
 					currentCommand = extractFirstCommand(line)
 				}
 			}
+		}
+
+		// Count assistant turns for turns-per-request
+		if isAsst {
+			asstTurnCount++
 		}
 
 		// Tool use (assistant messages have tool_use blocks)
@@ -224,6 +306,16 @@ func ScanSessionStats(path string) (SessionStats, error) {
 				}
 			}
 		}
+	}
+
+	// Flush last request's turns
+	if seenFirstUser && asstTurnCount > 0 {
+		stats.TurnsPerRequest = append(stats.TurnsPerRequest, asstTurnCount)
+	}
+
+	// Average message gap
+	if gapCount > 0 {
+		stats.AvgMsgGap = totalGap / time.Duration(gapCount)
 	}
 
 	return stats, sc.Err()
@@ -502,10 +594,23 @@ type GlobalStats struct {
 
 	TotalWrites, TotalEdits, TotalFiles int
 	TotalToolResults, TotalToolErrors   int
+	TotalCompactions                    int
+	SessionsWithCompaction              int
+
+	// Cost estimation
+	TotalCostUSD   float64
+	ModelTokens    map[string]*ModelUsage
+
+	// Model switching
+	TotalModelSwitches    int
+	SessionsWithSwitches  int
 
 	ToolErrors    map[string]int // tool name -> error count
 	SkillErrors   map[string]int // skill name -> error count
 	CommandErrors map[string]int // command name -> error count
+
+	// Turns per request (aggregated across all sessions)
+	AllTurnsPerRequest []int // every request's turn count for distribution
 
 	SessionDurations []time.Duration // per-session durations for sparkline
 	SessionTokens    []int64         // output tokens per session for sparkline
@@ -519,6 +624,7 @@ func AggregateStats(sessions []Session) GlobalStats {
 		SkillCounts:   make(map[string]int),
 		CommandCounts: make(map[string]int),
 		Models:        make(map[string]int),
+		ModelTokens:   make(map[string]*ModelUsage),
 		ToolErrors:    make(map[string]int),
 		SkillErrors:   make(map[string]int),
 		CommandErrors: make(map[string]int),
@@ -546,6 +652,31 @@ func AggregateStats(sessions []Session) GlobalStats {
 		g.TotalEdits += stats.EditCount
 		g.TotalToolResults += stats.ToolResultCount
 		g.TotalToolErrors += stats.ToolErrorCount
+		g.TotalCompactions += stats.CompactionCount
+		if stats.CompactionCount > 0 {
+			g.SessionsWithCompaction++
+		}
+
+		// Cost and model tokens
+		sessCost := EstimateCost(stats.ModelTokens)
+		g.TotalCostUSD += sessCost
+		for model, mu := range stats.ModelTokens {
+			gmu := g.ModelTokens[model]
+			if gmu == nil {
+				gmu = &ModelUsage{}
+				g.ModelTokens[model] = gmu
+			}
+			gmu.InputTokens += mu.InputTokens
+			gmu.OutputTokens += mu.OutputTokens
+			gmu.CacheReadTokens += mu.CacheReadTokens
+			gmu.CacheCreationTokens += mu.CacheCreationTokens
+		}
+
+		// Model switches
+		g.TotalModelSwitches += stats.ModelSwitches
+		if stats.ModelSwitches > 0 {
+			g.SessionsWithSwitches++
+		}
 
 		for k, v := range stats.ToolCounts {
 			g.ToolCounts[k] += v
@@ -581,6 +712,7 @@ func AggregateStats(sessions []Session) GlobalStats {
 			g.SessionDurations = append(g.SessionDurations, dur)
 		}
 		g.SessionTokens = append(g.SessionTokens, stats.TotalOutputTokens)
+		g.AllTurnsPerRequest = append(g.AllTurnsPerRequest, stats.TurnsPerRequest...)
 	}
 
 	g.TotalFiles = len(allFiles)
@@ -589,6 +721,49 @@ func AggregateStats(sessions []Session) GlobalStats {
 	}
 
 	return g
+}
+
+// modelPricing holds per-million-token pricing for Claude models.
+type modelPricing struct {
+	input, output, cacheRead, cacheWrite float64
+}
+
+var claudePricing = map[string]modelPricing{
+	"opus":   {input: 15.0, output: 75.0, cacheRead: 1.50, cacheWrite: 18.75},
+	"sonnet": {input: 3.0, output: 15.0, cacheRead: 0.30, cacheWrite: 3.75},
+	"haiku":  {input: 1.0, output: 5.0, cacheRead: 0.10, cacheWrite: 1.25},
+}
+
+// EstimateCost computes approximate USD cost from per-model token usage.
+func EstimateCost(modelTokens map[string]*ModelUsage) float64 {
+	total := 0.0
+	for model, mu := range modelTokens {
+		p := matchPricing(model)
+		total += float64(mu.InputTokens) * p.input / 1_000_000
+		total += float64(mu.OutputTokens) * p.output / 1_000_000
+		total += float64(mu.CacheReadTokens) * p.cacheRead / 1_000_000
+		total += float64(mu.CacheCreationTokens) * p.cacheWrite / 1_000_000
+	}
+	return total
+}
+
+func matchPricing(model string) modelPricing {
+	for key, p := range claudePricing {
+		if len(model) >= len(key) && contains(model, key) {
+			return p
+		}
+	}
+	// Default to sonnet pricing
+	return claudePricing["sonnet"]
+}
+
+func contains(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }
 
 func countOccurrences(data, pattern []byte) int {

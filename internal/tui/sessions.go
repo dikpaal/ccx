@@ -571,6 +571,7 @@ func renderHelpOverlay(width, height int) string {
 	sb.WriteString("\n" + headerStyle.Render("  Keybindings") + "\n")
 	keys := []struct{ key, desc string }{
 		{"↵ / →", "Open session / preview"},
+		{"esc / ←", "Go back / close overlay"},
 		{"g", "Open project directory"},
 		{"e", "Edit session files"},
 		{"x", "Actions menu (delete, move, worktree)"},
@@ -581,6 +582,7 @@ func renderHelpOverlay(width, height int) string {
 		{"tab", "Toggle/cycle preview mode"},
 		{"L", "Live session modal (tmux)"},
 		{"?", "This help screen"},
+		{"q", "Quit"},
 	}
 	for _, k := range keys {
 		sb.WriteString(fmt.Sprintf("    %-14s %s\n", k.key, dimStyle.Render(k.desc)))

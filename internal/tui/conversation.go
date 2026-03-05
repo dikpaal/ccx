@@ -382,6 +382,75 @@ func buildConvItems(merged []mergedMsg, agents []session.Subagent, tasks []sessi
 	return items
 }
 
+// extractInlineTasks builds a task list from TaskCreate/TaskUpdate tool calls
+// in the conversation entries. Used as fallback when no file-based tasks exist.
+func extractInlineTasks(entries []session.Entry) []session.TaskItem {
+	tasks := make(map[string]*session.TaskItem) // keyed by task ID
+	var order []string                           // preserve creation order
+	nextID := 1
+
+	for _, e := range entries {
+		if e.Role != "assistant" {
+			continue
+		}
+		for _, b := range e.Content {
+			if b.Type != "tool_use" {
+				continue
+			}
+			switch b.ToolName {
+			case "TaskCreate":
+				var input struct {
+					Subject     string `json:"subject"`
+					Description string `json:"description"`
+				}
+				json.Unmarshal([]byte(b.ToolInput), &input)
+				if input.Subject == "" {
+					continue
+				}
+				id := fmt.Sprintf("%d", nextID)
+				nextID++
+				t := &session.TaskItem{
+					ID:          id,
+					Subject:     input.Subject,
+					Description: input.Description,
+					Status:      "pending",
+				}
+				tasks[id] = t
+				order = append(order, id)
+			case "TaskUpdate":
+				var input struct {
+					TaskID  string `json:"taskId"`
+					Status  string `json:"status"`
+					Subject string `json:"subject"`
+				}
+				json.Unmarshal([]byte(b.ToolInput), &input)
+				if input.TaskID == "" {
+					continue
+				}
+				t, ok := tasks[input.TaskID]
+				if !ok {
+					// Task created before our scan window; create a stub
+					t = &session.TaskItem{ID: input.TaskID, Status: "pending"}
+					tasks[input.TaskID] = t
+					order = append(order, input.TaskID)
+				}
+				if input.Status != "" {
+					t.Status = input.Status
+				}
+				if input.Subject != "" {
+					t.Subject = input.Subject
+				}
+			}
+		}
+	}
+
+	result := make([]session.TaskItem, 0, len(order))
+	for _, id := range order {
+		result = append(result, *tasks[id])
+	}
+	return result
+}
+
 // taskOpResult holds both compact (for list label) and detailed (for preview) summaries.
 type taskOpResult struct {
 	compact  string // one-line summary for conv list
@@ -517,8 +586,15 @@ func (a *App) openConversation(sess session.Session) tea.Cmd {
 	agents, _ := session.FindSubagents(sess.FilePath)
 	a.conv.agents = agents
 
-	// Build conversation items
-	a.conv.items = buildConvItems(a.conv.merged, agents, sess.Tasks)
+	// Build conversation items — use file-based tasks, or extract from JSONL
+	tasks := sess.Tasks
+	if len(tasks) == 0 {
+		tasks = extractInlineTasks(entries)
+		sess.Tasks = tasks
+		a.conv.sess = sess
+		a.currentSess = sess
+	}
+	a.conv.items = buildConvItems(a.conv.merged, agents, tasks)
 
 	if info, err := os.Stat(sess.FilePath); err == nil {
 		a.lastMsgLoadTime = info.ModTime()
@@ -968,7 +1044,12 @@ func (a *App) refreshConversation() tea.Cmd {
 	a.conv.merged = filterConversation(mergeConversationTurns(entries))
 	agents, _ := session.FindSubagents(a.conv.sess.FilePath)
 	a.conv.agents = agents
-	a.conv.items = buildConvItems(a.conv.merged, agents, a.conv.sess.Tasks)
+	tasks := a.conv.sess.Tasks
+	if len(tasks) == 0 {
+		tasks = extractInlineTasks(entries)
+		a.conv.sess.Tasks = tasks
+	}
+	a.conv.items = buildConvItems(a.conv.merged, agents, tasks)
 
 	// Preserve cursor position
 	oldIdx := a.convList.Index()

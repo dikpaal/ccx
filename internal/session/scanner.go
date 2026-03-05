@@ -38,6 +38,8 @@ var (
 	bSkillToolS        = []byte(`"name": "Skill"`)
 	bMCPTool           = []byte(`"name":"mcp__`)
 	bMCPToolS          = []byte(`"name": "mcp__`)
+	bTaskCreate        = []byte(`"name":"TaskCreate"`)
+	bTaskCreateS       = []byte(`"name": "TaskCreate"`)
 
 	decodedPathCache sync.Map // dirName → decoded path (string, "" if unresolvable)
 )
@@ -232,6 +234,11 @@ func scanSessionStream(path string, modTime time.Time, home string) Session {
 		if !sess.HasMCP {
 			if bytes.Contains(line, bMCPTool) || bytes.Contains(line, bMCPToolS) {
 				sess.HasMCP = true
+			}
+		}
+		if !sess.HasTasks {
+			if bytes.Contains(line, bTaskCreate) || bytes.Contains(line, bTaskCreateS) {
+				sess.HasTasks = true
 			}
 		}
 

@@ -429,11 +429,11 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.sessPreviewMode = sessPreviewConversation
 			a.sessSplit.CacheKey = ""
 			return a, nil
+		} else if a.paneProxy.scrolled {
+			// User is scrolling through history — don't overwrite content
 		} else {
 			a.sessSplit.Preview.SetContent(msg.content)
-			if a.paneProxy == nil || !a.paneProxy.scrolled {
-				a.sessSplit.Preview.GotoBottom()
-			}
+			a.sessSplit.Preview.GotoBottom()
 		}
 		return a, nil
 
@@ -534,7 +534,7 @@ func (a *App) View() string {
 			// Pane proxy focused: show proxy-specific help with indicator
 			if a.sessSplit.Focus && a.paneProxy != nil && a.sessPreviewMode == sessPreviewLive {
 				indicator := a.paneProxyIndicator()
-				h := "keys→pane ^B/F:scroll ^⇧J:jump ^Q:unfocus S-↵:newline"
+				h := "keys→pane ^B/F:scroll ^G:jump ^Q:unfocus S-↵:newline"
 				help = "  " + indicator + " " + formatHelp(h)
 			} else if a.paneProxy != nil && a.sessPreviewMode == sessPreviewLive && !a.sessSplit.Focus {
 				indicator := a.paneProxyIndicator()
@@ -839,8 +839,8 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.paneProxy.scrolled = false
 			sp.Focus = false
 			return a, tea.Batch(capturePaneCmd(a.paneProxy.pane), liveTickCmd())
-		case "ctrl+J":
-			// Jump to the actual tmux pane (ctrl+shift+j; ctrl+j = enter)
+		case "ctrl+g":
+			// Jump to the actual tmux pane
 			if err := switchToTmuxPane(a.paneProxy.pane); err != nil {
 				a.copiedMsg = "Switch failed"
 			}
@@ -852,14 +852,19 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				content, err := tmuxCapturePaneWithScrollback(a.paneProxy.pane)
 				if err == nil {
 					sp.Preview.SetContent(content)
-					sp.Preview.GotoBottom()
+					// Set offset to end manually
+					total := sp.Preview.TotalLineCount()
+					maxOff := max(total-sp.Preview.Height, 0)
+					sp.Preview.SetYOffset(maxOff)
 				}
 			}
 			if key == "ctrl+b" {
-				scrollPreview(&sp.Preview, "pgup")
+				sp.Preview.SetYOffset(max(sp.Preview.YOffset-sp.Preview.Height, 0))
 			} else {
-				scrollPreview(&sp.Preview, "pgdown")
+				maxOff := max(sp.Preview.TotalLineCount()-sp.Preview.Height, 0)
+				sp.Preview.SetYOffset(min(sp.Preview.YOffset+sp.Preview.Height, maxOff))
 			}
+			a.copiedMsg = fmt.Sprintf("scroll: %d/%d", sp.Preview.YOffset, max(sp.Preview.TotalLineCount()-sp.Preview.Height, 0))
 			if sp.Preview.AtBottom() {
 				a.paneProxy.scrolled = false
 			}

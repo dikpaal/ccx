@@ -832,26 +832,29 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a.handleWorktreeInput(msg)
 	}
 
-	// Pane proxy focused: scroll via tmux copy mode, rest forwarded to tmux
+	// Pane proxy focused: local scroll for history, other keys forwarded to tmux
 	if a.isPaneProxyFocused() {
 		switch key {
 		case "ctrl+q":
-			tmuxCopyModeScroll(a.paneProxy.pane, "cancel")
 			a.paneProxy.scrolled = false
 			sp.Focus = false
 			return a, tea.Batch(capturePaneCmd(a.paneProxy.pane), liveTickCmd())
-		case "pgup", "ctrl+b":
-			a.paneProxy.scrolled = true
-			return a, a.liveScrollCmd("page-up")
-		case "pgdown", "ctrl+f":
-			a.paneProxy.scrolled = true
-			return a, a.liveScrollCmd("page-down")
-		case "ctrl+u":
-			a.paneProxy.scrolled = true
-			return a, a.liveScrollCmd("halfpage-up")
-		case "ctrl+d":
-			a.paneProxy.scrolled = true
-			return a, a.liveScrollCmd("halfpage-down")
+		case "pgup", "ctrl+b", "pgdown", "ctrl+f", "ctrl+u", "ctrl+d", "up", "down", "home", "end":
+			// First scroll: fetch scrollback history into viewport
+			if !a.paneProxy.scrolled {
+				a.paneProxy.scrolled = true
+				content, err := tmuxCapturePaneWithScrollback(a.paneProxy.pane)
+				if err == nil {
+					sp.Preview.SetContent(content)
+					sp.Preview.GotoBottom()
+				}
+			}
+			scrollPreview(&sp.Preview, key)
+			// If we scrolled back to bottom, exit scroll mode
+			if sp.Preview.AtBottom() {
+				a.paneProxy.scrolled = false
+			}
+			return a, nil
 		}
 		return a.handlePaneProxyKey(key)
 	}
@@ -977,8 +980,7 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if sp.Focus && sp.Show && a.sessPreviewMode == sessPreviewConversation {
 			// Delegate to conversation handler (collapse), fall through below
 		} else if sp.Focus && sp.Show {
-			if a.paneProxy != nil && a.paneProxy.scrolled {
-				tmuxCopyModeScroll(a.paneProxy.pane, "cancel")
+			if a.paneProxy != nil {
 				a.paneProxy.scrolled = false
 			}
 			sp.Focus = false
@@ -1058,20 +1060,6 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmd, previewCmd)
 	}
 	return m, cmd
-}
-
-// liveScrollCmd sends a tmux copy-mode scroll command and re-captures the pane.
-func (a *App) liveScrollCmd(direction string) tea.Cmd {
-	pane := a.paneProxy.pane
-	return func() tea.Msg {
-		tmuxCopyModeScroll(pane, direction)
-		time.Sleep(20 * time.Millisecond)
-		content, err := tmuxCapturePane(pane)
-		if err != nil || !hasClaude(pane.PID) {
-			return liveCaptureMsg{failed: true}
-		}
-		return liveCaptureMsg{content: content}
-	}
 }
 
 // handlePaneProxyKey forwards a key to the tmux pane and captures the result.

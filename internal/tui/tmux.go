@@ -378,10 +378,20 @@ func tmuxPromptAndSend(p tmuxPane, promptText string) error {
 }
 
 // tmuxCapturePane captures the visible content of a tmux pane.
-// Does NOT include scrollback — use tmux copy mode to scroll back.
+// Does NOT include scrollback.
 func tmuxCapturePane(p tmuxPane) (string, error) {
 	target := p.Session + ":" + p.Window + "." + p.Pane
 	out, err := exec.Command("tmux", "capture-pane", "-e", "-p", "-t", target).Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(string(out), "\n"), nil
+}
+
+// tmuxCapturePaneWithScrollback captures the visible content plus scrollback history.
+func tmuxCapturePaneWithScrollback(p tmuxPane) (string, error) {
+	target := p.Session + ":" + p.Window + "." + p.Pane
+	out, err := exec.Command("tmux", "capture-pane", "-e", "-p", "-S", "-500", "-t", target).Output()
 	if err != nil {
 		return "", err
 	}

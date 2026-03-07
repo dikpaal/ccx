@@ -77,9 +77,10 @@ func capturePaneCmd(p tmuxPane) tea.Cmd {
 
 // paneProxyState holds state for both live preview and shell-in-preview.
 type paneProxyState struct {
-	pane    tmuxPane
-	sessID  string // non-empty for live Claude preview, empty for shell
-	isShell bool   // true = we spawned this pane, must kill on close
+	pane     tmuxPane
+	sessID   string // non-empty for live Claude preview, empty for shell
+	isShell  bool   // true = we spawned this pane, must kill on close
+	scrolled bool   // user scrolled up in local viewport
 }
 
 type viewState int
@@ -430,7 +431,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, nil
 		} else {
 			a.sessSplit.Preview.SetContent(msg.content)
-			a.sessSplit.Preview.GotoBottom()
+			if a.paneProxy == nil || !a.paneProxy.scrolled {
+				a.sessSplit.Preview.GotoBottom()
+			}
 		}
 		return a, nil
 
@@ -531,7 +534,7 @@ func (a *App) View() string {
 			// Pane proxy focused: show proxy-specific help with indicator
 			if a.sessSplit.Focus && a.paneProxy != nil && a.sessPreviewMode == sessPreviewLive {
 				indicator := a.paneProxyIndicator()
-				h := "keys→pane ^J:jump ^Q:unfocus"
+				h := "keys→pane ^↑↓:scroll ^J:jump ^Q:unfocus S-↵:newline"
 				help = "  " + indicator + " " + formatHelp(h)
 			} else if a.paneProxy != nil && a.sessPreviewMode == sessPreviewLive && !a.sessSplit.Focus {
 				indicator := a.paneProxyIndicator()
@@ -833,6 +836,7 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if a.isPaneProxyFocused() {
 		switch key {
 		case "ctrl+q":
+			a.paneProxy.scrolled = false
 			sp.Focus = false
 			return a, tea.Batch(capturePaneCmd(a.paneProxy.pane), liveTickCmd())
 		case "ctrl+j":
@@ -841,6 +845,28 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				a.copiedMsg = "Switch failed"
 			}
 			return a, nil
+		case "ctrl+up", "ctrl+down":
+			// Local viewport scroll with scrollback
+			if !a.paneProxy.scrolled {
+				a.paneProxy.scrolled = true
+				content, err := tmuxCapturePaneWithScrollback(a.paneProxy.pane)
+				if err == nil {
+					sp.Preview.SetContent(content)
+					sp.Preview.GotoBottom()
+				}
+			}
+			if key == "ctrl+up" {
+				scrollPreview(&sp.Preview, "up")
+			} else {
+				scrollPreview(&sp.Preview, "down")
+			}
+			if sp.Preview.AtBottom() {
+				a.paneProxy.scrolled = false
+			}
+			return a, nil
+		case "shift+enter":
+			// Send backslash + enter for multi-line input in Claude
+			return a, a.liveNewlineCmd()
 		}
 		return a.handlePaneProxyKey(key)
 	}
@@ -1049,6 +1075,22 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // Uses captureAfterKeyCmd to send key + capture in one Cmd (no polling needed).
 func (a *App) handlePaneProxyKey(key string) (tea.Model, tea.Cmd) {
 	return a, captureAfterKeyCmd(a.paneProxy.pane, key)
+}
+
+// liveNewlineCmd sends backslash + Enter to the tmux pane for multi-line input.
+func (a *App) liveNewlineCmd() tea.Cmd {
+	pane := a.paneProxy.pane
+	return func() tea.Msg {
+		target := pane.Session + ":" + pane.Window + "." + pane.Pane
+		exec.Command("tmux", "send-keys", "-l", "-t", target, "\\").Run()
+		exec.Command("tmux", "send-keys", "-t", target, "Enter").Run()
+		time.Sleep(30 * time.Millisecond)
+		content, err := tmuxCapturePane(pane)
+		if err != nil || !hasClaude(pane.PID) {
+			return liveCaptureMsg{failed: true}
+		}
+		return liveCaptureMsg{content: content}
+	}
 }
 
 // handleFocusedPreviewKeys handles keys when the session preview pane is focused.

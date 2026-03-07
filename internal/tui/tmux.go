@@ -333,7 +333,15 @@ func currentTmuxWindowClaudes() []string {
 
 func switchToTmuxPane(p tmuxPane) error {
 	target := p.Session + ":" + p.Window + "." + p.Pane
-	// Select the window first (in case it's in a different tmux window)
+
+	// If the pane is in a different tmux session, switch the client first.
+	out, _ := exec.Command("tmux", "display-message", "-p", "#{session_name}").Output()
+	currentSession := strings.TrimSpace(string(out))
+	if currentSession != "" && currentSession != p.Session {
+		exec.Command("tmux", "switch-client", "-t", p.Session).Run()
+	}
+
+	// Select the window (in case it's in a different tmux window)
 	exec.Command("tmux", "select-window", "-t", p.Session+":"+p.Window).Run()
 	return exec.Command("tmux", "select-pane", "-t", target).Run()
 }

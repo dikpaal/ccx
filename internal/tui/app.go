@@ -531,7 +531,7 @@ func (a *App) View() string {
 			// Pane proxy focused: show proxy-specific help with indicator
 			if a.sessSplit.Focus && a.paneProxy != nil && a.sessPreviewMode == sessPreviewLive {
 				indicator := a.paneProxyIndicator()
-				h := "keys→pane J/↵:jump ^Q:unfocus"
+				h := "keys→pane ^J:jump ^Q:unfocus"
 				help = "  " + indicator + " " + formatHelp(h)
 			} else if a.paneProxy != nil && a.sessPreviewMode == sessPreviewLive && !a.sessSplit.Focus {
 				indicator := a.paneProxyIndicator()
@@ -835,7 +835,7 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "ctrl+q":
 			sp.Focus = false
 			return a, tea.Batch(capturePaneCmd(a.paneProxy.pane), liveTickCmd())
-		case "J", "enter":
+		case "ctrl+j":
 			// Jump to the actual tmux pane
 			if err := switchToTmuxPane(a.paneProxy.pane); err != nil {
 				a.copiedMsg = "Switch failed"

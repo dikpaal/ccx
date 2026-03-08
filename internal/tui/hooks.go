@@ -37,6 +37,13 @@ func (a *App) openHooksView() (tea.Model, tea.Cmd) {
 }
 
 func (a *App) handleHooksKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	// Translate navigation aliases (vim hjkl, etc.)
+	if _, navMsg := a.keymap.TranslateNav(key, msg); navMsg.Type != msg.Type {
+		msg = navMsg
+	}
+
 	switch msg.String() {
 	case "q":
 		return a, tea.Quit

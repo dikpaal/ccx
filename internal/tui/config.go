@@ -156,6 +156,12 @@ func (a *App) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	sp := &a.cfgSplit
 	key := msg.String()
 
+	// Translate navigation aliases (vim hjkl, etc.)
+	if nav, navMsg := a.keymap.TranslateNav(key, msg); nav != "" {
+		key = nav
+		msg = navMsg
+	}
+
 	// Route to search input when active
 	if a.cfgSearching {
 		return a.handleCfgSearch(msg)

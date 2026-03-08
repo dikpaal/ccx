@@ -77,10 +77,9 @@ func capturePaneCmd(p tmuxPane) tea.Cmd {
 
 // paneProxyState holds state for both live preview and shell-in-preview.
 type paneProxyState struct {
-	pane     tmuxPane
-	sessID   string // non-empty for live Claude preview, empty for shell
-	isShell  bool   // true = we spawned this pane, must kill on close
-	scrolled bool   // user scrolled up in local viewport
+	pane    tmuxPane
+	sessID  string // non-empty for live Claude preview, empty for shell
+	isShell bool   // true = we spawned this pane, must kill on close
 }
 
 type viewState int
@@ -429,7 +428,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.sessPreviewMode = sessPreviewConversation
 			a.sessSplit.CacheKey = ""
 			return a, nil
-		} else if !a.paneProxy.scrolled {
+		} else {
 			a.sessSplit.Preview.SetContent(msg.content)
 			a.sessSplit.Preview.GotoBottom()
 		}
@@ -532,7 +531,7 @@ func (a *App) View() string {
 			// Pane proxy focused: show proxy-specific help with indicator
 			if a.sessSplit.Focus && a.paneProxy != nil && a.sessPreviewMode == sessPreviewLive {
 				indicator := a.paneProxyIndicator()
-				h := "keys→pane ^B/F:scroll ^G:jump ^Q:unfocus S-↵:newline"
+				h := "keys→pane ^G:jump ^N:newline ^Q:unfocus"
 				help = "  " + indicator + " " + formatHelp(h)
 			} else if a.paneProxy != nil && a.sessPreviewMode == sessPreviewLive && !a.sessSplit.Focus {
 				indicator := a.paneProxyIndicator()
@@ -540,13 +539,15 @@ func (a *App) View() string {
 				help = "  " + indicator + " " + formatHelp(h)
 			} else {
 				sk := a.keymap.Session
-				h := fmtKey(sk.Open, "open") + " " + fmtKey(sk.Edit, "edit") + " " + fmtKey(sk.Actions, "actions") + " " + fmtKey(sk.Views, "views") + " " + fmtKey(sk.Refresh, "refresh") + " " + fmtKey(sk.Group, "group")
+				h := fmtKey(sk.Open, "open") + " " + fmtKey(sk.Edit, "edit") + " " + fmtKey(sk.Actions, "actions") + " " + fmtKey(sk.Views, "views") + " " + fmtKey(sk.Refresh, "refresh")
 				if !a.sessSplit.Show {
-					h += " " + fmtKey(sk.Preview, "preview") + " " + fmtKey(sk.Right, "preview")
+					h += " →:preview tab:group"
 				} else if a.sessSplit.Focus && a.sessPreviewMode == sessPreviewConversation {
-					h += " ↑↓:nav c:full " + fmtKey(sk.Open, "jump") + " →←:fold f/F:all " + fmtKey(sk.Search, "search") + " " + fmtKey(sk.Preview, "mode")
+					h += " ↑↓:nav c:full " + fmtKey(sk.Open, "jump") + " →←:fold f/F:all " + fmtKey(sk.Search, "search") + " tab:mode"
+				} else if a.sessSplit.Focus {
+					h += " tab:mode ←:unfocus " + displayKey(sk.ResizeShrink) + displayKey(sk.ResizeGrow) + ":resize"
 				} else {
-					h += " " + fmtKey(sk.Preview, "mode") + " " + fmtKey(sk.Escape, "close") + " ←→:focus " + displayKey(sk.ResizeShrink) + displayKey(sk.ResizeGrow) + ":resize"
+					h += " tab:group →:focus ←:close " + displayKey(sk.ResizeShrink) + displayKey(sk.ResizeGrow) + ":resize"
 				}
 				if a.config.TmuxEnabled && inTmux() {
 					h += " " + fmtKey(sk.Live, "live")
@@ -694,6 +695,26 @@ func (a *App) View() string {
 		help = formatHelp("v:views — pick a view")
 	}
 
+	// Edit menu hint box floating above help line
+	if a.editMenu {
+		hintBox := a.renderEditHintBox()
+		contentLines := strings.Split(content, "\n")
+		boxLines := strings.Split(hintBox, "\n")
+		boxH := len(boxLines)
+		startY := len(contentLines) - boxH
+		if startY < 0 {
+			startY = 0
+		}
+		for i, bl := range boxLines {
+			y := startY + i
+			if y < len(contentLines) {
+				contentLines[y] = overlayLine(contentLines[y], bl, 1, a.width)
+			}
+		}
+		content = strings.Join(contentLines, "\n")
+		help = formatHelp("e:edit — pick a file")
+	}
+
 	// Command mode hint box floating above help line
 	if a.cmdMode && a.state == viewSessions {
 		hintBox := a.renderCmdHintBox()
@@ -834,41 +855,15 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if a.isPaneProxyFocused() {
 		switch key {
 		case "ctrl+q":
-			if a.paneProxy.scrolled {
-				a.paneProxy.scrolled = false
-				return a, capturePaneCmd(a.paneProxy.pane)
-			}
 			sp.Focus = false
 			return a, tea.Batch(capturePaneCmd(a.paneProxy.pane), liveTickCmd())
 		case "ctrl+g":
 			// Jump to the actual tmux pane
-			a.paneProxy.scrolled = false
 			if err := switchToTmuxPane(a.paneProxy.pane); err != nil {
 				a.copiedMsg = "Switch failed"
 			}
 			return a, nil
-		case "ctrl+b", "ctrl+f":
-			// Fetch scrollback on first scroll, then scroll local viewport
-			if !a.paneProxy.scrolled {
-				a.paneProxy.scrolled = true
-				content, err := tmuxCapturePaneWithScrollback(a.paneProxy.pane)
-				if err == nil {
-					sp.Preview.SetContent(content)
-					maxOff := max(sp.Preview.TotalLineCount()-sp.Preview.Height, 0)
-					sp.Preview.SetYOffset(maxOff)
-				}
-			}
-			if key == "ctrl+b" {
-				sp.Preview.SetYOffset(max(sp.Preview.YOffset-sp.Preview.Height, 0))
-			} else {
-				maxOff := max(sp.Preview.TotalLineCount()-sp.Preview.Height, 0)
-				sp.Preview.SetYOffset(min(sp.Preview.YOffset+sp.Preview.Height, maxOff))
-			}
-			if sp.Preview.AtBottom() {
-				a.paneProxy.scrolled = false
-			}
-			return a, nil
-		case "shift+enter":
+		case "ctrl+n":
 			// Send backslash + enter for multi-line input in Claude
 			return a, a.liveNewlineCmd()
 		}
@@ -974,22 +969,22 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case km.Session.Help:
 		a.showHelp = true
 		return a, nil
-	// Session has custom tab/shift+tab (mode cycling)
+	// Tab/shift+tab: context-aware cycling
+	// List focused → cycle group mode; Preview focused → cycle preview mode
 	case km.Session.Preview:
-		if !sp.Show {
-			idx := a.sessionList.Index()
-			sp.Show = true
-			sp.CacheKey = ""
-			contentH := a.height - 3
-			a.sessionList.SetSize(sp.ListWidth(a.width, a.splitRatio), contentH)
-			a.sessionList.Select(idx)
-		} else {
+		if sp.Focus && sp.Show {
 			a.cycleSessionPreviewMode()
+		} else {
+			a.sessGroupMode = (a.sessGroupMode + 1) % 5
+			a.rebuildSessionList()
 		}
 		return a, nil
 	case km.Session.PreviewBack:
-		if sp.Show {
+		if sp.Focus && sp.Show {
 			a.cycleSessionPreviewModeReverse()
+		} else {
+			a.sessGroupMode = (a.sessGroupMode - 1 + 5) % 5
+			a.rebuildSessionList()
 		}
 		return a, nil
 	case km.Session.Left:
@@ -1395,7 +1390,6 @@ func (a *App) openEditMenu(sess session.Session) (tea.Model, tea.Cmd) {
 		{"s", "session", sess.FilePath},
 		{"t", "text", ""}, // sentinel: text export
 	}
-	a.copiedMsg = "Edit: s:session t:text"
 	return a, nil
 }
 
@@ -1431,6 +1425,23 @@ func (a *App) renderViewsHintBox() string {
 	sp := "  "
 	km := a.keymap.Views
 	line := h.Render(displayKey(km.Stats)) + d.Render(":stats") + sp + h.Render(displayKey(km.Config)) + d.Render(":config") + sp + h.Render(displayKey(km.Hooks)) + d.Render(":hooks")
+	body := line + "\n" + d.Render("esc:cancel")
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorDim).
+		Padding(0, 1)
+	return boxStyle.Render(body)
+}
+
+func (a *App) renderEditHintBox() string {
+	h := lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	d := dimStyle
+	sp := "  "
+	var parts []string
+	for _, c := range a.editChoices {
+		parts = append(parts, h.Render(c.key)+d.Render(":"+c.label))
+	}
+	line := strings.Join(parts, sp)
 	body := line + "\n" + d.Render("esc:cancel")
 	boxStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -3492,9 +3503,9 @@ func (a *App) renderBreadcrumb() string {
 	// Build the styled breadcrumb and track click regions
 	a.breadcrumbSegs = a.breadcrumbSegs[:0]
 	sepText := " > "
-	sepStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280")).Background(colorPrimary)
-	parentStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB")).Background(colorPrimary)
-	activeStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(colorPrimary)
+	sepStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280")).Background(colorTitleBg)
+	parentStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Background(colorTitleBg)
+	activeStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#E2E8F0")).Background(colorTitleBg)
 
 	var text string
 	x := 0
@@ -3540,13 +3551,13 @@ func (a *App) renderBreadcrumb() string {
 	}
 
 	if len(actions) > 0 {
-		actionStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Background(colorPrimary)
-		sepAction := lipgloss.NewStyle().Foreground(lipgloss.Color("#4B5563")).Background(colorPrimary).Render("  ")
+		actionStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Background(colorTitleBg)
+		sepAction := lipgloss.NewStyle().Foreground(lipgloss.Color("#4B5563")).Background(colorTitleBg).Render("  ")
 		text += sepAction
 		x += lipgloss.Width(sepAction)
 		for i, act := range actions {
 			if i > 0 {
-				divider := lipgloss.NewStyle().Foreground(lipgloss.Color("#4B5563")).Background(colorPrimary).Render(" ")
+				divider := lipgloss.NewStyle().Foreground(lipgloss.Color("#4B5563")).Background(colorTitleBg).Render(" ")
 				text += divider
 				x += lipgloss.Width(divider)
 			}
@@ -3565,17 +3576,17 @@ func (a *App) renderBreadcrumb() string {
 	// Right-aligned status: item count + scroll % + loading
 	rightParts := a.breadcrumbRightStatus()
 	if rightParts != "" {
-		countStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#A1A1AA")).Background(colorPrimary)
+		countStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#A1A1AA")).Background(colorTitleBg)
 		rightStr := countStyle.Render(rightParts + " ")
 		rightW := lipgloss.Width(rightStr)
 		gap := max(a.width-x-rightW, 1)
-		text += lipgloss.NewStyle().Background(colorPrimary).Render(strings.Repeat(" ", gap)) + rightStr
+		text += lipgloss.NewStyle().Background(colorTitleBg).Render(strings.Repeat(" ", gap)) + rightStr
 	}
 
 	// Fill remaining width
 	titleW := lipgloss.Width(text)
 	if titleW < a.width {
-		text += lipgloss.NewStyle().Background(colorPrimary).Render(strings.Repeat(" ", a.width-titleW))
+		text += lipgloss.NewStyle().Background(colorTitleBg).Render(strings.Repeat(" ", a.width-titleW))
 	}
 
 	return text

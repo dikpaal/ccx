@@ -87,12 +87,12 @@ func TestCycleClearsLivePreviewState(t *testing.T) {
 func TestTogglePreviewModeLive(t *testing.T) {
 	app := newTestApp(fakeSessions())
 
-	// Open preview first
-	m, _ := app.Update(tea.KeyMsg{Type: tea.KeyTab})
+	// Open preview via right arrow
+	m, _ := app.Update(tea.KeyMsg{Type: tea.KeyRight})
 	app = m.(*App)
 
 	if !app.sessSplit.Show {
-		t.Fatal("preview should be open after Tab")
+		t.Fatal("preview should be open after Right")
 	}
 
 	// Toggle to live mode
@@ -146,8 +146,8 @@ func TestOpenLivePreviewNonLiveSession(t *testing.T) {
 func TestLivePreviewNonLiveSessionShowsMessage(t *testing.T) {
 	app := newTestApp(fakeSessions())
 
-	// Open preview and set live mode
-	m, _ := app.Update(tea.KeyMsg{Type: tea.KeyTab})
+	// Open preview via right arrow and set live mode
+	m, _ := app.Update(tea.KeyMsg{Type: tea.KeyRight})
 	app = m.(*App)
 	app.sessPreviewMode = sessPreviewLive
 	app.paneProxy = &paneProxyState{sessID: "aaa"}
@@ -294,8 +294,8 @@ func TestLiveTickCapturesBothFocusStates(t *testing.T) {
 func TestCtrlQFromFocusedPaneProxyUnfocuses(t *testing.T) {
 	app := newTestApp(fakeSessions())
 
-	// Open preview and set up pane proxy
-	m, _ := app.Update(tea.KeyMsg{Type: tea.KeyTab})
+	// Open preview via right arrow and set up pane proxy
+	m, _ := app.Update(tea.KeyMsg{Type: tea.KeyRight})
 	app = m.(*App)
 	app.sessPreviewMode = sessPreviewLive
 	app.paneProxy = &paneProxyState{sessID: "aaa"}

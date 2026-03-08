@@ -80,7 +80,7 @@ func DefaultKeymap() Keymap {
 			Actions:      "x",
 			Views:        "v",
 			Refresh:      "R",
-			Group:        "G",
+			Group:        "",
 			Help:         "?",
 			Search:       "/",
 			Live:         "L",
@@ -106,6 +106,16 @@ func DefaultKeymap() Keymap {
 			Stats:  "s",
 			Config: "c",
 			Hooks:  "h",
+		},
+		Navigation: NavigationKeymap{
+			Up:       []string{"k"},
+			Down:     []string{"j"},
+			Left:     []string{"h"},
+			Right:    []string{"l"},
+			PageUp:   []string{"ctrl+b"},
+			PageDown: []string{"ctrl+f"},
+			Home:     []string{"g"},
+			End:      []string{"G"},
 		},
 	}
 }
@@ -309,6 +319,8 @@ func displayKey(key string) string {
 		return "→"
 	case ":":
 		return ":"
+	case "ctrl+g":
+		return "^G"
 	default:
 		return key
 	}

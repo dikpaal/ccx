@@ -92,6 +92,12 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	sp := &a.conv.split
 	key := msg.String()
 
+	// Translate navigation aliases (vim hjkl, etc.)
+	if nav, navMsg := a.keymap.TranslateNav(key, msg); nav != "" {
+		key = nav
+		msg = navMsg
+	}
+
 	// Edit menu
 	if a.editMenu {
 		return a.handleEditMenu(key)

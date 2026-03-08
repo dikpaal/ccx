@@ -4,6 +4,7 @@ import "github.com/charmbracelet/lipgloss"
 
 var (
 	colorPrimary      = lipgloss.Color("#7C3AED")
+	colorTitleBg      = lipgloss.Color("#1E293B") // subtle dark bg for title bar
 	colorDim          = lipgloss.Color("#6B7280")
 	colorAccent       = lipgloss.Color("#10B981")
 	colorUser         = lipgloss.Color("#3B82F6")

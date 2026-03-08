@@ -83,6 +83,12 @@ func (a *App) handleMessageFullKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	key := msg.String()
 
+	// Translate navigation aliases (vim hjkl, etc.)
+	if nav, navMsg := a.keymap.TranslateNav(key, msg); nav != "" {
+		key = nav
+		msg = navMsg
+	}
+
 	switch key {
 	case "q":
 		return a, tea.Quit

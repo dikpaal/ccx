@@ -990,8 +990,9 @@ func overlayLine(bgLine, fgLine string, col, maxWidth int) string {
 	for i := 0; i < col && i < len(bgCells); i++ {
 		sb.WriteString(bgCells[i])
 	}
-	// Modal line
+	// Modal line (reset ANSI after to prevent bleed into bg)
 	sb.WriteString(fgLine)
+	sb.WriteString("\x1b[0m")
 	// Right portion of bg
 	for i := col + fgW; i < len(bgCells); i++ {
 		sb.WriteString(bgCells[i])

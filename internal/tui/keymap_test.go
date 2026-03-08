@@ -22,7 +22,6 @@ func TestDefaultKeymap(t *testing.T) {
 		{"Actions", km.Session.Actions},
 		{"Views", km.Session.Views},
 		{"Refresh", km.Session.Refresh},
-		{"Group", km.Session.Group},
 		{"Help", km.Session.Help},
 		{"Search", km.Session.Search},
 		{"Live", km.Session.Live},
@@ -213,18 +212,25 @@ func TestFmtKey(t *testing.T) {
 	}
 }
 
-func TestDefaultKeymap_NavigationEmpty(t *testing.T) {
+func TestDefaultKeymap_NavigationVim(t *testing.T) {
 	km := DefaultKeymap()
-	if len(km.Navigation.Up) != 0 {
-		t.Errorf("default Navigation.Up should be empty, got %v", km.Navigation.Up)
+	if len(km.Navigation.Up) == 0 || km.Navigation.Up[0] != "k" {
+		t.Errorf("default Navigation.Up should include 'k', got %v", km.Navigation.Up)
 	}
-	if len(km.Navigation.Down) != 0 {
-		t.Errorf("default Navigation.Down should be empty, got %v", km.Navigation.Down)
+	if len(km.Navigation.Down) == 0 || km.Navigation.Down[0] != "j" {
+		t.Errorf("default Navigation.Down should include 'j', got %v", km.Navigation.Down)
+	}
+	if len(km.Navigation.Home) == 0 || km.Navigation.Home[0] != "g" {
+		t.Errorf("default Navigation.Home should include 'g', got %v", km.Navigation.Home)
+	}
+	if len(km.Navigation.End) == 0 || km.Navigation.End[0] != "G" {
+		t.Errorf("default Navigation.End should include 'G', got %v", km.Navigation.End)
 	}
 }
 
 func TestTranslateNav_NoAliases(t *testing.T) {
 	km := DefaultKeymap()
+	km.Navigation = NavigationKeymap{} // clear all nav aliases
 	origMsg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")}
 
 	nav, msg := km.TranslateNav("j", origMsg)
@@ -334,8 +340,9 @@ func TestLoadKeymap_WithNavigation(t *testing.T) {
 		t.Errorf("Navigation.PageUp=%v, want [ctrl+u]", km.Navigation.PageUp)
 	}
 
-	// Unspecified nav keys remain empty
-	if len(km.Navigation.Home) != 0 {
-		t.Errorf("Navigation.Home should be empty, got %v", km.Navigation.Home)
+	// Unspecified nav keys keep defaults
+	def := DefaultKeymap()
+	if len(km.Navigation.Home) != len(def.Navigation.Home) {
+		t.Errorf("Navigation.Home should keep default %v, got %v", def.Navigation.Home, km.Navigation.Home)
 	}
 }

@@ -388,31 +388,6 @@ func tmuxCapturePane(p tmuxPane) (string, error) {
 	return strings.TrimRight(string(out), "\n"), nil
 }
 
-// tmuxCapturePaneWithScrollback captures the visible content plus scrollback history.
-func tmuxCapturePaneWithScrollback(p tmuxPane) (string, error) {
-	target := p.Session + ":" + p.Window + "." + p.Pane
-	out, err := exec.Command("tmux", "capture-pane", "-e", "-p", "-S", "-500", "-t", target).Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimRight(string(out), "\n"), nil
-}
-
-// tmuxCopyModeScroll enters tmux copy mode (if not already in it) and scrolls.
-// direction: "page-up", "page-down", "halfpage-up", "halfpage-down",
-// "scroll-up", "scroll-down", "cancel" (exit copy mode).
-func tmuxCopyModeScroll(p tmuxPane, direction string) {
-	target := p.Session + ":" + p.Window + "." + p.Pane
-	if direction == "cancel" {
-		exec.Command("tmux", "send-keys", "-t", target, "-X", "cancel").Run()
-		return
-	}
-	// Enter copy mode (idempotent if already in it)
-	exec.Command("tmux", "copy-mode", "-t", target).Run()
-	exec.Command("tmux", "send-keys", "-t", target, "-X", direction).Run()
-}
-
-
 
 // teaKeyToTmux maps a Bubble Tea key string to tmux send-keys argument(s).
 // Returns (tmuxKey, literal). If literal is true, use send-keys -l.

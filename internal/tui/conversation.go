@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -61,7 +62,7 @@ func (a *App) openConversation(sess session.Session) tea.Cmd {
 	a.conv.split.Show = true
 	a.conv.split.Focus = false
 	a.conv.split.CacheKey = ""
-	a.conv.textPreview = true
+	a.conv.previewMode = previewText
 	a.convList = newConvList(a.conv.items, a.conv.split.ListWidth(a.width, a.splitRatio), contentH)
 	a.conv.split.List = &a.convList
 
@@ -92,6 +93,11 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	sp := &a.conv.split
 	key := msg.String()
 
+	// Block filter input intercepts all keys
+	if a.conv.blockFiltering {
+		return a.handleBlockFilterInput(msg)
+	}
+
 	// Translate navigation aliases (vim hjkl, etc.)
 	if nav, navMsg := a.keymap.TranslateNav(key, msg); nav != "" {
 		key = nav
@@ -107,6 +113,11 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q":
 		return a, tea.Quit
 	case "esc":
+		// Clear block filter first
+		if sp.Folds != nil && sp.Folds.BlockFilter != "" {
+			a.clearBlockFilter()
+			return a, nil
+		}
 		if !sp.Show {
 			a.liveTail = false
 			a.conv.split.BottomAlign = false
@@ -177,9 +188,16 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a.jumpToTmuxPane(a.currentSess.ProjectPath, a.currentSess.ID)
 	}
 
-	// Tab cycles preview mode when preview is open
-	if key == "tab" && sp.Show {
-		a.conv.textPreview = !a.conv.textPreview
+	// Tab/shift+tab cycles preview mode when preview is open: text → tool → hook
+	if (key == "tab" || key == "shift+tab") && sp.Show {
+		if key == "shift+tab" {
+			a.conv.previewMode = (a.conv.previewMode + 2) % 3
+		} else {
+			a.conv.previewMode = (a.conv.previewMode + 1) % 3
+		}
+		if sp.Folds != nil {
+			sp.Folds.HideHooks = a.conv.previewMode == previewTool
+		}
 		sp.CacheKey = "" // force re-render
 		a.updateConvPreview()
 		return a, nil
@@ -215,7 +233,7 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Focused preview keys
 	if sp.Focus && sp.Show {
 		if key == "up" || key == "down" {
-			if a.conv.textPreview {
+			if a.conv.previewMode == previewText {
 				// Text mode: scroll viewport directly
 				scrollPreview(&sp.Preview, key)
 				return a, nil
@@ -233,6 +251,10 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		result = sp.HandleFocusedKeys(key)
 		switch result {
 		case splitKeySearchFromPreview:
+			if a.conv.previewMode != previewText {
+				a.startBlockFilter()
+				return a, nil
+			}
 			return a, startListSearch(&a.convList)
 		case splitKeyCursorMoved:
 			sp.RefreshFoldCursor(a.width, a.splitRatio)
@@ -316,7 +338,7 @@ func (a *App) updateConvPreview() {
 	}
 
 	// Text-only preview mode: show clean conversation text (no tool calls)
-	if a.conv.textPreview {
+	if a.conv.previewMode == previewText {
 		a.renderTextOnlyPreview(item, entry)
 		return
 	}
@@ -350,6 +372,14 @@ func (a *App) updateConvPreview() {
 		sp.CacheKey = cacheKey
 		if sp.Folds != nil {
 			sp.Folds.ResetWithPrefs(entry, sp.TypeFoldPrefs, sp.TypeFmtPrefs)
+			sp.Folds.HideHooks = a.conv.previewMode == previewTool
+			// Re-apply block filter to new entry
+			if sp.Folds.BlockFilter != "" {
+				sp.Folds.BlockVisible = applyBlockFilter(sp.Folds.BlockFilter, entry)
+				if first := sp.Folds.firstVisibleBlock(); first >= 0 {
+					sp.Folds.BlockCursor = first
+				}
+			}
 			debugLog.Printf("  after ResetWithPrefs: collapsed=%v formatted=%v blockCursor=%d",
 				sp.Folds.Collapsed, sp.Folds.Formatted, sp.Folds.BlockCursor)
 		}
@@ -911,4 +941,90 @@ func (a *App) openFullConversation() (tea.Model, tea.Cmd) {
 
 	a.state = viewMessageFull
 	return a, nil
+}
+
+// --- Block filter for conversation preview ---
+
+// startBlockFilter activates the block filter input in the preview pane.
+func (a *App) startBlockFilter() {
+	ti := textinput.New()
+	ti.Prompt = "Filter: "
+	ti.Placeholder = "is:hook is:tool tool:Grep is:error ..."
+	ti.CharLimit = 200
+	ti.Width = a.conv.split.PreviewWidth(a.width, a.splitRatio) - 10
+	// Pre-fill with existing filter
+	if a.conv.split.Folds != nil && a.conv.split.Folds.BlockFilter != "" {
+		ti.SetValue(a.conv.split.Folds.BlockFilter)
+	}
+	ti.Focus()
+	a.conv.blockFilterTI = ti
+	a.conv.blockFiltering = true
+}
+
+// handleBlockFilterInput handles key events while the block filter input is active.
+func (a *App) handleBlockFilterInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	switch key {
+	case "enter":
+		a.commitBlockFilter()
+		return a, nil
+	case "esc":
+		a.conv.blockFiltering = false
+		return a, nil
+	}
+	var cmd tea.Cmd
+	a.conv.blockFilterTI, cmd = a.conv.blockFilterTI.Update(msg)
+	return a, cmd
+}
+
+// commitBlockFilter applies the filter and refreshes the preview.
+func (a *App) commitBlockFilter() {
+	a.conv.blockFiltering = false
+	sp := &a.conv.split
+	if sp.Folds == nil {
+		return
+	}
+	filter := a.conv.blockFilterTI.Value()
+	sp.Folds.BlockFilter = filter
+	sp.Folds.BlockVisible = applyBlockFilter(filter, sp.Folds.Entry)
+
+	// Move block cursor to first visible block
+	if first := sp.Folds.firstVisibleBlock(); first >= 0 {
+		sp.Folds.BlockCursor = first
+	}
+
+	sp.CacheKey = "" // force re-render
+	sp.RefreshFoldPreview(a.width, a.splitRatio)
+	sp.Preview.YOffset = 0
+}
+
+// clearBlockFilter removes the block filter and shows all blocks.
+func (a *App) clearBlockFilter() {
+	sp := &a.conv.split
+	if sp.Folds == nil {
+		return
+	}
+	sp.Folds.BlockFilter = ""
+	sp.Folds.BlockVisible = nil
+	sp.CacheKey = "" // force re-render
+	sp.RefreshFoldPreview(a.width, a.splitRatio)
+}
+
+// renderBlockFilterHintBox renders a floating hint box for block filter syntax.
+func renderBlockFilterHintBox() string {
+	h := lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8"))
+	d := dimStyle
+
+	lines := []string{
+		h.Render("is:") + d.Render("tool result error text thinking hook skill image"),
+		h.Render("tool:") + d.Render("Bash Read Edit Write Grep Glob Agent Skill"),
+		h.Render("!") + d.Render("negate") + "  " + d.Render("space=AND  free text search"),
+	}
+
+	body := strings.Join(lines, "\n")
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorDim).
+		Padding(0, 1)
+	return boxStyle.Render(body)
 }

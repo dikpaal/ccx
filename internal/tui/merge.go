@@ -156,15 +156,22 @@ func isSystemAgent(a session.Subagent) bool {
 
 // mergedToolSummary returns a compact tool summary with counts for duplicates.
 // e.g. "[Bash, Read×3, Edit]"
+// Skill tool_use blocks show "/skillname" instead of "Skill".
 func mergedToolSummary(e session.Entry) string {
 	seen := make(map[string]int)
 	var order []string
 	for _, block := range e.Content {
 		if block.Type == "tool_use" {
-			if seen[block.ToolName] == 0 {
-				order = append(order, block.ToolName)
+			name := block.ToolName
+			if name == "Skill" {
+				if skill := extractSkillFromInput(block.ToolInput); skill != "" {
+					name = "/" + skill
+				}
 			}
-			seen[block.ToolName]++
+			if seen[name] == 0 {
+				order = append(order, name)
+			}
+			seen[name]++
 		}
 	}
 	if len(order) == 0 {

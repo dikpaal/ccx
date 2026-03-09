@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -35,7 +36,8 @@ func (c cfgItem) FilterValue() string {
 // --- Config delegate ---
 
 type cfgDelegate struct {
-	searchTerm string
+	searchTerm  string
+	selectedSet map[string]bool // config Path → selected
 }
 
 func (d cfgDelegate) Height() int                             { return 1 }
@@ -51,9 +53,14 @@ func (d cfgDelegate) Render(w io.Writer, m list.Model, index int, item list.Item
 	selected := index == m.Index()
 	width := m.Width()
 
-	// Cursor prefix for selected item
+	// Cursor prefix for selected/multi-selected item
+	isMultiSelected := !ci.isHeader && d.selectedSet != nil && d.selectedSet[ci.item.Path]
 	cursor := "  "
-	if selected {
+	if selected && isMultiSelected {
+		cursor = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("✓ ")
+	} else if isMultiSelected {
+		cursor = lipgloss.NewStyle().Foreground(colorPrimary).Render("✓ ")
+	} else if selected {
 		cursor = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("▸ ")
 	}
 	cursorW := 2
@@ -68,14 +75,18 @@ func (d cfgDelegate) Render(w io.Writer, m list.Model, index int, item list.Item
 		return
 	}
 
-	// Tree connector
+	// Tree connector with depth indentation
+	indent := ""
+	if ci.treeDepth > 1 {
+		indent = strings.Repeat("  ", ci.treeDepth-1)
+	}
 	connector := "├─ "
 	if ci.treeLast {
 		connector = "└─ "
 	}
 	connStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#4B5563"))
-	prefix := cursor + connStyle.Render(connector)
-	prefixW := cursorW + lipgloss.Width(connStyle.Render(connector))
+	prefix := cursor + connStyle.Render(indent+connector)
+	prefixW := cursorW + lipgloss.Width(connStyle.Render(indent+connector))
 
 	nameStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB"))
 	descStyle := lipgloss.NewStyle().Foreground(colorDim)
@@ -140,7 +151,8 @@ func (a *App) openConfigExplorer() (tea.Model, tea.Cmd) {
 	}
 
 	a.cfgTree = tree
-	items := buildConfigItems(tree)
+	a.cfgSelectedSet = make(map[string]bool)
+	items := buildConfigItemsFiltered(tree, a.cfgFilterCat, a.cfgSearchTerm)
 	contentH := ContentHeight(a.height)
 	listW := a.cfgSplit.ListWidth(a.width, a.splitRatio)
 	a.cfgList = newConfigList(items, listW, contentH)
@@ -156,30 +168,103 @@ func (a *App) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	sp := &a.cfgSplit
 	key := msg.String()
 
+	// Route to text inputs BEFORE nav translation — otherwise vim keys
+	// (j/k/h/l) get converted to arrow keys and won't type in the input.
+	if a.cfgSearching {
+		return a.handleCfgSearch(msg)
+	}
+	if a.cfgNaming {
+		return a.handleCfgNaming(msg)
+	}
+	if a.cfgProjectPicker {
+		return a.handleCfgProjectPicker(msg)
+	}
+
+	// Page jump menu: second key picks the section (before nav translation so h/l work)
+	if a.cfgPageMenu {
+		a.cfgPageMenu = false
+		return a.handleCfgPageMenu(key)
+	}
+
 	// Translate navigation aliases (vim hjkl, etc.)
 	if nav, navMsg := a.keymap.TranslateNav(key, msg); nav != "" {
 		key = nav
 		msg = navMsg
 	}
 
-	// Route to search input when active
-	if a.cfgSearching {
-		return a.handleCfgSearch(msg)
+	// Views menu: pick a view
+	if a.viewsMenu {
+		return a.handleViewsMenu(key)
+	}
+
+	// Actions menu: pick an action
+	if a.cfgActionsMenu {
+		return a.handleCfgActionsMenu(key)
+	}
+
+	// Clear delete confirm on any key except d
+	if a.cfgDeleteConfirm && key != "d" {
+		a.cfgDeleteConfirm = false
+		a.copiedMsg = ""
 	}
 
 	switch key {
 	case "q":
 		return a, tea.Quit
 	case "esc":
+		if a.cfgHasSelection() {
+			a.clearCfgSelection()
+			return a, nil
+		}
 		if a.cfgSearchTerm != "" {
 			a.clearCfgSearch()
 			return a, nil
 		}
-		a.state = viewSessions
+		if a.cfgFilterCat != cfgFilterAll {
+			a.cfgFilterCat = cfgFilterAll
+			a.rebuildCfgList()
+			return a, nil
+		}
+		// Top-level view: esc does nothing (use v to switch views)
 		return a, nil
+	case a.keymap.Session.Views:
+		a.viewsMenu = true
+		return a, nil
+	case "x":
+		a.cfgActionsMenu = true
+		return a, nil
+	case "p":
+		a.cfgPageMenu = true
+		return a, nil
+	case " ":
+		// Toggle multi-select on non-header items
+		if ci, ok := a.cfgList.SelectedItem().(cfgItem); ok && !ci.isHeader {
+			if a.cfgSelectedSet[ci.item.Path] {
+				delete(a.cfgSelectedSet, ci.item.Path)
+			} else {
+				a.cfgSelectedSet[ci.item.Path] = true
+			}
+			a.applyCfgDelegate()
+			// Auto-advance cursor
+			idx := a.cfgList.Index()
+			if idx < len(a.cfgList.Items())-1 {
+				a.cfgList.Select(idx + 1)
+				a.updateConfigPreview()
+			}
+		}
+		return a, nil
+	case "tab":
+		a.cycleCfgFilter(1)
+		return a, nil
+	case "shift+tab":
+		a.cycleCfgFilter(-1)
+		return a, nil
+	case "P":
+		return a.openCfgProjectPicker()
+	case "a":
+		return a.startCfgNaming()
 	case "/":
-		a.startCfgSearch()
-		return a, nil
+		return a, a.startCfgSearch()
 	case "n":
 		if a.cfgSearchTerm != "" {
 			a.nextCfgMatch()
@@ -194,12 +279,8 @@ func (a *App) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.updateConfigPreview()
 		}
 		return a, nil
-	case "e":
-		// Open selected file in $EDITOR
-		if ci, ok := a.cfgList.SelectedItem().(cfgItem); ok && !ci.isHeader {
-			return a.openInEditor(ci.item.Path)
-		}
-		return a, nil
+	case "u":
+		return a.undoCfgDelete()
 	}
 
 	// Split pane navigation
@@ -238,8 +319,9 @@ func (a *App) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	// Pass remaining keys to list for cursor movement
-	if a.listReady(&a.cfgList) {
+	// Only pass navigation keys to list — block all others to prevent
+	// the bubbles list from entering its built-in filter mode on character keys.
+	if a.listReady(&a.cfgList) && isNavKey(msg) {
 		var cmd tea.Cmd
 		a.cfgList, cmd = a.cfgList.Update(msg)
 		a.updateConfigPreview()
@@ -346,46 +428,115 @@ func wordWrap(text string, width int) string {
 
 // --- Build config items ---
 
+// cfgSection defines a category with its display label.
+type cfgSection struct {
+	category session.ConfigCategory
+	label    string
+}
+
+// cfgScopeGroup defines a scope (User/Project/Local) containing one or more sections.
+type cfgScopeGroup struct {
+	scope    string
+	sections []cfgSection
+}
+
+func cfgScopeGroups(tree *session.ConfigTree) []cfgScopeGroup {
+	return []cfgScopeGroup{
+		{"USER", []cfgSection{
+			{session.ConfigGlobal, "MEMORY"},
+			{session.ConfigSkill, "SKILLS"},
+			{session.ConfigAgent, "AGENTS"},
+			{session.ConfigCommand, "COMMANDS"},
+			{session.ConfigHook, "HOOKS"},
+			{session.ConfigMCP, "MCP SERVERS"},
+		}},
+		{fmt.Sprintf("PROJECT: %s", tree.ProjectName), []cfgSection{
+			{session.ConfigProject, ""},
+		}},
+		{"LOCAL", []cfgSection{
+			{session.ConfigLocal, ""},
+		}},
+		{"ENTERPRISE", []cfgSection{
+			{session.ConfigEnterprise, ""},
+		}},
+	}
+}
+
+// cfgMemoryScopeGroups returns scope groups optimized for the MEMORY filter view:
+// project-level first (most specific), then user-level (most general).
+func cfgMemoryScopeGroups(tree *session.ConfigTree) []cfgScopeGroup {
+	return []cfgScopeGroup{
+		{fmt.Sprintf("PROJECT: %s", tree.ProjectName), []cfgSection{
+			{session.ConfigLocal, ""},
+			{session.ConfigProject, ""},
+		}},
+		{"USER", []cfgSection{
+			{session.ConfigGlobal, ""},
+		}},
+	}
+}
+
 func buildConfigItems(tree *session.ConfigTree) []list.Item {
 	var items []list.Item
 
-	type section struct {
-		category session.ConfigCategory
-		label    string
-	}
-	sections := []section{
-		{session.ConfigGlobal, "  GLOBAL"},
-		{session.ConfigProject, fmt.Sprintf("  PROJECT: %s", tree.ProjectName)},
-		{session.ConfigLocal, fmt.Sprintf("  LOCAL: %s", tree.ProjectPath)},
-		{session.ConfigSkill, "  SKILLS"},
-		{session.ConfigAgent, "  AGENTS"},
-		{session.ConfigCommand, "  COMMANDS"},
-		{session.ConfigMCP, "  MCP SERVERS"},
-	}
-
-	for _, sec := range sections {
-		// Collect items for this category
-		var catItems []session.ConfigItem
-		for _, item := range tree.Items {
-			if item.Category == sec.category {
-				catItems = append(catItems, item)
+	for _, group := range cfgScopeGroups(tree) {
+		// Check if any section in this group has items
+		groupHasItems := false
+		for _, sec := range group.sections {
+			for _, item := range tree.Items {
+				if item.Category == sec.category {
+					groupHasItems = true
+					break
+				}
+			}
+			if groupHasItems {
+				break
 			}
 		}
 
-		// Add header
-		items = append(items, cfgItem{
-			isHeader: true,
-			label:    sec.label,
-		})
+		// Scope header
+		items = append(items, cfgItem{isHeader: true, label: "  " + group.scope})
 
-		if len(catItems) == 0 {
-			items = append(items, cfgItem{
-				isHeader: true,
-				label:    "    (empty)",
-			})
+		if !groupHasItems {
+			items = append(items, cfgItem{isHeader: true, label: "    (empty)"})
 			continue
 		}
 
+		for _, sec := range group.sections {
+			var catItems []session.ConfigItem
+			for _, item := range tree.Items {
+				if item.Category == sec.category {
+					catItems = append(catItems, item)
+				}
+			}
+			if len(catItems) == 0 {
+				continue
+			}
+
+			// Sub-header for groups with multiple sections
+			if sec.label != "" && len(group.sections) > 1 {
+				items = append(items, cfgItem{isHeader: true, label: "    " + sec.label})
+			}
+
+			items = appendGroupedItems(items, catItems)
+		}
+	}
+
+	return items
+}
+
+// appendGroupedItems appends config items to the list, inserting sub-headers
+// when items have different Group values (e.g. hook event types).
+func appendGroupedItems(items []list.Item, catItems []session.ConfigItem) []list.Item {
+	hasGroups := false
+	for _, ci := range catItems {
+		if ci.Group != "" {
+			hasGroups = true
+			break
+		}
+	}
+
+	if !hasGroups {
 		for i, ci := range catItems {
 			items = append(items, cfgItem{
 				item:      ci,
@@ -393,8 +544,77 @@ func buildConfigItems(tree *session.ConfigTree) []list.Item {
 				treeLast:  i == len(catItems)-1,
 			})
 		}
+		return items
 	}
 
+	// Group items by Group field, preserving order of first appearance
+	type groupEntry struct {
+		name  string
+		items []session.ConfigItem
+	}
+	var ungrouped []session.ConfigItem
+	var groups []groupEntry
+	idx := make(map[string]int)
+	for _, ci := range catItems {
+		if ci.Group == "" {
+			ungrouped = append(ungrouped, ci)
+			continue
+		}
+		if i, ok := idx[ci.Group]; ok {
+			groups[i].items = append(groups[i].items, ci)
+		} else {
+			idx[ci.Group] = len(groups)
+			groups = append(groups, groupEntry{ci.Group, []session.ConfigItem{ci}})
+		}
+	}
+
+	// Render ungrouped first
+	lastUngrouped := len(ungrouped) - 1
+	if len(groups) > 0 {
+		lastUngrouped = -1
+	}
+	for i, ci := range ungrouped {
+		items = append(items, cfgItem{
+			item:      ci,
+			treeDepth: 1,
+			treeLast:  i == lastUngrouped,
+		})
+	}
+
+	// Render grouped items with sub-headers
+	for _, g := range groups {
+		items = append(items, cfgItem{isHeader: true, label: "      " + g.name})
+		for i, ci := range g.items {
+			items = append(items, cfgItem{
+				item:      ci,
+				treeDepth: 1,
+				treeLast:  i == len(g.items)-1,
+			})
+		}
+	}
+	return items
+}
+
+// appendRefTreeItems renders items as a reference tree using RefDepth.
+// Root items (RefDepth=0) are top-level, referenced items (RefDepth>0) are children.
+// Items with keyword Group get keywords shown as description instead of file heading.
+func appendRefTreeItems(items []list.Item, catItems []session.ConfigItem) []list.Item {
+	for i, ci := range catItems {
+		item := ci
+		// For keyword-triggered items, use keywords as description
+		if item.Group != "" {
+			item.Description = item.Group
+		}
+		depth := 1
+		if item.RefDepth > 0 {
+			depth = item.RefDepth + 1
+		}
+		items = append(items, cfgItem{
+			item:      item,
+			treeDepth: depth,
+			treeLast:  i == len(catItems)-1,
+		})
+	}
 	return items
 }
 
@@ -407,6 +627,9 @@ func newConfigList(items []list.Item, width, height int) list.Model {
 	l.SetFilteringEnabled(false)
 	l.SetShowHelp(false)
 	l.DisableQuitKeybindings()
+	// Unbind the filter key so the list never enters filtering mode
+	l.KeyMap.Filter.SetEnabled(false)
+	l.KeyMap.ClearFilter.SetEnabled(false)
 	l.SetSize(width, height)
 
 	// Skip to first non-header item
@@ -436,14 +659,11 @@ func (a *App) refreshConfigExplorer() {
 	}
 	selectedIdx := a.cfgList.Index()
 	a.cfgTree = tree
-	items := buildConfigItems(tree)
-	contentH := ContentHeight(a.height)
-	listW := a.cfgSplit.ListWidth(a.width, a.splitRatio)
-	a.cfgList = newConfigList(items, listW, contentH)
-	if selectedIdx < len(items) {
+	// Rebuild with current search/filter preserved
+	a.rebuildCfgList()
+	if selectedIdx < len(a.cfgList.Items()) {
 		a.cfgList.Select(selectedIdx)
 	}
-	a.cfgSplit.CacheKey = ""
 	a.updateConfigPreview()
 }
 
@@ -457,12 +677,30 @@ func (a *App) renderConfigSplit() string {
 
 // --- Config search (custom, not bubbles filter) ---
 
-func (a *App) startCfgSearch() {
+func (a *App) startCfgSearch() tea.Cmd {
 	a.cfgSearching = true
+	a.cfgSearchHistI = -1 // new input mode
 	ti := textinput.New()
 	ti.Prompt = "Search: "
 	ti.Focus()
 	a.cfgSearchInput = ti
+	return ti.Cursor.BlinkCmd()
+}
+
+const cfgSearchHistMax = 20
+
+func (a *App) pushCfgSearchHist(term string) {
+	// Remove duplicate if exists
+	for i, h := range a.cfgSearchHist {
+		if h == term {
+			a.cfgSearchHist = append(a.cfgSearchHist[:i], a.cfgSearchHist[i+1:]...)
+			break
+		}
+	}
+	a.cfgSearchHist = append(a.cfgSearchHist, term)
+	if len(a.cfgSearchHist) > cfgSearchHistMax {
+		a.cfgSearchHist = a.cfgSearchHist[len(a.cfgSearchHist)-cfgSearchHistMax:]
+	}
 }
 
 func (a *App) handleCfgSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -473,52 +711,62 @@ func (a *App) handleCfgSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if term == "" {
 			a.clearCfgSearch()
 		} else {
+			a.pushCfgSearchHist(term)
 			a.cfgSearchTerm = term
-			a.buildCfgSearchMatches()
-			a.applyCfgDelegate()
-			if len(a.cfgSearchMatch) > 0 {
-				a.cfgSearchIdx = 0
-				a.cfgList.Select(a.cfgSearchMatch[0])
-				a.updateConfigPreview()
-			}
+			a.rebuildCfgList()
 		}
 		return a, nil
 	case "esc":
 		a.cfgSearching = false
 		return a, nil
+	case "up":
+		// Browse history (newest to oldest)
+		if len(a.cfgSearchHist) == 0 {
+			return a, nil
+		}
+		if a.cfgSearchHistI < 0 {
+			// Entering history from new input — start at most recent
+			a.cfgSearchHistI = len(a.cfgSearchHist) - 1
+		} else if a.cfgSearchHistI > 0 {
+			a.cfgSearchHistI--
+		}
+		a.cfgSearchInput.SetValue(a.cfgSearchHist[a.cfgSearchHistI])
+		a.cfgSearchInput.CursorEnd()
+		return a, nil
+	case "down":
+		if a.cfgSearchHistI < 0 {
+			return a, nil
+		}
+		if a.cfgSearchHistI < len(a.cfgSearchHist)-1 {
+			a.cfgSearchHistI++
+			a.cfgSearchInput.SetValue(a.cfgSearchHist[a.cfgSearchHistI])
+			a.cfgSearchInput.CursorEnd()
+		} else {
+			// Past end of history — back to empty new input
+			a.cfgSearchHistI = -1
+			a.cfgSearchInput.SetValue("")
+		}
+		return a, nil
 	}
+	// Any typing resets history browsing position
+	oldVal := a.cfgSearchInput.Value()
 	var cmd tea.Cmd
 	a.cfgSearchInput, cmd = a.cfgSearchInput.Update(msg)
+	if a.cfgSearchInput.Value() != oldVal {
+		a.cfgSearchHistI = -1
+	}
 	return a, cmd
 }
 
-func (a *App) buildCfgSearchMatches() {
-	lower := strings.ToLower(a.cfgSearchTerm)
-	a.cfgSearchMatch = nil
-	items := a.cfgList.Items()
-	for i, item := range items {
-		ci, ok := item.(cfgItem)
-		if !ok || ci.isHeader {
-			continue
-		}
-		text := strings.ToLower(ci.item.Name + " " + ci.item.Description)
-		if strings.Contains(text, lower) {
-			a.cfgSearchMatch = append(a.cfgSearchMatch, i)
-		}
-	}
-}
-
 func (a *App) applyCfgDelegate() {
-	a.cfgList.SetDelegate(cfgDelegate{searchTerm: a.cfgSearchTerm})
+	a.cfgList.SetDelegate(cfgDelegate{searchTerm: a.cfgSearchTerm, selectedSet: a.cfgSelectedSet})
 }
 
 func (a *App) clearCfgSearch() {
 	a.cfgSearchTerm = ""
 	a.cfgSearchMatch = nil
 	a.cfgSearchIdx = 0
-	a.cfgList.SetDelegate(cfgDelegate{})
-	a.cfgSplit.CacheKey = "" // force preview re-render without highlights
-	a.updateConfigPreview()
+	a.rebuildCfgList()
 }
 
 func (a *App) nextCfgMatch() {
@@ -535,4 +783,1033 @@ func (a *App) prevCfgMatch() {
 	}
 	a.cfgSearchIdx = (a.cfgSearchIdx - 1 + len(a.cfgSearchMatch)) % len(a.cfgSearchMatch)
 	a.cfgList.Select(a.cfgSearchMatch[a.cfgSearchIdx])
+}
+
+// --- Config multi-select helpers ---
+
+func (a *App) cfgHasSelection() bool {
+	return len(a.cfgSelectedSet) > 0
+}
+
+func (a *App) clearCfgSelection() {
+	clear(a.cfgSelectedSet)
+	a.applyCfgDelegate()
+}
+
+func (a *App) selectedConfigItems() []session.ConfigItem {
+	if a.cfgTree == nil {
+		return nil
+	}
+	// Use full tree items, not filtered list, so selections persist across filters
+	var items []session.ConfigItem
+	for _, item := range a.cfgTree.Items {
+		if a.cfgSelectedSet[item.Path] {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+// extractRelConfigPath returns the relative path from ~/.claude/ for a config file.
+// For files outside ~/.claude/, returns empty string.
+func extractRelConfigPath(path, claudeDir string) string {
+	rel, err := filepath.Rel(claudeDir, path)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	return rel
+}
+
+// buildTestConfigDir creates a temp directory with symlinks to selected config files
+// in the correct structure for Claude Code to discover them.
+func buildTestConfigDir(items []session.ConfigItem) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("home dir: %w", err)
+	}
+	claudeDir := filepath.Join(home, ".claude")
+
+	tmpDir, err := os.MkdirTemp("", "ccx-cfgtest-")
+	if err != nil {
+		return "", fmt.Errorf("create temp dir: %w", err)
+	}
+
+	tmpClaude := filepath.Join(tmpDir, ".claude")
+	if err := os.MkdirAll(tmpClaude, 0o755); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", err
+	}
+
+	// Copy .claude.json from real HOME (required by Claude startup — has workspace trust)
+	claudeJSON := filepath.Join(home, ".claude.json")
+	if data, err := os.ReadFile(claudeJSON); err == nil {
+		os.WriteFile(filepath.Join(tmpDir, ".claude.json"), data, 0o644)
+	}
+
+	// Create empty settings.json so hooks/MCP from the real HOME are not loaded.
+	// Selected settings.json/hooks will be symlinked below if the user chose them.
+	os.WriteFile(filepath.Join(tmpClaude, "settings.json"), []byte("{}"), 0o644)
+
+	hasHooks := false
+	for _, item := range items {
+		rel := extractRelConfigPath(item.Path, claudeDir)
+		if rel == "" {
+			continue
+		}
+
+		dst := filepath.Join(tmpClaude, rel)
+
+		// For skills, symlink the entire skill directory
+		if item.Category == session.ConfigSkill {
+			skillDir := filepath.Dir(item.Path)
+			dstDir := filepath.Dir(dst)
+			if err := os.MkdirAll(filepath.Dir(dstDir), 0o755); err != nil {
+				continue
+			}
+			os.Symlink(skillDir, dstDir)
+			continue
+		}
+
+		// For hooks: symlink file or directory, track that we have hooks
+		if item.Category == session.ConfigHook {
+			hasHooks = true
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				continue
+			}
+			os.Symlink(item.Path, dst)
+			continue
+		}
+
+		// Symlink individual file (remove placeholder if exists)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			continue
+		}
+		os.Remove(dst) // remove placeholder (e.g. empty settings.json)
+		os.Symlink(item.Path, dst)
+	}
+
+	// If hooks were selected, copy the hooks config from settings.json
+	// so Claude knows which events trigger which hook scripts.
+	if hasHooks {
+		injectHooksConfig(filepath.Join(claudeDir, "settings.json"), filepath.Join(tmpClaude, "settings.json"))
+	}
+
+	return tmpDir, nil
+}
+
+// injectHooksConfig copies the "hooks" key from srcSettings into dstSettings.
+// If dstSettings already has content (e.g. from being selected as MCP config),
+// it merges; otherwise it creates a new JSON with just the hooks key.
+func injectHooksConfig(srcSettings, dstSettings string) {
+	srcData, err := os.ReadFile(srcSettings)
+	if err != nil {
+		return
+	}
+	var src map[string]json.RawMessage
+	if err := json.Unmarshal(srcData, &src); err != nil {
+		return
+	}
+	hooksRaw, ok := src["hooks"]
+	if !ok {
+		return
+	}
+
+	// Read existing dst settings (may be empty "{}" or user-selected settings.json)
+	dstData, _ := os.ReadFile(dstSettings)
+	var dst map[string]json.RawMessage
+	if err := json.Unmarshal(dstData, &dst); err != nil {
+		dst = make(map[string]json.RawMessage)
+	}
+	dst["hooks"] = hooksRaw
+
+	out, err := json.MarshalIndent(dst, "", "  ")
+	if err != nil {
+		return
+	}
+	os.WriteFile(dstSettings, out, 0o644)
+}
+
+// launchConfigTest launches a sandboxed Claude session using only selected configs.
+func (a *App) launchConfigTest() (tea.Model, tea.Cmd) {
+	if !a.cfgHasSelection() {
+		a.copiedMsg = "No configs selected (space to select)"
+		return a, nil
+	}
+	if !inTmux() {
+		a.copiedMsg = "Requires tmux"
+		return a, nil
+	}
+
+	items := a.selectedConfigItems()
+	tmpDir, err := buildTestConfigDir(items)
+	if err != nil {
+		a.copiedMsg = "Failed: " + err.Error()
+		return a, nil
+	}
+
+	// Strategy: read selected config files and inject as --system-prompt.
+	// This keeps HOME unchanged (auth works), uses --settings for clean hooks/MCP,
+	// and replaces the system prompt with only the selected config content.
+	settingsPath := filepath.Join(tmpDir, ".claude", "settings.json")
+
+	// Build combined prompt from selected config file contents
+	promptFile := filepath.Join(tmpDir, "system-prompt.txt")
+	if err := buildSystemPromptFile(items, promptFile); err != nil {
+		os.RemoveAll(tmpDir)
+		a.copiedMsg = "Failed: " + err.Error()
+		return a, nil
+	}
+
+	script := fmt.Sprintf(
+		`unset CLAUDECODE; claude --system-prompt "$(cat %s)" --settings %s --setting-sources ""; `+
+			`rc=$?; if [ $rc -ne 0 ]; then echo ""; echo "[claude exited: $rc] press any key"; read -n1; fi`,
+		shellQuote(promptFile), shellQuote(settingsPath),
+	)
+
+	a.copiedMsg = fmt.Sprintf("Testing %d configs…", len(items))
+
+	return a, func() tea.Msg {
+		exec.Command("tmux", "display-popup", "-E", "-w", "90%", "-h", "80%",
+			"bash", "-c", script).Run()
+		return configTestDoneMsg{tmpDir: tmpDir}
+	}
+}
+
+type configTestDoneMsg struct{ tmpDir string }
+
+// buildSystemPromptFile concatenates selected config file contents into a single
+// system prompt file, with headers separating each source.
+func buildSystemPromptFile(items []session.ConfigItem, outPath string) error {
+	var sb strings.Builder
+	sb.WriteString("You are testing a specific set of Claude Code configurations.\n")
+	sb.WriteString("ONLY the following config files are active for this session:\n\n")
+
+	for _, item := range items {
+		// Skip non-text configs (settings.json, MCP json, hooks)
+		if item.Category == session.ConfigMCP || item.Category == session.ConfigHook {
+			continue
+		}
+		data, err := os.ReadFile(item.Path)
+		if err != nil {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("--- %s (%s) ---\n", item.Name, item.Path))
+		sb.Write(data)
+		sb.WriteString("\n\n")
+	}
+
+	return os.WriteFile(outPath, []byte(sb.String()), 0o644)
+}
+
+// --- Category filter ---
+
+const cfgFilterAll = -1    // show everything
+const cfgFilterMemory = -2 // show global + project + local (all "memory" scopes)
+
+func (a *App) cycleCfgFilter(dir int) {
+	a.cfgFilterCat += dir
+	count := session.ConfigCategoryCount()
+	if a.cfgFilterCat >= count {
+		a.cfgFilterCat = cfgFilterAll
+	} else if a.cfgFilterCat < cfgFilterAll {
+		a.cfgFilterCat = count - 1
+	}
+	a.rebuildCfgList()
+}
+
+func (a *App) cfgFilterLabel() string {
+	if a.cfgFilterCat == cfgFilterMemory {
+		return "MEMORY"
+	}
+	if a.cfgFilterCat < 0 {
+		return ""
+	}
+	return session.CategoryLabel(session.ConfigCategory(a.cfgFilterCat))
+}
+
+func (a *App) rebuildCfgList() {
+	items := buildConfigItemsFiltered(a.cfgTree, a.cfgFilterCat, a.cfgSearchTerm)
+	contentH := ContentHeight(a.height)
+	listW := a.cfgSplit.ListWidth(a.width, a.splitRatio)
+	a.cfgList = newConfigList(items, listW, contentH)
+	a.applyCfgDelegate()
+
+	// Build match indices for n/N navigation
+	a.cfgSearchMatch = nil
+	a.cfgSearchIdx = 0
+	if a.cfgSearchTerm != "" {
+		for i, item := range items {
+			if ci, ok := item.(cfgItem); ok && !ci.isHeader {
+				a.cfgSearchMatch = append(a.cfgSearchMatch, i)
+			}
+		}
+	}
+
+	a.cfgSplit.CacheKey = ""
+	a.updateConfigPreview()
+}
+
+// cfgSearchTags maps config categories to searchable "is:" tags.
+var cfgSearchTags = map[session.ConfigCategory][]string{
+	session.ConfigGlobal:  {"is:user", "is:memory"},
+	session.ConfigProject: {"is:project"},
+	session.ConfigLocal:   {"is:local"},
+	session.ConfigSkill:   {"is:user", "is:skill"},
+	session.ConfigAgent:   {"is:user", "is:agent"},
+	session.ConfigCommand: {"is:user", "is:command", "is:cmd"},
+	session.ConfigHook:    {"is:user", "is:hook"},
+	session.ConfigMCP:        {"is:user", "is:mcp"},
+	session.ConfigEnterprise: {"is:enterprise"},
+}
+
+// cfgItemSearchText returns the full searchable text for a config item,
+// including synthetic is: tags for scope and type filtering.
+func cfgItemSearchText(item session.ConfigItem) string {
+	parts := []string{
+		strings.ToLower(item.Name),
+		strings.ToLower(item.Description),
+	}
+	if tags, ok := cfgSearchTags[item.Category]; ok {
+		parts = append(parts, tags...)
+	}
+	return strings.Join(parts, " ")
+}
+
+// cfgMatchesSearch checks if a config item matches all search terms.
+// Supports "is:" prefix filters and plain text substring matching.
+func cfgMatchesSearch(item session.ConfigItem, terms []string) bool {
+	text := cfgItemSearchText(item)
+	for _, term := range terms {
+		if !strings.Contains(text, term) {
+			return false
+		}
+	}
+	return true
+}
+
+func buildConfigItemsFiltered(tree *session.ConfigTree, filterCat int, searchTerm string) []list.Item {
+	if filterCat == cfgFilterAll && searchTerm == "" {
+		return buildConfigItems(tree)
+	}
+
+	// Split search into terms (all must match)
+	var terms []string
+	if searchTerm != "" {
+		for _, t := range strings.Fields(strings.ToLower(searchTerm)) {
+			if t != "" {
+				terms = append(terms, t)
+			}
+		}
+	}
+	filterActive := filterCat >= 0
+	isMemoryFilter := filterCat == cfgFilterMemory
+
+	// Use memory-specific scope groups and tree rendering for MEMORY filter
+	scopeGroups := cfgScopeGroups(tree)
+	if isMemoryFilter {
+		scopeGroups = cfgMemoryScopeGroups(tree)
+	}
+
+	var items []list.Item
+	for _, group := range scopeGroups {
+		var groupItems []list.Item
+
+		for _, sec := range group.sections {
+			if !isMemoryFilter && filterActive && int(sec.category) != filterCat {
+				continue
+			}
+
+			var catItems []session.ConfigItem
+			for _, item := range tree.Items {
+				if item.Category != sec.category {
+					continue
+				}
+				// In MEMORY filter, skip settings files (not instructions)
+				if isMemoryFilter && strings.HasSuffix(item.Name, ".json") {
+					continue
+				}
+				if len(terms) > 0 && !cfgMatchesSearch(item, terms) {
+					continue
+				}
+				catItems = append(catItems, item)
+			}
+			if len(catItems) == 0 {
+				continue
+			}
+
+			// Sub-header for groups with multiple sections
+			if sec.label != "" && len(group.sections) > 1 {
+				groupItems = append(groupItems, cfgItem{isHeader: true, label: "    " + sec.label})
+			}
+
+			if isMemoryFilter {
+				groupItems = appendRefTreeItems(groupItems, catItems)
+			} else {
+				groupItems = appendGroupedItems(groupItems, catItems)
+			}
+		}
+
+		// Skip empty scope groups when searching
+		if len(groupItems) == 0 {
+			continue
+		}
+
+		items = append(items, cfgItem{isHeader: true, label: "  " + group.scope})
+		items = append(items, groupItems...)
+	}
+	return items
+}
+
+// --- Draft config creation ---
+
+// cfgTemplate describes how to create a new config file.
+type cfgTemplate struct {
+	subdir   string // relative to ~/.claude/
+	ext      string
+	template string
+	perm     os.FileMode
+}
+
+// cfgTemplates maps categories to their default creation template.
+var cfgTemplates = map[session.ConfigCategory]cfgTemplate{
+	session.ConfigGlobal:  {"memory", ".md", "# Title\n\n", 0o644},
+	session.ConfigProject: {"", ".md", "# Title\n\n", 0o644}, // resolved dynamically
+	session.ConfigAgent:   {"agents", ".md", "# Agent Name\n\nYou are an agent that...\n", 0o644},
+	session.ConfigSkill:   {"skills", "", "---\ndescription: \"\"\n---\n# Skill Name\n\n...\n", 0o644},
+	session.ConfigCommand: {"commands", ".md", "# Command Name\n\n$ARGUMENTS\n", 0o644},
+	session.ConfigHook:    {"hooks", ".sh", "#!/bin/bash\nset -euo pipefail\n\n# Hook: \n", 0o755},
+}
+
+// cfgGlobalSubdirs are the subdirs under ~/.claude/ where global items live.
+var cfgGlobalSubdirs = []string{"memory", "contexts", "rules"}
+
+func (a *App) startCfgNaming() (tea.Model, tea.Cmd) {
+	// Determine category: use filter if active, else use current item's category
+	cat := session.ConfigGlobal // default
+	if a.cfgFilterCat >= 0 {
+		cat = session.ConfigCategory(a.cfgFilterCat)
+	} else if ci, ok := a.cfgList.SelectedItem().(cfgItem); ok && !ci.isHeader {
+		cat = ci.item.Category
+	}
+
+	// Check if this category supports creation
+	if _, ok := cfgTemplates[cat]; !ok {
+		a.copiedMsg = "Cannot create " + session.CategoryLabel(cat) + " items"
+		return a, nil
+	}
+
+	// For Global/Project, detect subdir from current item path
+	prompt := "New " + strings.ToLower(session.CategoryLabel(cat))
+	if cat == session.ConfigGlobal {
+		subdir := a.detectCfgSubdir()
+		if subdir != "" {
+			prompt = "New " + subdir
+		} else {
+			prompt = "New memory"
+		}
+	}
+
+	a.cfgNaming = true
+	a.cfgNamingCat = cat
+	ti := textinput.New()
+	ti.Prompt = prompt + ": "
+	ti.Focus()
+	a.cfgNamingInput = ti
+	return a, nil
+}
+
+// detectCfgSubdir determines which global subdir the cursor is in (memory, contexts, rules).
+func (a *App) detectCfgSubdir() string {
+	ci, ok := a.cfgList.SelectedItem().(cfgItem)
+	if !ok || ci.isHeader || ci.item.Category != session.ConfigGlobal {
+		return ""
+	}
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		return ""
+	}
+	claudeDir := filepath.Join(home, ".claude")
+	rel := extractRelConfigPath(ci.item.Path, claudeDir)
+	if rel == "" {
+		return ""
+	}
+	// rel is like "memory/k8s.md" or "contexts/dev.md" or "rules/security.md"
+	parts := strings.SplitN(rel, string(filepath.Separator), 2)
+	if len(parts) > 0 {
+		return parts[0]
+	}
+	return ""
+}
+
+func (a *App) handleCfgNaming(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		name := strings.TrimSpace(a.cfgNamingInput.Value())
+		a.cfgNaming = false
+		if name == "" {
+			return a, nil
+		}
+		return a.createDraftConfig(name, a.cfgNamingCat)
+	case "esc":
+		a.cfgNaming = false
+		return a, nil
+	}
+	var cmd tea.Cmd
+	a.cfgNamingInput, cmd = a.cfgNamingInput.Update(msg)
+	return a, cmd
+}
+
+func (a *App) createDraftConfig(name string, cat session.ConfigCategory) (tea.Model, tea.Cmd) {
+	tmpl, ok := cfgTemplates[cat]
+	if !ok {
+		return a, nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		a.copiedMsg = "Cannot find home dir"
+		return a, nil
+	}
+
+	// Sanitize name
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.ReplaceAll(name, " ", "-")
+
+	var filePath string
+	switch {
+	case cat == session.ConfigGlobal:
+		// Detect subdir from cursor position (memory, contexts, rules)
+		subdir := a.detectCfgSubdir()
+		if subdir == "" {
+			subdir = "memory"
+		}
+		dir := filepath.Join(home, ".claude", subdir)
+		os.MkdirAll(dir, 0o755)
+		filePath = filepath.Join(dir, name+".md")
+	case cat == session.ConfigProject:
+		if a.cfgTree == nil || a.cfgTree.ProjectPath == "" {
+			a.copiedMsg = "No project selected"
+			return a, nil
+		}
+		encoded := session.EncodeProjectPath(a.cfgTree.ProjectPath)
+		dir := filepath.Join(home, ".claude", "projects", encoded, "memory")
+		os.MkdirAll(dir, 0o755)
+		filePath = filepath.Join(dir, name+".md")
+	case cat == session.ConfigSkill:
+		// Skills use skills/<name>/SKILL.md
+		dir := filepath.Join(home, ".claude", tmpl.subdir, name)
+		os.MkdirAll(dir, 0o755)
+		filePath = filepath.Join(dir, "SKILL.md")
+	default:
+		dir := filepath.Join(home, ".claude", tmpl.subdir)
+		os.MkdirAll(dir, 0o755)
+		filePath = filepath.Join(dir, name+tmpl.ext)
+	}
+
+	// Don't overwrite existing
+	if _, err := os.Stat(filePath); err == nil {
+		a.copiedMsg = "Already exists: " + filepath.Base(filePath)
+		return a, nil
+	}
+
+	if err := os.WriteFile(filePath, []byte(tmpl.template), tmpl.perm); err != nil {
+		a.copiedMsg = "Create failed: " + err.Error()
+		return a, nil
+	}
+
+	return a.openInEditor(filePath)
+}
+
+// --- Delete config items (with confirm + undo) ---
+
+// cfgTrashEntry stores a deleted item for undo.
+type cfgTrashEntry struct {
+	origPath string // original file path
+	tmpPath  string // temp backup path
+	isDir    bool   // true for skill directories
+}
+
+// cfgDeletableCategories lists categories where files can be deleted.
+var cfgDeletableCategories = map[session.ConfigCategory]bool{
+	session.ConfigGlobal:  true,
+	session.ConfigProject: true,
+	session.ConfigAgent:   true,
+	session.ConfigSkill:   true,
+	session.ConfigCommand: true,
+	session.ConfigHook:    true,
+}
+
+func (a *App) deleteCfgItems() (tea.Model, tea.Cmd) {
+	// If confirm is pending, this is the second press — execute delete
+	if a.cfgDeleteConfirm {
+		a.cfgDeleteConfirm = false
+		return a.executeCfgDelete()
+	}
+
+	// Gather items to delete
+	var targets []session.ConfigItem
+	if a.cfgHasSelection() {
+		for _, item := range a.selectedConfigItems() {
+			if cfgDeletableCategories[item.Category] {
+				targets = append(targets, item)
+			}
+		}
+	} else {
+		ci, ok := a.cfgList.SelectedItem().(cfgItem)
+		if !ok || ci.isHeader {
+			return a, nil
+		}
+		if !cfgDeletableCategories[ci.item.Category] {
+			a.copiedMsg = "Cannot delete " + session.CategoryLabel(ci.item.Category) + " items"
+			return a, nil
+		}
+		targets = append(targets, ci.item)
+	}
+
+	if len(targets) == 0 {
+		return a, nil
+	}
+
+	// Show confirmation — keep actions menu open so next d goes through handleCfgActionsMenu
+	a.cfgDeleteConfirm = true
+	a.cfgActionsMenu = true
+	if len(targets) == 1 {
+		a.copiedMsg = "Delete " + targets[0].Name + "? Press d to confirm"
+	} else {
+		a.copiedMsg = fmt.Sprintf("Delete %d items? Press d to confirm", len(targets))
+	}
+	return a, nil
+}
+
+func (a *App) executeCfgDelete() (tea.Model, tea.Cmd) {
+	var targets []session.ConfigItem
+	if a.cfgHasSelection() {
+		for _, item := range a.selectedConfigItems() {
+			if cfgDeletableCategories[item.Category] {
+				targets = append(targets, item)
+			}
+		}
+	} else {
+		ci, ok := a.cfgList.SelectedItem().(cfgItem)
+		if !ok || ci.isHeader {
+			return a, nil
+		}
+		targets = append(targets, ci.item)
+	}
+
+	trashed := 0
+	for _, item := range targets {
+		entry, err := trashCfgItem(item)
+		if err != nil {
+			continue
+		}
+		a.cfgTrash = append(a.cfgTrash, entry)
+		trashed++
+	}
+
+	a.clearCfgSelection()
+	a.refreshConfigExplorer()
+	if trashed == 1 {
+		a.copiedMsg = "Deleted " + targets[0].Name + " (u:undo)"
+	} else {
+		a.copiedMsg = fmt.Sprintf("Deleted %d items (u:undo)", trashed)
+	}
+	return a, nil
+}
+
+// trashCfgItem moves a config file to a temp location for undo.
+func trashCfgItem(item session.ConfigItem) (cfgTrashEntry, error) {
+	isDir := item.Category == session.ConfigSkill
+	srcPath := item.Path
+	if isDir {
+		srcPath = filepath.Dir(item.Path) // skill directory
+	}
+
+	tmpDir, err := os.MkdirTemp("", "ccx-trash-")
+	if err != nil {
+		return cfgTrashEntry{}, err
+	}
+	tmpPath := filepath.Join(tmpDir, filepath.Base(srcPath))
+
+	if err := os.Rename(srcPath, tmpPath); err != nil {
+		os.RemoveAll(tmpDir)
+		return cfgTrashEntry{}, err
+	}
+
+	return cfgTrashEntry{origPath: srcPath, tmpPath: tmpPath, isDir: isDir}, nil
+}
+
+func (a *App) undoCfgDelete() (tea.Model, tea.Cmd) {
+	if len(a.cfgTrash) == 0 {
+		a.copiedMsg = "Nothing to undo"
+		return a, nil
+	}
+
+	// Pop last entry
+	entry := a.cfgTrash[len(a.cfgTrash)-1]
+	a.cfgTrash = a.cfgTrash[:len(a.cfgTrash)-1]
+
+	// Restore: ensure parent dir exists, then move back
+	os.MkdirAll(filepath.Dir(entry.origPath), 0o755)
+	if err := os.Rename(entry.tmpPath, entry.origPath); err != nil {
+		a.copiedMsg = "Undo failed: " + err.Error()
+		return a, nil
+	}
+	// Clean up empty temp dir
+	os.Remove(filepath.Dir(entry.tmpPath))
+
+	a.refreshConfigExplorer()
+	a.copiedMsg = "Restored " + filepath.Base(entry.origPath)
+	return a, nil
+}
+
+// --- Actions menu ---
+
+func (a *App) handleCfgActionsMenu(key string) (tea.Model, tea.Cmd) {
+	a.cfgActionsMenu = false
+	a.copiedMsg = ""
+
+	switch key {
+	case "d":
+		return a.deleteCfgItems()
+	case "e":
+		return a.editCfgItems()
+	case "t":
+		return a.launchConfigTest()
+	case "u":
+		return a.undoCfgDelete()
+	}
+	// Any other key cancels
+	return a, nil
+}
+
+// editCfgItems opens selected config files (or current item) in $EDITOR.
+func (a *App) editCfgItems() (tea.Model, tea.Cmd) {
+	if a.cfgHasSelection() {
+		// Multi-select: open all selected files in editor
+		var paths []string
+		for _, item := range a.selectedConfigItems() {
+			paths = append(paths, item.Path)
+		}
+		if len(paths) == 0 {
+			return a, nil
+		}
+		editor := os.Getenv("EDITOR")
+		if editor == "" {
+			editor = "vi"
+		}
+		args := append([]string{}, paths...)
+		c := exec.Command(editor, args...)
+		return a, tea.ExecProcess(c, func(err error) tea.Msg {
+			return editorDoneMsg{}
+		})
+	}
+	// Single item
+	ci, ok := a.cfgList.SelectedItem().(cfgItem)
+	if !ok || ci.isHeader {
+		return a, nil
+	}
+	return a.openInEditor(ci.item.Path)
+}
+
+// renderCfgActionsHintBox renders a compact bordered hint box for the config actions menu.
+func (a *App) renderCfgActionsHintBox() string {
+	hl := lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	d := dimStyle
+	sp := "  "
+
+	var lines []string
+	if a.cfgHasSelection() {
+		header := fmt.Sprintf("%d selected", len(a.cfgSelectedSet))
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(header))
+	}
+	line := hl.Render("d") + d.Render(":delete") + sp + hl.Render("e") + d.Render(":edit")
+	if a.cfgHasSelection() {
+		line += sp + hl.Render("t") + d.Render(":test")
+	}
+	if len(a.cfgTrash) > 0 {
+		line += sp + hl.Render("u") + d.Render(":undo")
+	}
+	lines = append(lines, line)
+	lines = append(lines, d.Render("esc:cancel"))
+
+	body := strings.Join(lines, "\n")
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorDim).
+		Padding(0, 1)
+	return boxStyle.Render(body)
+}
+
+func (a *App) renderCfgPageHintBox() string {
+	hl := lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	d := dimStyle
+	sp := "  "
+
+	line1 := hl.Render("m") + d.Render(":memory") + sp + hl.Render("p") + d.Render(":project") + sp + hl.Render("l") + d.Render(":local")
+	line2 := hl.Render("s") + d.Render(":skills") + sp + hl.Render("a") + d.Render(":agents") + sp + hl.Render("c") + d.Render(":cmds")
+	line3 := hl.Render("h") + d.Render(":hooks") + sp + hl.Render("i") + d.Render(":mcp") + sp + hl.Render("e") + d.Render(":enterprise")
+	line4 := hl.Render("o") + d.Render(":all")
+
+	body := strings.Join([]string{line1, line2, line3, line4, d.Render("esc:cancel")}, "\n")
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorDim).
+		Padding(0, 1)
+	return boxStyle.Render(body)
+}
+
+func (a *App) handleCfgPageMenu(key string) (tea.Model, tea.Cmd) {
+	a.cfgPageMenu = false
+	switch key {
+	case "m":
+		a.cfgFilterCat = cfgFilterMemory
+	case "p":
+		a.cfgFilterCat = int(session.ConfigProject)
+	case "l":
+		a.cfgFilterCat = int(session.ConfigLocal)
+	case "s":
+		a.cfgFilterCat = int(session.ConfigSkill)
+	case "a":
+		a.cfgFilterCat = int(session.ConfigAgent)
+	case "c":
+		a.cfgFilterCat = int(session.ConfigCommand)
+	case "h":
+		a.cfgFilterCat = int(session.ConfigHook)
+	case "i":
+		a.cfgFilterCat = int(session.ConfigMCP)
+	case "e":
+		a.cfgFilterCat = int(session.ConfigEnterprise)
+	case "o":
+		a.cfgFilterCat = cfgFilterAll
+	default:
+		return a, nil
+	}
+	a.rebuildCfgList()
+	return a, nil
+}
+
+// --- Project picker (fuzzy search overlay) ---
+
+type cfgProjectEntry struct {
+	path string
+	name string // shortened display name
+}
+
+func (a *App) openCfgProjectPicker() (tea.Model, tea.Cmd) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		a.copiedMsg = "Cannot find home dir"
+		return a, nil
+	}
+	claudeDir := filepath.Join(home, ".claude")
+	projects := session.ListProjects(claudeDir)
+	if len(projects) == 0 {
+		a.copiedMsg = "No projects found"
+		return a, nil
+	}
+
+	entries := []cfgProjectEntry{{path: "", name: "(none)"}}
+	for _, p := range projects {
+		entries = append(entries, cfgProjectEntry{path: p, name: session.ShortenPath(p, home)})
+	}
+
+	ti := textinput.New()
+	ti.Prompt = "Project: "
+	ti.Focus()
+
+	a.cfgProjectPicker = true
+	a.cfgProjectEntries = entries
+	a.cfgProjectInput = ti
+	a.cfgProjectCursor = 0
+	return a, ti.Cursor.BlinkCmd()
+}
+
+// cfgProjectFiltered returns entries matching the current fuzzy query.
+func (a *App) cfgProjectFiltered() []cfgProjectEntry {
+	query := strings.ToLower(a.cfgProjectInput.Value())
+	if query == "" {
+		return a.cfgProjectEntries
+	}
+	var out []cfgProjectEntry
+	for _, e := range a.cfgProjectEntries {
+		if fuzzyMatch(strings.ToLower(e.name), query) || fuzzyMatch(strings.ToLower(e.path), query) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// fuzzyMatch checks if all characters of pattern appear in s in order.
+func fuzzyMatch(s, pattern string) bool {
+	pi := 0
+	for i := 0; i < len(s) && pi < len(pattern); i++ {
+		if s[i] == pattern[pi] {
+			pi++
+		}
+	}
+	return pi == len(pattern)
+}
+
+func (a *App) handleCfgProjectPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	switch key {
+	case "enter":
+		filtered := a.cfgProjectFiltered()
+		if len(filtered) > 0 && a.cfgProjectCursor < len(filtered) {
+			a.cfgProjectPicker = false
+			return a.switchCfgProject(filtered[a.cfgProjectCursor].path)
+		}
+		a.cfgProjectPicker = false
+		return a, nil
+	case "esc":
+		a.cfgProjectPicker = false
+		return a, nil
+	case "up", "ctrl+p":
+		if a.cfgProjectCursor > 0 {
+			a.cfgProjectCursor--
+		}
+		return a, nil
+	case "down", "ctrl+n":
+		filtered := a.cfgProjectFiltered()
+		if a.cfgProjectCursor < len(filtered)-1 {
+			a.cfgProjectCursor++
+		}
+		return a, nil
+	}
+
+	// Pass to text input, then reset cursor to 0 on text change
+	oldVal := a.cfgProjectInput.Value()
+	var cmd tea.Cmd
+	a.cfgProjectInput, cmd = a.cfgProjectInput.Update(msg)
+	if a.cfgProjectInput.Value() != oldVal {
+		a.cfgProjectCursor = 0
+	}
+	return a, cmd
+}
+
+func (a *App) switchCfgProject(projectPath string) (tea.Model, tea.Cmd) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		a.copiedMsg = "Cannot find home dir"
+		return a, nil
+	}
+	claudeDir := filepath.Join(home, ".claude")
+
+	tree, err := session.ScanConfig(claudeDir, projectPath)
+	if err != nil {
+		a.copiedMsg = "Config scan failed"
+		return a, nil
+	}
+
+	a.cfgTree = tree
+	a.cfgSelectedSet = make(map[string]bool)
+	items := buildConfigItemsFiltered(tree, a.cfgFilterCat, a.cfgSearchTerm)
+	contentH := ContentHeight(a.height)
+	listW := a.cfgSplit.ListWidth(a.width, a.splitRatio)
+	a.cfgList = newConfigList(items, listW, contentH)
+	a.cfgSplit.CacheKey = ""
+	a.updateConfigPreview()
+	a.copiedMsg = "Project: " + tree.ProjectName
+	return a, nil
+}
+
+// renderProjectPickerOverlay renders the project picker as a compact centered overlay.
+func (a *App) renderProjectPickerOverlay(bg string) string {
+	filtered := a.cfgProjectFiltered()
+
+	hl := lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	nameStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#D1D5DB"))
+	selStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
+	cursorStyle := lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+
+	boxW := min(a.width-8, 70)
+	// Fixed slot count — never changes with filter results
+	maxSlots := min(15, ContentHeight(a.height)-8)
+	if maxSlots < 3 {
+		maxSlots = 3
+	}
+
+	// Build lines
+	var lines []string
+	lines = append(lines, hl.Render("Switch Project"))
+	lines = append(lines, a.cfgProjectInput.View())
+	lines = append(lines, dimStyle.Render(strings.Repeat("─", boxW-2)))
+
+	// Scroll window around cursor
+	start := 0
+	visible := min(len(filtered), maxSlots)
+	if a.cfgProjectCursor >= start+maxSlots {
+		start = a.cfgProjectCursor - maxSlots + 1
+	}
+	end := start + visible
+	if end > len(filtered) {
+		end = len(filtered)
+		start = max(0, end-maxSlots)
+		visible = end - start
+	}
+
+	for i := start; i < end; i++ {
+		e := filtered[i]
+		display := e.name
+		if len(display) > boxW-6 {
+			display = "…" + display[len(display)-boxW+7:]
+		}
+		if i == a.cfgProjectCursor {
+			lines = append(lines, cursorStyle.Render("▸ ")+selStyle.Render(display))
+		} else {
+			lines = append(lines, "  "+nameStyle.Render(display))
+		}
+	}
+
+	// Pad remaining slots with empty lines to keep fixed height
+	for i := visible; i < maxSlots; i++ {
+		lines = append(lines, "")
+	}
+
+	// Footer: match count
+	footer := dimStyle.Render(fmt.Sprintf("  %d/%d", len(filtered), len(a.cfgProjectEntries)))
+	lines = append(lines, footer)
+
+	body := strings.Join(lines, "\n")
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorAccent).
+		Padding(0, 1).
+		Width(boxW).
+		Height(maxSlots + 4) // title + input + ruler + footer
+	overlay := boxStyle.Render(body)
+
+	// Use ANSI-safe overlay onto background
+	bgLines := strings.Split(bg, "\n")
+	contentH := ContentHeight(a.height)
+	for len(bgLines) < contentH {
+		bgLines = append(bgLines, "")
+	}
+
+	fgLines := strings.Split(overlay, "\n")
+	fgH := len(fgLines)
+	fgW := 0
+	for _, l := range fgLines {
+		if w := lipgloss.Width(l); w > fgW {
+			fgW = w
+		}
+	}
+
+	startY := max((contentH-fgH)/2, 0)
+	startX := max((a.width-fgW)/2, 0)
+
+	for i, fgLine := range fgLines {
+		y := startY + i
+		if y >= len(bgLines) {
+			break
+		}
+		bgLines[y] = overlayLine(bgLines[y], fgLine, startX, a.width)
+	}
+
+	if len(bgLines) > contentH {
+		bgLines = bgLines[:contentH]
+	}
+	return strings.Join(bgLines, "\n")
 }

@@ -95,3 +95,61 @@ func ScanSessions(claudeDir string) ([]Session, error) {
 
 	return sessions, nil
 }
+
+// ScanSessionsForPaths scans only the most recently modified session file in
+// each project directory matching the given absolute project paths. This is
+// designed for fast live-session detection at startup.
+func ScanSessionsForPaths(claudeDir string, projectPaths []string) ([]Session, error) {
+	if len(projectPaths) == 0 {
+		return nil, nil
+	}
+
+	if claudeDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("get home dir: %w", err)
+		}
+		claudeDir = filepath.Join(home, ".claude")
+	}
+
+	home := filepath.Dir(claudeDir)
+	projectsDir := filepath.Join(claudeDir, "projects")
+
+	var sessions []Session
+	for _, pp := range projectPaths {
+		encoded := EncodeProjectPath(pp)
+		dir := filepath.Join(projectsDir, encoded)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		// Find the most recently modified JSONL file
+		var bestPath string
+		var bestTime time.Time
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") || strings.HasPrefix(e.Name(), "agent-") {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if info.ModTime().After(bestTime) {
+				bestTime = info.ModTime()
+				bestPath = filepath.Join(dir, e.Name())
+			}
+		}
+		if bestPath != "" {
+			sess := scanSessionStream(bestPath, bestTime, home)
+			if sess.MsgCount > 0 {
+				sessions = append(sessions, sess)
+			}
+		}
+	}
+
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].ModTime.After(sessions[j].ModTime)
+	})
+
+	return sessions, nil
+}

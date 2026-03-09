@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +12,27 @@ import (
 
 	"github.com/sendbird/ccx/internal/session"
 )
+
+// extractClaudeOAuthToken reads the OAuth access token from the macOS Keychain.
+func extractClaudeOAuthToken() (string, error) {
+	out, err := exec.Command("security", "find-generic-password",
+		"-s", "Claude Code-credentials", "-w").Output()
+	if err != nil {
+		return "", err
+	}
+	var creds struct {
+		ClaudeAiOauth struct {
+			AccessToken string `json:"accessToken"`
+		} `json:"claudeAiOauth"`
+	}
+	if err := json.Unmarshal(out, &creds); err != nil {
+		return "", err
+	}
+	if creds.ClaudeAiOauth.AccessToken == "" {
+		return "", fmt.Errorf("no access token found in keychain")
+	}
+	return creds.ClaudeAiOauth.AccessToken, nil
+}
 
 type tmuxPane struct {
 	PaneID  string
@@ -208,6 +231,29 @@ func findLiveProjectPaths() map[string]bool {
 		}
 	}
 	return live
+}
+
+// DetectLiveProjectPaths returns absolute project paths of currently running
+// Claude processes. Used for fast phase-1 session scanning at startup.
+func DetectLiveProjectPaths() []string {
+	if inTmux() {
+		cps := findClaudePanes()
+		seen := make(map[string]bool, len(cps))
+		var paths []string
+		for _, cp := range cps {
+			if !seen[cp.path] {
+				seen[cp.path] = true
+				paths = append(paths, cp.path)
+			}
+		}
+		return paths
+	}
+	live := findLiveProjectPaths()
+	paths := make([]string, 0, len(live))
+	for p := range live {
+		paths = append(paths, p)
+	}
+	return paths
 }
 
 // markLiveSessions sets IsLive and IsResponding on sessions by matching

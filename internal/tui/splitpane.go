@@ -42,11 +42,14 @@ type SplitPane struct {
 // FoldState holds fold/unfold and block cursor state for previews
 // that render structured content blocks.
 type FoldState struct {
-	Collapsed   foldSet
-	Formatted   foldSet
-	Entry       session.Entry
-	BlockCursor int
-	BlockStarts []int
+	Collapsed    foldSet
+	Formatted    foldSet
+	Entry        session.Entry
+	BlockCursor  int
+	BlockStarts  []int
+	BlockVisible []bool   // nil = all visible; non-nil = per-block visibility
+	BlockFilter  string   // current filter expression (empty = no filter)
+	HideHooks    bool     // true = suppress hook badges/details in render
 }
 
 // ListWidth returns the list width given total width and split ratio.
@@ -408,7 +411,8 @@ func (sp *SplitPane) RefreshFoldPreview(totalW, splitRatio int) {
 	oldOffset := sp.Preview.YOffset
 
 	cursor := sp.Folds.BlockCursor
-	rp := renderFullMessageWithCursor(sp.Folds.Entry, previewW, sp.Folds.Collapsed, sp.Folds.Formatted, cursor)
+	ro := renderOpts{visible: sp.Folds.BlockVisible, hideHooks: sp.Folds.HideHooks}
+	rp := renderFullMessageWithCursor(sp.Folds.Entry, previewW, sp.Folds.Collapsed, sp.Folds.Formatted, cursor, ro)
 	sp.Folds.BlockStarts = rp.blockStarts
 	sp.cachedRP = &rp
 	sp.cachedFolds = foldHash(sp.Folds.Collapsed, sp.Folds.Formatted)
@@ -456,7 +460,8 @@ func (sp *SplitPane) RefreshFoldCursor(totalW, splitRatio int) {
 	// Fold state unchanged — re-render with new cursor position only
 	previewW := sp.PreviewWidth(totalW, splitRatio)
 	cursor := sp.Folds.BlockCursor
-	rp := renderFullMessageWithCursor(sp.Folds.Entry, previewW, sp.Folds.Collapsed, sp.Folds.Formatted, cursor)
+	ro := renderOpts{visible: sp.Folds.BlockVisible, hideHooks: sp.Folds.HideHooks}
+	rp := renderFullMessageWithCursor(sp.Folds.Entry, previewW, sp.Folds.Collapsed, sp.Folds.Formatted, cursor, ro)
 	sp.Folds.BlockStarts = rp.blockStarts
 	sp.cachedRP = &rp
 
@@ -601,14 +606,16 @@ func (fs *FoldState) HandleKey(key string) foldResult {
 
 	switch key {
 	case "up":
-		if fs.BlockCursor > 0 {
-			fs.BlockCursor--
+		next := fs.prevVisibleBlock(fs.BlockCursor)
+		if next >= 0 {
+			fs.BlockCursor = next
 			return foldCursorMoved
 		}
 		return foldUnhandled
 	case "down":
-		if fs.BlockCursor < nBlocks-1 {
-			fs.BlockCursor++
+		next := fs.nextVisibleBlock(fs.BlockCursor)
+		if next >= 0 {
+			fs.BlockCursor = next
 			return foldCursorMoved
 		}
 		return foldUnhandled
@@ -649,14 +656,16 @@ func (fs *FoldState) HandleKey(key string) foldResult {
 		// Fall through to viewport scroll — lets user read long blocks page by page
 		return foldUnhandled
 	case "home":
-		if fs.BlockCursor != 0 {
-			fs.BlockCursor = 0
+		first := fs.firstVisibleBlock()
+		if first >= 0 && fs.BlockCursor != first {
+			fs.BlockCursor = first
 			return foldCursorMoved
 		}
 		return foldUnhandled
 	case "end":
-		if fs.BlockCursor != nBlocks-1 {
-			fs.BlockCursor = nBlocks - 1
+		last := fs.lastVisibleBlock()
+		if last >= 0 && fs.BlockCursor != last {
+			fs.BlockCursor = last
 			return foldCursorMoved
 		}
 		return foldUnhandled
@@ -670,6 +679,57 @@ func (fs *FoldState) HandleKey(key string) foldResult {
 		return foldHandled
 	}
 	return foldUnhandled
+}
+
+// isBlockVisible returns whether block i is visible under the current filter.
+func (fs *FoldState) isBlockVisible(i int) bool {
+	if fs.BlockVisible == nil {
+		return true
+	}
+	if i < 0 || i >= len(fs.BlockVisible) {
+		return false
+	}
+	return fs.BlockVisible[i]
+}
+
+// nextVisibleBlock returns the next visible block index after current, or -1.
+func (fs *FoldState) nextVisibleBlock(current int) int {
+	for i := current + 1; i < len(fs.Entry.Content); i++ {
+		if fs.isBlockVisible(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+// prevVisibleBlock returns the previous visible block index before current, or -1.
+func (fs *FoldState) prevVisibleBlock(current int) int {
+	for i := current - 1; i >= 0; i-- {
+		if fs.isBlockVisible(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+// firstVisibleBlock returns the first visible block index, or -1.
+func (fs *FoldState) firstVisibleBlock() int {
+	for i := 0; i < len(fs.Entry.Content); i++ {
+		if fs.isBlockVisible(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+// lastVisibleBlock returns the last visible block index, or -1.
+func (fs *FoldState) lastVisibleBlock() int {
+	for i := len(fs.Entry.Content) - 1; i >= 0; i-- {
+		if fs.isBlockVisible(i) {
+			return i
+		}
+	}
+	return -1
 }
 
 // SelectBlockAtLine moves the block cursor to the block containing the given line.

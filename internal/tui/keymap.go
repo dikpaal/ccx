@@ -45,7 +45,6 @@ type ActionsKeymap struct {
 type ViewsKeymap struct {
 	Stats  string `yaml:"stats"`
 	Config string `yaml:"config"`
-	Hooks  string `yaml:"hooks"`
 }
 
 // NavigationKeymap defines extra keybindings that alias standard navigation keys.
@@ -105,7 +104,6 @@ func DefaultKeymap() Keymap {
 		Views: ViewsKeymap{
 			Stats:  "s",
 			Config: "c",
-			Hooks:  "h",
 		},
 		Navigation: NavigationKeymap{
 			Up:       []string{"k"},
@@ -324,6 +322,17 @@ func displayKey(key string) string {
 	default:
 		return key
 	}
+}
+
+// isNavKey returns true if the key message is a navigation key (arrows, pgup/pgdn, home/end).
+// Used to prevent bubbles list from entering filter mode on character keys.
+func isNavKey(msg tea.KeyMsg) bool {
+	switch msg.Type {
+	case tea.KeyUp, tea.KeyDown, tea.KeyLeft, tea.KeyRight,
+		tea.KeyPgUp, tea.KeyPgDown, tea.KeyHome, tea.KeyEnd:
+		return true
+	}
+	return false
 }
 
 // fmtKey returns "displayKey:desc" for use in formatHelp().

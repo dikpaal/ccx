@@ -44,6 +44,9 @@ type SessionStats struct {
 	// Skills: skill name -> count (from Skill tool_use)
 	SkillCounts map[string]int
 
+	// Agents: subagent_type -> count (from Agent tool_use)
+	AgentCounts map[string]int
+
 	// Timeline
 	FirstTimestamp time.Time
 	LastTimestamp  time.Time
@@ -116,6 +119,8 @@ type GlobalStats struct {
 	ToolErrors    map[string]int
 	SkillErrors   map[string]int
 	CommandErrors map[string]int
+
+	AgentCounts map[string]int // subagent_type -> total count across sessions
 
 	AllTurnsPerRequest []int
 

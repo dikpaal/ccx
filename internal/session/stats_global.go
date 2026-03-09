@@ -9,6 +9,7 @@ func AggregateStats(sessions []Session) GlobalStats {
 		MCPToolCounts:          make(map[string]int),
 		SkillCounts:            make(map[string]int),
 		CommandCounts:          make(map[string]int),
+		AgentCounts:            make(map[string]int),
 		Models:                 make(map[string]int),
 		ModelTokens:            make(map[string]*ModelUsage),
 		ToolErrors:             make(map[string]int),
@@ -75,6 +76,9 @@ func AggregateStats(sessions []Session) GlobalStats {
 		}
 		for k, v := range stats.CommandCounts {
 			g.CommandCounts[k] += v
+		}
+		for k, v := range stats.AgentCounts {
+			g.AgentCounts[k] += v
 		}
 		for k, v := range stats.Models {
 			g.Models[k] += v

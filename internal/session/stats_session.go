@@ -29,6 +29,7 @@ func ScanSessionStats(path string) (SessionStats, error) {
 		MCPToolCounts:       make(map[string]int),
 		CommandCounts:       make(map[string]int),
 		SkillCounts:         make(map[string]int),
+		AgentCounts:         make(map[string]int),
 		FilesTouched:        make(map[string]bool),
 		Models:              make(map[string]int),
 		ModelTokens:         make(map[string]*ModelUsage),
@@ -279,6 +280,14 @@ func extractToolUses(line []byte, stats *SessionStats, ts time.Time) {
 					}
 				}
 
+				if name == "Agent" {
+					if agentType := extractAgentType(line, pos); agentType != "" {
+						stats.AgentCounts[agentType]++
+					} else {
+						stats.AgentCounts["general-purpose"]++
+					}
+				}
+
 				if name == "Write" || name == "Edit" || name == "Read" {
 					searchEnd := min(pos+2000, len(line))
 					fp := extractStringField(line[pos:searchEnd], bFilePathQ, bFilePathS)
@@ -322,6 +331,11 @@ func isValidCommand(cmd string) bool {
 		}
 	}
 	return true
+}
+
+func extractAgentType(line []byte, pos int) string {
+	searchEnd := min(pos+500, len(line))
+	return extractStringField(line[pos:searchEnd], bSubagentQ, bSubagentQS)
 }
 
 func extractSkillName(line []byte, pos int) string {

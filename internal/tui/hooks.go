@@ -32,7 +32,7 @@ func (a *App) openHooksView() (tea.Model, tea.Cmd) {
 	contentH := a.height - 3
 	a.hooksVP = viewport.New(a.width, contentH)
 	a.hooksVP.SetContent(renderHooksView(a.width))
-	a.state = viewHooks
+	a.state = viewConfig
 	return a, nil
 }
 

@@ -444,6 +444,18 @@ func renderGlobalStats(stats session.GlobalStats, width int) string {
 		renderToolDailyTimelines(&sb, stats.AllToolCallTimestamps, stats.AllToolErrorTimestamps, stats.ToolCounts, width, 10)
 	}
 
+	// ── AGENTS ──
+	if len(stats.AgentCounts) > 0 {
+		totalAgents := 0
+		for _, c := range stats.AgentCounts {
+			totalAgents += c
+		}
+		sb.WriteString(titleStyle.Render(fmt.Sprintf("AGENTS (%d spawns)", totalAgents)) + "\n")
+		sb.WriteString(ruler + "\n")
+		renderToolBarN(&sb, stats.AgentCounts, width, 10)
+		sb.WriteString("\n")
+	}
+
 	// ── SKILLS ──
 	if len(stats.SkillCounts) > 0 {
 		totalSkills := 0

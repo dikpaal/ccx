@@ -47,24 +47,9 @@ func main() {
 		os.Exit(0)
 	}
 
-	sessions, err := session.ScanSessions(claudeDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error scanning sessions: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Auto-detect tmux unless explicitly set
 	if !tmuxEnabled && os.Getenv("TMUX") != "" {
 		tmuxEnabled = true
-	}
-
-	if len(sessions) == 0 {
-		dir := claudeDir
-		if dir == "" {
-			dir = "~/.claude/projects/"
-		}
-		fmt.Fprintf(os.Stderr, "No sessions found in %s\n", dir)
-		os.Exit(0)
 	}
 
 	configPath := filepath.Join(os.Getenv("HOME"), ".config", "ccx", "config.yaml")
@@ -75,7 +60,12 @@ func main() {
 		km = &def
 	}
 
-	app := tui.NewApp(sessions, tui.Config{
+	// Phase 1: scan only live sessions synchronously (~40ms) for instant display.
+	// Full scan happens asynchronously inside the TUI.
+	livePaths := tui.DetectLiveProjectPaths()
+	liveSessions, _ := session.ScanSessionsForPaths(claudeDir, livePaths)
+
+	app := tui.NewApp(liveSessions, tui.Config{
 		ClaudeDir:    claudeDir,
 		TmuxEnabled:  tmuxEnabled,
 		TmuxAutoLive: tmuxAutoLive,

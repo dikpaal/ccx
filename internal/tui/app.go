@@ -23,11 +23,26 @@ type liveTickMsg time.Time     // slow live capture (2s, unfocused)
 type spinnerTickMsg time.Time
 type globalStatsMsg session.GlobalStats
 
+// sessionsScannedMsg carries the result of async full session scanning.
+type sessionsScannedMsg struct {
+	sessions []session.Session
+	err      error
+}
+
 // liveCaptureMsg carries async tmux capture-pane result.
 type liveCaptureMsg struct {
 	content string
 	failed  bool
 }
+
+// Conversation preview detail levels (cycled with tab).
+const (
+	previewText = 0 // text only — no tool blocks
+	previewTool = 1 // text + tool blocks (hooks hidden)
+	previewHook = 2 // text + tool blocks + hook details
+)
+
+var previewModeLabels = [3]string{"text", "tool", "hook"}
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
@@ -90,7 +105,6 @@ const (
 	viewMessageFull
 	viewGlobalStats
 	viewConfig
-	viewHooks
 )
 
 type App struct {
@@ -142,6 +156,9 @@ type App struct {
 	globalStatsCache   *session.GlobalStats
 	globalStatsLoading bool
 	spinnerFrame       int
+	statsDetail        statsDetailMode // drill-down detail category
+	statsDetailVP      viewport.Model
+	statsPageMenu      bool // "p" page jump popup
 
 	// Session preview mode
 	sessPreviewMode    sessPreview
@@ -163,8 +180,9 @@ type App struct {
 	sessConvFilterTerm string           // applied filter term
 
 	// Group mode: groupFlat=0, groupProject=1, groupTree=2
-	sessGroupMode int
-	liveUpdate    bool // auto-refresh disabled by default
+	sessGroupMode   int
+	sessionsLoading bool // true while initial async scan is in progress
+	liveUpdate      bool // auto-refresh disabled by default
 
 	// Edit file menu
 	editMenu    bool
@@ -214,7 +232,12 @@ type App struct {
 		split    SplitPane
 		agent       session.Subagent  // non-zero when viewing agent conversation
 		task        session.TaskItem  // non-zero when viewing task conversation
-		textPreview bool              // true = text-only preview, false = detailed/fold preview
+		// Preview detail level: text → tool → hook (cycled with tab)
+		previewMode int // 0=text, 1=tool (no hooks), 2=hook (with hooks)
+
+		// Block filter for preview pane
+		blockFiltering bool            // true when filter input is active
+		blockFilterTI  textinput.Model // filter text input
 	}
 	convList list.Model
 
@@ -237,6 +260,10 @@ type App struct {
 		searchTerm  string   // committed search term
 		searchLines []int    // line numbers that match
 		searchIdx   int      // current match index in searchLines
+
+		// Block filter for single-message mode
+		blockFiltering bool
+		blockFilterTI  textinput.Model
 	}
 
 	// Navigation stack for agent drill-down
@@ -251,8 +278,23 @@ type App struct {
 	cfgSearchTerm  string
 	cfgSearchMatch []int // indices of matching items
 	cfgSearchIdx   int   // current match index
+	cfgSearchHist  []string // search history (most recent last)
+	cfgSearchHistI int      // -1 = new input, 0..N = browsing history
+	cfgSelectedSet map[string]bool // config file path → selected
+	cfgFilterCat   int             // -1 = all, 0..N = ConfigCategory value
+	cfgNaming      bool            // naming input active for new config
+	cfgNamingInput textinput.Model
+	cfgNamingCat   session.ConfigCategory
+	cfgProjectPicker  bool              // project picker overlay active
+	cfgProjectEntries []cfgProjectEntry // all projects
+	cfgProjectInput   textinput.Model   // fuzzy search input
+	cfgProjectCursor  int               // selected index in filtered list
+	cfgTrash         []cfgTrashEntry // undo stack for deleted items
+	cfgDeleteConfirm bool            // waiting for second x press
+	cfgActionsMenu   bool            // config actions menu open
+	cfgPageMenu      bool            // config page jump popup
 
-	// Hooks view (viewHooks)
+	// Hooks view (legacy, kept for viewport reuse)
 	hooksVP viewport.Model
 
 	// Command mode (: key)
@@ -313,10 +355,10 @@ type Config struct {
 }
 
 func NewApp(sessions []session.Session, cfg Config) *App {
-	// Set IsLive by matching running Claude processes to sessions.
-	// In tmux: match by session ID in process args, fallback to most recent for path.
-	// Outside tmux: match by project path.
-	markLiveSessions(sessions)
+	if len(sessions) > 0 {
+		// Set IsLive by matching running Claude processes to sessions.
+		markLiveSessions(sessions)
+	}
 
 	if cfg.WorktreeDir == "" {
 		cfg.WorktreeDir = ".worktree"
@@ -328,12 +370,13 @@ func NewApp(sessions []session.Session, cfg Config) *App {
 	}
 
 	a := &App{
-		state:       viewSessions,
-		sessions:    sessions,
-		config:      cfg,
-		keymap:      km,
-		splitRatio:  35,
-		selectedSet: make(map[string]bool),
+		state:           viewSessions,
+		sessions:        sessions,
+		sessionsLoading: true, // always true — full scan happens async
+		config:          cfg,
+		keymap:          km,
+		splitRatio:      35,
+		selectedSet:     make(map[string]bool),
 	}
 	a.sessSplit = SplitPane{List: &a.sessionList, ItemHeight: 2}
 	a.conv.split = SplitPane{List: &a.convList, Show: true, Folds: &FoldState{}, ItemHeight: 1}
@@ -359,7 +402,18 @@ func NewApp(sessions []session.Session, cfg Config) *App {
 }
 
 func (a *App) Init() tea.Cmd {
-	return tickCmd()
+	cmds := []tea.Cmd{tickCmd()}
+	if a.sessionsLoading {
+		// Phase 1 (live sessions) was done synchronously in main.
+		// Fire phase 2: full async scan for all remaining sessions.
+		cmds = append(cmds, spinnerTickCmd())
+		claudeDir := a.config.ClaudeDir
+		cmds = append(cmds, func() tea.Msg {
+			sessions, err := session.ScanSessions(claudeDir)
+			return sessionsScannedMsg{sessions: sessions, err: err}
+		})
+	}
+	return tea.Batch(cmds...)
 }
 
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -373,6 +427,14 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case editorDoneMsg:
 		if a.state == viewConfig {
 			// Re-scan config after editor closes
+			a.refreshConfigExplorer()
+		}
+		return a, nil
+
+	case configTestDoneMsg:
+		os.RemoveAll(msg.tmpDir)
+		a.clearCfgSelection()
+		if a.state == viewConfig {
 			a.refreshConfigExplorer()
 		}
 		return a, nil
@@ -435,9 +497,49 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case spinnerTickMsg:
-		if a.globalStatsLoading {
+		if a.globalStatsLoading || a.sessionsLoading {
 			a.spinnerFrame = (a.spinnerFrame + 1) % len(spinnerFrames)
 			return a, spinnerTickCmd()
+		}
+		return a, nil
+
+	case sessionsScannedMsg:
+		// Full scan complete — replace partial live sessions with full list
+		a.sessionsLoading = false
+		if msg.err != nil || len(msg.sessions) == 0 {
+			if len(a.sessions) == 0 {
+				a.sessions = nil
+			}
+			return a, nil
+		}
+		markLiveSessions(msg.sessions)
+
+		// Remember cursor position from phase 1
+		selectedID := ""
+		if sess, ok := a.selectedSession(); ok {
+			selectedID = sess.ID
+		}
+
+		a.sessions = msg.sessions
+		// Build/rebuild session list
+		if a.width > 0 && a.height > 0 {
+			contentH := a.height - 3
+			sessW := a.sessSplit.ListWidth(a.width, a.splitRatio)
+			a.sessionList = newSessionList(a.sessions, sessW, contentH, a.sessGroupMode, a.selectedSet)
+			a.sessSplit.CacheKey = ""
+			if a.config.SearchQuery != "" {
+				applyListFilter(&a.sessionList, a.config.SearchQuery)
+			}
+			// Restore cursor to previously selected session
+			if selectedID != "" {
+				for i, item := range a.sessionList.Items() {
+					if si, ok := item.(sessionItem); ok && si.sess.ID == selectedID {
+						a.sessionList.Select(i)
+						return a, nil
+					}
+				}
+			}
+			return a, a.autoSelectSession()
 		}
 		return a, nil
 
@@ -494,8 +596,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a.handleMessageFullKeys(msg)
 		case viewConfig:
 			return a.handleConfigKeys(msg)
-		case viewHooks:
-			return a.handleHooksKeys(msg)
 		}
 	}
 
@@ -512,6 +612,25 @@ func (a *App) View() string {
 	switch a.state {
 	case viewSessions:
 		title = a.renderBreadcrumb()
+		if a.sessionsLoading && len(a.sessions) == 0 {
+			idx := a.spinnerFrame % len(spinnerFrames)
+			frame := spinnerFrames[idx]
+			spinnerColors := []lipgloss.Color{"#10B981", "#3B82F6", "#F59E0B", "#7C3AED", "#EC4899"}
+			c := spinnerColors[a.spinnerFrame/len(spinnerFrames)%len(spinnerColors)]
+			s := lipgloss.NewStyle().Foreground(c).Bold(true)
+			content = "\n  " + s.Render(fmt.Sprintf("%s Scanning sessions…", frame))
+			help = formatHelp("loading… q:quit")
+			break
+		}
+		if len(a.sessions) == 0 {
+			dir := a.config.ClaudeDir
+			if dir == "" {
+				dir = "~/.claude/projects/"
+			}
+			content = "\n  " + dimStyle.Render(fmt.Sprintf("No sessions found in %s", dir))
+			help = formatHelp("q:quit")
+			break
+		}
 		content = a.renderSessionSplit()
 		if a.sessConvFullText != "" {
 			content = renderFullTextModal(content, a.sessConvFullText, a.sessConvFullScroll, a.width, ContentHeight(a.height))
@@ -558,8 +677,21 @@ func (a *App) View() string {
 
 	case viewGlobalStats:
 		title = a.renderBreadcrumb()
-		content = a.globalStatsVP.View()
-		help = formatHelp("↑↓:scroll esc:back q:quit")
+		if a.globalStatsLoading {
+			idx := a.spinnerFrame % len(spinnerFrames)
+			frame := spinnerFrames[idx]
+			spinnerColors := []lipgloss.Color{"#10B981", "#3B82F6", "#F59E0B", "#7C3AED", "#EC4899"}
+			c := spinnerColors[a.spinnerFrame/len(spinnerFrames)%len(spinnerColors)]
+			s := lipgloss.NewStyle().Foreground(c).Bold(true)
+			content = "\n  " + s.Render(fmt.Sprintf("%s Scanning %d sessions…", frame, len(a.sessions)))
+			help = formatHelp("loading… v:views q:quit")
+		} else if a.statsDetail != statsDetailNone {
+			content = a.statsDetailVP.View()
+			help = formatHelp("p:page tab/S-tab:cycle ↑↓:scroll esc:back")
+		} else {
+			content = a.globalStatsVP.View()
+			help = formatHelp("p:page tab:first ↑↓:scroll v:views q:quit")
+		}
 
 	case viewConversation:
 		title = a.renderBreadcrumb()
@@ -573,38 +705,50 @@ func (a *App) View() string {
 			badges = badgeStyle.Render(a.liveBadgeText()) + "  "
 		}
 		sp := &a.conv.split
-		h := "↵:open e:edit L:live R:refresh"
-		if a.config.TmuxEnabled && inTmux() && a.currentSess.IsLive {
-			h += " I:input J:jump"
-		}
-		if sp.Show {
-			if sp.Focus {
-				if a.conv.textPreview {
-					h += " ↑↓:scroll"
-				} else {
-					h += " ↑↓:blocks ←→:fold f/F:all"
-				}
-			} else {
-				modeLabel := "text"
-				if !a.conv.textPreview {
-					modeLabel = "detail"
-				}
-				h += " tab:" + modeLabel + " →:focus"
-			}
-			h += " esc:close []:resize"
+		if a.conv.blockFiltering {
+			help = "  " + a.conv.blockFilterTI.View() + helpStyle.Render("  enter:apply esc:cancel")
 		} else {
-			h += " tab:preview →:preview"
+			h := "↵:open e:edit L:live R:refresh"
+			if a.config.TmuxEnabled && inTmux() && a.currentSess.IsLive {
+				h += " I:input J:jump"
+			}
+			if sp.Show {
+				if sp.Focus {
+					if a.conv.previewMode == previewText {
+						h += " ↑↓:scroll"
+					} else {
+						h += " ↑↓:blocks ←→:fold f/F:all /:filter"
+					}
+				} else {
+					// Show next mode label for tab hint
+					next := previewModeLabels[(a.conv.previewMode+1)%3]
+					h += " tab:" + next + " →:focus"
+				}
+				h += " esc:close []:resize"
+			} else {
+				h += " tab:preview →:preview"
+			}
+			// Show active block filter badge
+			if sp.Folds != nil && sp.Folds.BlockFilter != "" {
+				vis := countVisibleBlocks(sp.Folds.BlockVisible)
+				total := len(sp.Folds.Entry.Content)
+				filterInfo := filterBadge.Render(fmt.Sprintf(" [%d/%d] %s", vis, total, sp.Folds.BlockFilter))
+				help = filterInfo + " " + badges + formatHelp(h+" /:search esc:back q:quit")
+			} else {
+				help = badges + formatHelp(h+" /:search esc:back q:quit")
+			}
 		}
-		help = badges + formatHelp(h+" /:search esc:back q:quit")
 
 	case viewMessageFull:
 		title = a.renderBreadcrumb()
 		content = a.renderMessageFull()
-		if a.msgFull.searching {
+		if a.msgFull.blockFiltering {
+			help = "  " + a.msgFull.blockFilterTI.View() + helpStyle.Render("  enter:apply esc:cancel")
+		} else if a.msgFull.searching {
 			help = "  " + a.msgFull.searchInput.View() + helpStyle.Render("  enter:search esc:cancel")
 		} else if a.msgFull.allMessages {
 			if a.copyModeActive {
-				help = formatHelp("all messages  ↑↓:move v/sp:select y/↵:copy home/end esc:cancel")
+				help = formatHelp("all messages  ↑↓:move v/sp:sel y/↵:copy home/end esc:cancel")
 			} else {
 				sh := "all messages  ↑↓:scroll v:copy y:all /:search"
 				if a.msgFull.searchTerm != "" {
@@ -615,20 +759,33 @@ func (a *App) View() string {
 		} else {
 			pos := fmt.Sprintf("#%d/%d", a.msgFull.idx+1, len(a.msgFull.merged))
 			if a.copyModeActive {
-				help = formatHelp(pos + "  ↑↓:move v/sp:select y/↵:copy home/end esc:cancel")
+				help = formatHelp(pos + "  ↑↓:move v/sp:sel y/↵:copy home/end esc:cancel")
 			} else {
-				sh := pos + "  ↑↓:blocks ←→:fold n/N:msg f/F:all v:copy y:all /:search"
+				sh := pos + "  ↑↓:blocks ←→:fold n/N:msg f/F:all v:copy y:all /:filter"
 				if a.msgFull.searchTerm != "" {
 					sh = pos + fmt.Sprintf("  [%d/%d] n/N:match ↑↓:blocks ←→:fold f/F:all v:copy y:all", a.msgFull.searchIdx+1, len(a.msgFull.searchLines))
 				}
-				help = formatHelp(sh + " esc:back q:quit")
+				// Show active block filter badge
+				if a.msgFull.folds.BlockFilter != "" {
+					vis := countVisibleBlocks(a.msgFull.folds.BlockVisible)
+					total := len(a.msgFull.folds.Entry.Content)
+					filterInfo := filterBadge.Render(fmt.Sprintf(" [%d/%d] %s", vis, total, a.msgFull.folds.BlockFilter))
+					help = filterInfo + " " + formatHelp(sh+" esc:back q:quit")
+				} else {
+					help = formatHelp(sh + " esc:back q:quit")
+				}
 			}
 		}
 
 	case viewConfig:
 		title = a.renderBreadcrumb()
 		content = a.renderConfigSplit()
-		if a.cfgSearching {
+		if a.cfgProjectPicker {
+			content = a.renderProjectPickerOverlay(content)
+			help = formatHelp("/:filter ↵:select esc:cancel")
+		} else if a.cfgNaming {
+			help = "  " + a.cfgNamingInput.View() + helpStyle.Render("  enter:create esc:cancel")
+		} else if a.cfgSearching {
 			help = "  " + a.cfgSearchInput.View() + helpStyle.Render("  enter:apply esc:cancel")
 		} else if a.cfgSearchTerm != "" {
 			badge := fmt.Sprintf("[%d/%d]", a.cfgSearchIdx+1, len(a.cfgSearchMatch))
@@ -637,102 +794,95 @@ func (a *App) View() string {
 			}
 			help = "  " + filterBadge.Render(badge) + formatHelp(" n/N:next/prev esc:clear")
 		} else {
-			h := "e:edit /:search esc:back q:quit"
+			h := "sp:sel x:actions p:page tab:filter P:project a:new /:search v:views q:quit"
+			if a.cfgHasSelection() {
+				h = "sp:sel x:actions p:page tab:filter esc:clear q:quit"
+			}
 			if a.cfgSplit.Show {
 				if a.cfgSplit.Focus {
-					h = "↑↓:scroll e:edit esc:back q:quit"
+					h = "↑↓:scroll esc:unfocus q:quit"
+				} else if a.cfgHasSelection() {
+					h = "↑↓:nav →:focus sp:sel x:actions p:page esc:clear q:quit"
 				} else {
-					h = "↑↓:nav →:focus e:edit /:search esc:back q:quit"
+					h = "↑↓:nav →:focus sp:sel x:actions p:page tab:filter P:project a:new v:views q:quit"
 				}
 			}
-			help = formatHelp(h)
+			// Badges: filter + selection count
+			var badges string
+			if fl := a.cfgFilterLabel(); fl != "" {
+				badges += filterBadge.Render(fl) + " "
+			}
+			if a.cfgHasSelection() {
+				badges += filterBadge.Render(fmt.Sprintf("%d selected", len(a.cfgSelectedSet))) + " "
+			}
+			help = "  " + badges + formatHelp(h)
 		}
 
-	case viewHooks:
-		title = a.renderBreadcrumb()
-		content = a.hooksVP.View()
-		help = formatHelp("↑↓:scroll e:edit esc:back q:quit")
 	}
 
 
 	// Actions menu hint box floating above help line
 	if a.actionsMenu && a.state == viewSessions {
 		hintBox := a.renderActionsHintBox()
-		contentLines := strings.Split(content, "\n")
-		boxLines := strings.Split(hintBox, "\n")
-		boxH := len(boxLines)
-		startY := len(contentLines) - boxH
-		if startY < 0 {
-			startY = 0
-		}
-		for i, bl := range boxLines {
-			y := startY + i
-			if y < len(contentLines) {
-				contentLines[y] = overlayLine(contentLines[y], bl, 1, a.width)
-			}
-		}
-		content = strings.Join(contentLines, "\n")
+		content = placeHintBox(content, hintBox)
+		help = formatHelp("x:actions — pick an action")
+	}
+
+	// Config actions menu hint box
+	if a.cfgActionsMenu && a.state == viewConfig {
+		hintBox := a.renderCfgActionsHintBox()
+		content = placeHintBox(content, hintBox)
 		help = formatHelp("x:actions — pick an action")
 	}
 
 	// Views menu hint box floating above help line
-	if a.viewsMenu && a.state == viewSessions {
+	if a.viewsMenu {
 		hintBox := a.renderViewsHintBox()
-		contentLines := strings.Split(content, "\n")
-		boxLines := strings.Split(hintBox, "\n")
-		boxH := len(boxLines)
-		startY := len(contentLines) - boxH
-		if startY < 0 {
-			startY = 0
-		}
-		for i, bl := range boxLines {
-			y := startY + i
-			if y < len(contentLines) {
-				contentLines[y] = overlayLine(contentLines[y], bl, 1, a.width)
-			}
-		}
-		content = strings.Join(contentLines, "\n")
+		content = placeHintBox(content, hintBox)
 		help = formatHelp("v:views — pick a view")
 	}
 
 	// Edit menu hint box floating above help line
 	if a.editMenu {
 		hintBox := a.renderEditHintBox()
-		contentLines := strings.Split(content, "\n")
-		boxLines := strings.Split(hintBox, "\n")
-		boxH := len(boxLines)
-		startY := len(contentLines) - boxH
-		if startY < 0 {
-			startY = 0
-		}
-		for i, bl := range boxLines {
-			y := startY + i
-			if y < len(contentLines) {
-				contentLines[y] = overlayLine(contentLines[y], bl, 1, a.width)
-			}
-		}
-		content = strings.Join(contentLines, "\n")
+		content = placeHintBox(content, hintBox)
 		help = formatHelp("e:edit — pick a file")
+	}
+
+	// Stats page jump hint box
+	if a.statsPageMenu && a.state == viewGlobalStats {
+		hintBox := a.renderStatsPageHintBox()
+		content = placeHintBox(content, hintBox)
+		help = formatHelp("p:page — pick a page")
+	}
+
+	// Config page jump hint box
+	if a.cfgPageMenu && a.state == viewConfig {
+		hintBox := a.renderCfgPageHintBox()
+		content = placeHintBox(content, hintBox)
+		help = formatHelp("p:page — pick a section")
+	}
+
+	// Block filter hint box floating above help line (conversation preview and full-screen message)
+	if a.conv.blockFiltering && a.state == viewConversation {
+		hintBox := renderBlockFilterHintBox()
+		content = placeHintBox(content, hintBox)
+	}
+	if a.state == viewMessageFull {
+		if a.msgFull.blockFiltering {
+			hintBox := renderBlockFilterHintBox()
+			content = placeHintBox(content, hintBox)
+		} else if a.msgFull.searching {
+			hintBox := renderMsgFullSearchHintBox()
+			content = placeHintBox(content, hintBox)
+		}
 	}
 
 	// Command mode hint box floating above help line
 	if a.cmdMode && a.state == viewSessions {
 		hintBox := a.renderCmdHintBox()
 		if hintBox != "" {
-			contentLines := strings.Split(content, "\n")
-			boxLines := strings.Split(hintBox, "\n")
-			boxH := len(boxLines)
-			startY := len(contentLines) - boxH
-			if startY < 0 {
-				startY = 0
-			}
-			for i, bl := range boxLines {
-				y := startY + i
-				if y < len(contentLines) {
-					contentLines[y] = overlayLine(contentLines[y], bl, 1, a.width)
-				}
-			}
-			content = strings.Join(contentLines, "\n")
+			content = placeHintBox(content, hintBox)
 		}
 	}
 
@@ -787,6 +937,14 @@ func (a *App) View() string {
 // --- Key handlers ---
 
 func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// While loading with no sessions yet, only allow quit
+	if a.sessionsLoading && len(a.sessions) == 0 {
+		if msg.String() == "q" || msg.String() == "ctrl+c" {
+			return a, tea.Quit
+		}
+		return a, nil
+	}
+
 	sp := &a.sessSplit
 	key := msg.String()
 
@@ -1234,7 +1392,11 @@ func (a *App) openGlobalStats() (tea.Model, tea.Cmd) {
 
 	a.globalStatsLoading = true
 	a.spinnerFrame = 0
-	// Stay on current view while scanning — loading shows in title bar
+	// Switch to stats view immediately, show spinner in viewport
+	contentH := a.height - 3
+	a.globalStatsVP = viewport.New(a.width, contentH)
+	a.globalStatsVP.SetContent("")
+	a.state = viewGlobalStats
 
 	sessions := a.sessions
 	return a, tea.Batch(
@@ -1246,16 +1408,112 @@ func (a *App) openGlobalStats() (tea.Model, tea.Cmd) {
 }
 
 func (a *App) handleGlobalStatsKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
+	key := msg.String()
+
+	// Views menu: pick a view
+	if a.viewsMenu {
+		return a.handleViewsMenu(key)
+	}
+
+	// Page jump menu: second key picks the page
+	if a.statsPageMenu {
+		a.statsPageMenu = false
+		return a.handleStatsPageMenu(key)
+	}
+
+	// In detail view: tab cycles, esc goes back
+	if a.statsDetail != statsDetailNone {
+		switch key {
+		case "q":
+			return a, tea.Quit
+		case "esc":
+			a.statsDetail = statsDetailNone
+			return a, nil
+		case a.keymap.Session.Views:
+			a.viewsMenu = true
+			return a, nil
+		case "tab":
+			return a.openStatsDetail(a.statsDetail.next())
+		case "shift+tab":
+			return a.openStatsDetail(a.statsDetail.prev())
+		case "p":
+			a.statsPageMenu = true
+			return a, nil
+		}
+		var cmd tea.Cmd
+		a.statsDetailVP, cmd = a.statsDetailVP.Update(msg)
+		return a, cmd
+	}
+
+	switch key {
 	case "q":
 		return a, tea.Quit
 	case "esc":
-		a.state = viewSessions
 		return a, nil
+	case a.keymap.Session.Views:
+		a.viewsMenu = true
+		return a, nil
+	case "p":
+		a.statsPageMenu = true
+		return a, nil
+	case "tab":
+		return a.openStatsDetail(statsDetailTools)
+	case "shift+tab":
+		return a.openStatsDetail(statsDetailLast)
 	}
 	var cmd tea.Cmd
 	a.globalStatsVP, cmd = a.globalStatsVP.Update(msg)
 	return a, cmd
+}
+
+func (a *App) handleStatsPageMenu(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "t":
+		return a.openStatsDetail(statsDetailTools)
+	case "m":
+		return a.openStatsDetail(statsDetailMCP)
+	case "a":
+		return a.openStatsDetail(statsDetailAgents)
+	case "s":
+		return a.openStatsDetail(statsDetailSkills)
+	case "c":
+		return a.openStatsDetail(statsDetailCommands)
+	case "e":
+		return a.openStatsDetail(statsDetailErrors)
+	case "o":
+		// back to overview
+		a.statsDetail = statsDetailNone
+		return a, nil
+	}
+	return a, nil
+}
+
+func (a *App) renderStatsPageHintBox() string {
+	hl := lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	d := dimStyle
+	sp := "  "
+
+	line1 := hl.Render("t") + d.Render(":tools") + sp + hl.Render("m") + d.Render(":mcp") + sp + hl.Render("a") + d.Render(":agents")
+	line2 := hl.Render("s") + d.Render(":skills") + sp + hl.Render("c") + d.Render(":cmds") + sp + hl.Render("e") + d.Render(":errors")
+	line3 := hl.Render("o") + d.Render(":overview")
+
+	body := strings.Join([]string{line1, line2, line3, d.Render("esc:cancel")}, "\n")
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorDim).
+		Padding(0, 1)
+	return boxStyle.Render(body)
+}
+
+func (a *App) openStatsDetail(mode statsDetailMode) (tea.Model, tea.Cmd) {
+	if a.globalStatsCache == nil {
+		return a, nil
+	}
+	a.statsDetail = mode
+	contentH := a.height - 3
+	a.statsDetailVP = viewport.New(a.width, contentH)
+	a.statsDetailVP.SetContent(renderStatsDetail(mode, *a.globalStatsCache, a.width))
+	return a, nil
 }
 
 // --- Live Preview (tmux capture in split pane) ---
@@ -1413,8 +1671,10 @@ func (a *App) handleViewsMenu(key string) (tea.Model, tea.Cmd) {
 		return a.openGlobalStats()
 	case a.keymap.Views.Config:
 		return a.openConfigExplorer()
-	case a.keymap.Views.Hooks:
-		return a.openHooksView()
+	case "enter", " ":
+		// Sessions (default)
+		a.state = viewSessions
+		return a, nil
 	}
 	return a, nil
 }
@@ -1424,7 +1684,18 @@ func (a *App) renderViewsHintBox() string {
 	d := dimStyle
 	sp := "  "
 	km := a.keymap.Views
-	line := h.Render(displayKey(km.Stats)) + d.Render(":stats") + sp + h.Render(displayKey(km.Config)) + d.Render(":config") + sp + h.Render(displayKey(km.Hooks)) + d.Render(":hooks")
+	// Highlight current view
+	var parts []string
+	viewLabel := func(k, label string, active bool) string {
+		if active {
+			return lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true).Render("[" + label + "]")
+		}
+		return h.Render(displayKey(k)) + d.Render(":"+label)
+	}
+	parts = append(parts, viewLabel("↵", "sessions", a.state == viewSessions))
+	parts = append(parts, viewLabel(km.Stats, "stats", a.state == viewGlobalStats))
+	parts = append(parts, viewLabel(km.Config, "config", a.state == viewConfig))
+	line := strings.Join(parts, sp)
 	body := line + "\n" + d.Render("esc:cancel")
 	boxStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -2229,7 +2500,7 @@ func (a *App) refreshActivePreview() tea.Cmd {
 	case viewSessions:
 		return a.updateSessionPreview()
 	case viewConversation:
-		if a.conv.textPreview {
+		if a.conv.previewMode == previewText {
 			a.conv.split.CacheKey = "" // force re-render
 			a.updateConvPreview()
 		} else {
@@ -3129,6 +3400,12 @@ func (a *App) renderSearchHintBox() string {
 			h.Render("role=") + d.Render("user") + sp + h.Render("role=") + d.Render("asst"),
 			h.Render("tool=") + d.Render("Bash Read Edit Write"),
 		}
+	case viewConfig:
+		lines = []string{
+			h.Render("is:") + d.Render("user project local"),
+			h.Render("is:") + d.Render("memory skill agent command hook mcp"),
+			d.Render("text: filename description"),
+		}
 	default:
 		return ""
 	}
@@ -3153,7 +3430,7 @@ func (a *App) isFiltering() bool {
 	case viewConversation:
 		return a.convList.FilterState() == list.Filtering
 	case viewConfig:
-		return a.cfgSearching
+		return a.cfgSearching || a.cfgNaming || a.cfgProjectPicker
 	}
 	return false
 }
@@ -3177,6 +3454,9 @@ func (a *App) activeFilterValue() string {
 	case viewConversation:
 		return a.convList.FilterInput.Value()
 	case viewConfig:
+		if a.cfgSearching {
+			return a.cfgSearchInput.Value()
+		}
 		return a.cfgSearchTerm
 	}
 	return ""
@@ -3212,10 +3492,29 @@ func (a *App) updateActiveList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return a, nil
 	case viewConfig:
+		if a.cfgProjectPicker {
+			if km, ok := msg.(tea.KeyMsg); ok {
+				return a.handleCfgProjectPicker(km)
+			}
+			var cmd tea.Cmd
+			a.cfgProjectInput, cmd = a.cfgProjectInput.Update(msg)
+			return a, cmd
+		}
 		if a.cfgSearching {
 			if km, ok := msg.(tea.KeyMsg); ok {
 				return a.handleCfgSearch(km)
 			}
+			var cmd tea.Cmd
+			a.cfgSearchInput, cmd = a.cfgSearchInput.Update(msg)
+			return a, cmd
+		}
+		if a.cfgNaming {
+			if km, ok := msg.(tea.KeyMsg); ok {
+				return a.handleCfgNaming(km)
+			}
+			var cmd tea.Cmd
+			a.cfgNamingInput, cmd = a.cfgNamingInput.Update(msg)
+			return a, cmd
 		}
 		if a.listReady(&a.cfgList) {
 			var cmd tea.Cmd
@@ -3262,7 +3561,11 @@ func (a *App) updateActiveComponent(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, cmd
 	case viewGlobalStats:
 		var cmd tea.Cmd
-		a.globalStatsVP, cmd = a.globalStatsVP.Update(msg)
+		if a.statsDetail != statsDetailNone {
+			a.statsDetailVP, cmd = a.statsDetailVP.Update(msg)
+		} else {
+			a.globalStatsVP, cmd = a.globalStatsVP.Update(msg)
+		}
 		return a, cmd
 	case viewConfig:
 		if a.listReady(&a.cfgList) {
@@ -3272,10 +3575,6 @@ func (a *App) updateActiveComponent(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, cmd
 		}
 		return a, nil
-	case viewHooks:
-		var cmd tea.Cmd
-		a.hooksVP, cmd = a.hooksVP.Update(msg)
-		return a, cmd
 	}
 	return a, nil
 }
@@ -3316,12 +3615,14 @@ func (a *App) resizeAll() tea.Cmd {
 
 	sessW := a.sessSplit.ListWidth(a.width, a.splitRatio)
 	if a.sessionList.Width() == 0 {
-		a.sessionList = newSessionList(a.sessions, sessW, contentH, a.sessGroupMode, a.selectedSet)
-		a.sessSplit.CacheKey = ""
-		if a.config.SearchQuery != "" {
-			applyListFilter(&a.sessionList, a.config.SearchQuery)
+		if len(a.sessions) > 0 {
+			a.sessionList = newSessionList(a.sessions, sessW, contentH, a.sessGroupMode, a.selectedSet)
+			a.sessSplit.CacheKey = ""
+			if a.config.SearchQuery != "" {
+				applyListFilter(&a.sessionList, a.config.SearchQuery)
+			}
+			cmd = a.autoSelectSession()
 		}
-		cmd = a.autoSelectSession()
 	} else if a.state == viewSessions {
 		idx := a.sessionList.Index()
 		a.sessionList.SetSize(sessW, contentH)
@@ -3335,6 +3636,13 @@ func (a *App) resizeAll() tea.Cmd {
 	if a.globalStatsVP.Width > 0 {
 		a.globalStatsVP.Width = a.width
 		a.globalStatsVP.Height = contentH
+	}
+	if a.statsDetail != statsDetailNone && a.statsDetailVP.Width > 0 {
+		a.statsDetailVP.Width = a.width
+		a.statsDetailVP.Height = contentH
+		if a.globalStatsCache != nil {
+			a.statsDetailVP.SetContent(renderStatsDetail(a.statsDetail, *a.globalStatsCache, a.width))
+		}
 	}
 	// Conversation split view
 	if a.convList.Width() > 0 {
@@ -3444,8 +3752,10 @@ func (a *App) renderBreadcrumb() string {
 		}
 	case viewGlobalStats:
 		crumbs = []crumb{
-			{" Sessions", viewSessions},
-			{"Global Stats", viewGlobalStats},
+			{" Stats", viewGlobalStats},
+		}
+		if a.statsDetail != statsDetailNone {
+			crumbs = append(crumbs, crumb{statsDetailTitle(a.statsDetail), viewGlobalStats})
 		}
 	case viewConversation:
 		crumbs = []crumb{
@@ -3468,14 +3778,15 @@ func (a *App) renderBreadcrumb() string {
 			crumbs = append(crumbs, crumb{label, viewConversation})
 		}
 	case viewConfig:
-		crumbs = []crumb{
-			{" Sessions", viewSessions},
-			{"Config", viewConfig},
+		label := " Config"
+		if fl := a.cfgFilterLabel(); fl != "" {
+			label += " [" + fl + "]"
 		}
-	case viewHooks:
 		crumbs = []crumb{
-			{" Sessions", viewSessions},
-			{"Hooks", viewHooks},
+			{label, viewConfig},
+		}
+		if a.cfgTree != nil && a.cfgTree.ProjectName != "" {
+			crumbs = append(crumbs, crumb{a.cfgTree.ProjectName, viewConfig})
 		}
 	case viewMessageFull:
 		crumbs = []crumb{
@@ -3610,14 +3921,24 @@ func (a *App) breadcrumbRightStatus() string {
 		}
 	}
 
+	// Preview mode badge for conversation/message views
+	if a.state == viewConversation || a.state == viewMessageFull {
+		modeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8")).Bold(true)
+		parts = append(parts, modeStyle.Render(strings.ToUpper(previewModeLabels[a.conv.previewMode])))
+	}
+
 	// Loading indicator
-	if a.globalStatsLoading {
+	if a.globalStatsLoading || a.sessionsLoading {
 		idx := a.spinnerFrame % len(spinnerFrames)
 		frame := spinnerFrames[idx]
 		spinnerColors := []lipgloss.Color{"#10B981", "#3B82F6", "#F59E0B", "#7C3AED", "#EC4899"}
 		c := spinnerColors[a.spinnerFrame/len(spinnerFrames)%len(spinnerColors)]
 		s := lipgloss.NewStyle().Foreground(c).Bold(true)
-		parts = append(parts, s.Render(fmt.Sprintf("%s scanning %d sessions", frame, len(a.sessions))))
+		if a.globalStatsLoading {
+			parts = append(parts, s.Render(fmt.Sprintf("%s scanning %d sessions", frame, len(a.sessions))))
+		} else {
+			parts = append(parts, s.Render(fmt.Sprintf("%s loading…", frame)))
+		}
 	}
 
 	// Item count + page indicator for list views
@@ -3645,7 +3966,11 @@ func (a *App) breadcrumbRightStatus() string {
 	case viewMessageFull:
 		pct = int(a.msgFull.vp.ScrollPercent() * 100)
 	case viewGlobalStats:
-		pct = int(a.globalStatsVP.ScrollPercent() * 100)
+		if a.statsDetail != statsDetailNone {
+			pct = int(a.statsDetailVP.ScrollPercent() * 100)
+		} else {
+			pct = int(a.globalStatsVP.ScrollPercent() * 100)
+		}
 	case viewConfig:
 		if a.cfgSplit.Show {
 			pct = int(a.cfgSplit.Preview.ScrollPercent() * 100)

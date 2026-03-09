@@ -74,4 +74,9 @@ var (
 	// Task status icons in conversation
 	taskDoneStyle       = lipgloss.NewStyle().Foreground(colorAccent)
 	taskInProgressStyle = lipgloss.NewStyle().Foreground(colorAssistant)
+
+	// Skill and hook styles for message detail
+	skillBlockStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#A78BFA")).Bold(true)
+	hookBadgeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#FB923C"))
+	hookDetailStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Italic(true)
 )

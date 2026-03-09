@@ -76,6 +76,11 @@ func (a *App) handleMessageFullKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a.handleCopyModeKeys(msg)
 	}
 
+	// Block filter input intercepts all keys
+	if a.msgFull.blockFiltering {
+		return a.handleMsgFullBlockFilterInput(msg)
+	}
+
 	// Search input mode intercepts all keys
 	if a.msgFull.searching {
 		return a.handleMsgFullSearchInput(msg)
@@ -93,6 +98,11 @@ func (a *App) handleMessageFullKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q":
 		return a, tea.Quit
 	case "esc":
+		// Clear block filter first
+		if a.msgFull.folds.BlockFilter != "" {
+			a.clearMsgFullBlockFilter()
+			return a, nil
+		}
 		if a.msgFull.searchTerm != "" {
 			a.clearMsgFullSearch()
 			return a, nil
@@ -106,7 +116,11 @@ func (a *App) handleMessageFullKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.copiedMsg = "Copied!"
 		return a, nil
 	case "/":
-		a.startMsgFullSearch()
+		if a.msgFull.allMessages {
+			a.startMsgFullSearch()
+		} else {
+			a.startMsgFullBlockFilter()
+		}
 		return a, nil
 	}
 
@@ -180,7 +194,8 @@ func (a *App) handleMessageFullKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // refreshMsgFullPreview re-renders the message full viewport.
 func (a *App) refreshMsgFullPreview() {
 	fs := &a.msgFull.folds
-	rp := renderFullMessageWithCursor(fs.Entry, a.width, fs.Collapsed, fs.Formatted, fs.BlockCursor)
+	ro := renderOpts{visible: fs.BlockVisible, hideHooks: fs.HideHooks}
+	rp := renderFullMessageWithCursor(fs.Entry, a.width, fs.Collapsed, fs.Formatted, fs.BlockCursor, ro)
 	fs.BlockStarts = rp.blockStarts
 
 	oldOffset := a.msgFull.vp.YOffset
@@ -215,6 +230,75 @@ func (a *App) renderMessageFull() string {
 		a.msgFull.vp.YOffset = maxOffset
 	}
 	return a.msgFull.vp.View()
+}
+
+// --- Block filter for full-screen message view ---
+
+func (a *App) startMsgFullBlockFilter() {
+	ti := textinput.New()
+	ti.Prompt = "Filter: "
+	ti.Placeholder = "is:hook is:tool tool:Grep is:error ..."
+	ti.CharLimit = 200
+	ti.Width = a.width - 20
+	if a.msgFull.folds.BlockFilter != "" {
+		ti.SetValue(a.msgFull.folds.BlockFilter)
+	}
+	ti.Focus()
+	a.msgFull.blockFilterTI = ti
+	a.msgFull.blockFiltering = true
+}
+
+func (a *App) handleMsgFullBlockFilterInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	switch key {
+	case "enter":
+		a.commitMsgFullBlockFilter()
+		return a, nil
+	case "esc":
+		a.msgFull.blockFiltering = false
+		return a, nil
+	}
+	var cmd tea.Cmd
+	a.msgFull.blockFilterTI, cmd = a.msgFull.blockFilterTI.Update(msg)
+	return a, cmd
+}
+
+func (a *App) commitMsgFullBlockFilter() {
+	a.msgFull.blockFiltering = false
+	fs := &a.msgFull.folds
+	filter := a.msgFull.blockFilterTI.Value()
+	fs.BlockFilter = filter
+	fs.BlockVisible = applyBlockFilter(filter, fs.Entry)
+	if first := fs.firstVisibleBlock(); first >= 0 {
+		fs.BlockCursor = first
+	}
+	a.refreshMsgFullPreview()
+	a.msgFull.vp.YOffset = 0
+}
+
+func (a *App) clearMsgFullBlockFilter() {
+	fs := &a.msgFull.folds
+	fs.BlockFilter = ""
+	fs.BlockVisible = nil
+	a.refreshMsgFullPreview()
+}
+
+// renderMsgFullSearchHintBox renders a floating hint box for the full-screen message search.
+func renderMsgFullSearchHintBox() string {
+	h := lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8"))
+	d := dimStyle
+
+	lines := []string{
+		d.Render("text search across rendered content"),
+		h.Render("n/N") + d.Render(": next/prev match after search"),
+	}
+
+	body := strings.Join(lines, "\n")
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorDim).
+		Padding(0, 1)
+	return boxStyle.Render(body)
 }
 
 // pushNavFrame saves current conversation state onto the nav stack.

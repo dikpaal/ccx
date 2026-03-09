@@ -170,6 +170,30 @@ func ShortenPath(path, home string) string {
 	return path
 }
 
+// ListProjects returns all known project paths from ~/.claude/projects/.
+// It decodes the encoded directory names back to real filesystem paths.
+func ListProjects(claudeDir string) []string {
+	projDir := filepath.Join(claudeDir, "projects")
+	entries, err := os.ReadDir(projDir)
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	seen := make(map[string]bool)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		p := decodeProjectPath(e.Name())
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		paths = append(paths, p)
+	}
+	return paths
+}
+
 func isGitWorktree(projectPath string) bool {
 	gitPath := filepath.Join(projectPath, ".git")
 	info, err := os.Lstat(gitPath)

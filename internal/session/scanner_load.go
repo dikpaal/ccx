@@ -18,27 +18,72 @@ func LoadMessages(filePath string) ([]Entry, error) {
 	defer f.Close()
 
 	var entries []Entry
+	// Collect hook progress entries: toolUseID → []HookInfo
+	hookMap := make(map[string][]HookInfo)
+
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1024*1024), 10*1024*1024)
 
 	for sc.Scan() {
-		line := sc.Text()
-		if line == "" {
+		line := sc.Bytes()
+		if len(line) == 0 {
 			continue
 		}
 
-		entry, parseErr := ParseEntry(line)
+		entry, parseErr := ParseEntry(string(line))
 		if parseErr != nil {
 			continue
 		}
 
-		if entry.IsMeta || entry.Type == "progress" || entry.Type == "file-history-snapshot" {
+		// Collect hook progress entries
+		if entry.Type == "progress" {
+			if toolID, hook, ok := parseHookProgress(line); ok {
+				hookMap[toolID] = append(hookMap[toolID], hook)
+			}
+			continue
+		}
+
+		if entry.IsMeta || entry.Type == "file-history-snapshot" {
 			continue
 		}
 		if entry.Role == "user" || entry.Role == "assistant" {
 			entries = append(entries, entry)
 		}
 	}
+
+	// Attach hooks to matching tool_use blocks
+	if len(hookMap) > 0 {
+		for i := range entries {
+			for j := range entries[i].Content {
+				if entries[i].Content[j].Type == "tool_use" && entries[i].Content[j].ID != "" {
+					if hooks, ok := hookMap[entries[i].Content[j].ID]; ok {
+						entries[i].Content[j].Hooks = hooks
+					}
+				}
+			}
+		}
+	}
+
+	// Attach Stop hooks to the last assistant entry's last block.
+	// Stop hooks use internal UUIDs (not toolu_01... IDs) so they don't match tool_use blocks.
+	var stopHooks []HookInfo
+	for _, hooks := range hookMap {
+		for _, h := range hooks {
+			if h.Event == "Stop" {
+				stopHooks = append(stopHooks, h)
+			}
+		}
+	}
+	if len(stopHooks) > 0 {
+		for i := len(entries) - 1; i >= 0; i-- {
+			if entries[i].Role == "assistant" && len(entries[i].Content) > 0 {
+				last := len(entries[i].Content) - 1
+				entries[i].Content[last].Hooks = append(entries[i].Content[last].Hooks, stopHooks...)
+				break
+			}
+		}
+	}
+
 	return entries, sc.Err()
 }
 

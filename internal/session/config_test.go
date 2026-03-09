@@ -53,13 +53,14 @@ func TestExtractFrontmatterMissing(t *testing.T) {
 func TestScanConfig(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create global CLAUDE.md
-	os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("# Global Config"), 0644)
-
 	// Create memory dir with a file
 	memDir := filepath.Join(dir, "memory")
 	os.MkdirAll(memDir, 0755)
-	os.WriteFile(filepath.Join(memDir, "notes.md"), []byte("# Notes"), 0644)
+	notesPath := filepath.Join(memDir, "notes.md")
+	os.WriteFile(notesPath, []byte("# Notes"), 0644)
+
+	// Create global CLAUDE.md that references notes.md
+	os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("# Global Config\n\n`@"+notesPath+"`\n"), 0644)
 
 	// Create agents dir
 	agentsDir := filepath.Join(dir, "agents")

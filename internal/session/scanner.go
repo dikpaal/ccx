@@ -11,7 +11,8 @@ import (
 )
 
 // ScanSessions scans for Claude Code sessions. If claudeDir is empty,
-// defaults to ~/.claude.
+// defaults to ~/.claude. Uses a metadata cache to avoid re-scanning
+// unchanged files.
 func ScanSessions(claudeDir string) ([]Session, error) {
 	if claudeDir == "" {
 		home, err := os.UserHomeDir()
@@ -56,38 +57,62 @@ func ScanSessions(claudeDir string) ([]Session, error) {
 		return nil, fmt.Errorf("walk projects dir: %w", err)
 	}
 
-	const numWorkers = 12
-	fileCh := make(chan fileEntry, len(files))
-	resultCh := make(chan Session, len(files))
-
-	var wg sync.WaitGroup
-	for range numWorkers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for fe := range fileCh {
-				sess := scanSessionStream(fe.path, fe.modTime, home)
-				if sess.MsgCount > 0 {
-					resultCh <- sess
-				}
-			}
-		}()
-	}
-
-	for _, f := range files {
-		fileCh <- f
-	}
-	close(fileCh)
-
-	go func() {
-		wg.Wait()
-		close(resultCh)
-	}()
+	// Load cache and separate hits from misses
+	cache := loadCache(claudeDir)
+	validPaths := make(map[string]bool, len(files))
+	var needScan []fileEntry
 
 	sessions := make([]Session, 0, len(files))
-	for sess := range resultCh {
-		sessions = append(sessions, sess)
+	for _, f := range files {
+		validPaths[f.path] = true
+		if cached, ok := cache.lookup(f.path, f.modTime); ok {
+			if cached.MsgCount > 0 {
+				sessions = append(sessions, cached)
+			}
+			continue
+		}
+		needScan = append(needScan, f)
 	}
+
+	// Scan only files that changed or are new
+	if len(needScan) > 0 {
+		const numWorkers = 12
+		fileCh := make(chan fileEntry, len(needScan))
+		resultCh := make(chan Session, len(needScan))
+
+		var wg sync.WaitGroup
+		for range min(numWorkers, len(needScan)) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for fe := range fileCh {
+					sess := scanSessionStream(fe.path, fe.modTime, home)
+					cache.store(fe.path, fe.modTime, sess)
+					if sess.MsgCount > 0 {
+						resultCh <- sess
+					}
+				}
+			}()
+		}
+
+		for _, f := range needScan {
+			fileCh <- f
+		}
+		close(fileCh)
+
+		go func() {
+			wg.Wait()
+			close(resultCh)
+		}()
+
+		for sess := range resultCh {
+			sessions = append(sessions, sess)
+		}
+	}
+
+	// Prune deleted files and persist cache
+	cache.prune(validPaths)
+	cache.save()
 
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].ModTime.After(sessions[j].ModTime)

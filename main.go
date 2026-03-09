@@ -47,6 +47,18 @@ func main() {
 		os.Exit(0)
 	}
 
+	if claudeDir == "" {
+		claudeDir = os.Getenv("CLAUDE_CONFIG_DIR")
+	}
+	if claudeDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		claudeDir = home + "/.claude"
+	}
+
 	// Auto-detect tmux unless explicitly set
 	if !tmuxEnabled && os.Getenv("TMUX") != "" {
 		tmuxEnabled = true

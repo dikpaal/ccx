@@ -2015,6 +2015,9 @@ func (a *App) deleteSession(sess session.Session) (tea.Model, tea.Cmd) {
 		a.copiedMsg = "Delete failed: " + err.Error()
 		return a, nil
 	}
+	os.RemoveAll(filepath.Join(filepath.Dir(sess.FilePath), sess.ID))
+	os.RemoveAll(filepath.Join(a.config.ClaudeDir, "file-history", sess.ID))
+	os.RemoveAll(filepath.Join(a.config.ClaudeDir, "tasks", sess.ID))
 
 	delete(a.selectedSet, sess.ID)
 

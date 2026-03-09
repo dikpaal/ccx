@@ -15,6 +15,9 @@ import (
 // unchanged files.
 func ScanSessions(claudeDir string) ([]Session, error) {
 	if claudeDir == "" {
+		claudeDir = os.Getenv("CLAUDE_CONFIG_DIR")
+	}
+	if claudeDir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return nil, fmt.Errorf("get home dir: %w", err)

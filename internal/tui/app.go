@@ -105,6 +105,7 @@ const (
 	viewMessageFull
 	viewGlobalStats
 	viewConfig
+	viewPlugins
 )
 
 type App struct {
@@ -294,6 +295,14 @@ type App struct {
 	cfgActionsMenu    bool              // config actions menu open
 	cfgPageMenu       bool              // config page jump popup
 
+	// Plugin explorer (viewPlugins)
+	plgTree        *session.PluginTree
+	plgList        list.Model
+	plgSplit       SplitPane
+	plgSearching   bool
+	plgSearchInput textinput.Model
+	plgSearchTerm  string
+
 	// Hooks view (legacy, kept for viewport reuse)
 	hooksVP viewport.Model
 
@@ -382,6 +391,7 @@ func NewApp(sessions []session.Session, cfg Config) *App {
 	a.sessSplit = SplitPane{List: &a.sessionList, ItemHeight: 2}
 	a.conv.split = SplitPane{List: &a.convList, Show: true, Folds: &FoldState{}, ItemHeight: 1}
 	a.cfgSplit = SplitPane{List: &a.cfgList, ItemHeight: 1}
+	a.plgSplit = SplitPane{List: &a.plgList, ItemHeight: 1}
 	a.cmdRegistry = buildCmdRegistry()
 
 	// Apply CLI flags for initial group/preview mode
@@ -597,6 +607,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a.handleMessageFullKeys(msg)
 		case viewConfig:
 			return a.handleConfigKeys(msg)
+		case viewPlugins:
+			return a.handlePluginKeys(msg)
 		}
 	}
 
@@ -819,6 +831,20 @@ func (a *App) View() string {
 			help = "  " + badges + formatHelp(h)
 		}
 
+	case viewPlugins:
+		title = a.renderBreadcrumb()
+		content = a.renderPluginSplit()
+		if a.plgSearching {
+			help = "  " + a.plgSearchInput.View() + helpStyle.Render("  enter:apply esc:cancel")
+		} else if a.plgSearchTerm != "" {
+			help = "  " + filterBadge.Render(a.plgSearchTerm) + formatHelp(" n/N:next/prev esc:clear")
+		} else {
+			h := "↑↓:nav →:preview /:search v:views esc:back q:quit"
+			if a.plgSplit.Show && a.plgSplit.Focus {
+				h = "↑↓:scroll ←:unfocus q:quit"
+			}
+			help = "  " + formatHelp(h)
+		}
 	}
 
 	// Actions menu hint box floating above help line
@@ -1688,6 +1714,8 @@ func (a *App) handleViewsMenu(key string) (tea.Model, tea.Cmd) {
 		return a.openGlobalStats()
 	case a.keymap.Views.Config:
 		return a.openConfigExplorer()
+	case a.keymap.Views.Plugins:
+		return a.openPluginExplorer()
 	case "enter", " ":
 		// Sessions (default)
 		a.state = viewSessions
@@ -1712,6 +1740,7 @@ func (a *App) renderViewsHintBox() string {
 	parts = append(parts, viewLabel("↵", "sessions", a.state == viewSessions))
 	parts = append(parts, viewLabel(km.Stats, "stats", a.state == viewGlobalStats))
 	parts = append(parts, viewLabel(km.Config, "config", a.state == viewConfig))
+	parts = append(parts, viewLabel(km.Plugins, "plugins", a.state == viewPlugins))
 	line := strings.Join(parts, sp)
 	body := line + "\n" + d.Render("esc:cancel")
 	boxStyle := lipgloss.NewStyle().
@@ -3463,6 +3492,8 @@ func (a *App) isFiltering() bool {
 		return a.convList.FilterState() == list.Filtering
 	case viewConfig:
 		return a.cfgSearching || a.cfgNaming || a.cfgProjectPicker
+	case viewPlugins:
+		return a.plgSearching
 	}
 	return false
 }
@@ -3475,6 +3506,8 @@ func (a *App) hasFilterApplied() bool {
 		return a.convList.FilterState() == list.FilterApplied
 	case viewConfig:
 		return a.cfgSearchTerm != ""
+	case viewPlugins:
+		return a.plgSearchTerm != ""
 	}
 	return false
 }
@@ -3490,6 +3523,11 @@ func (a *App) activeFilterValue() string {
 			return a.cfgSearchInput.Value()
 		}
 		return a.cfgSearchTerm
+	case viewPlugins:
+		if a.plgSearching {
+			return a.plgSearchInput.Value()
+		}
+		return a.plgSearchTerm
 	}
 	return ""
 }
@@ -3502,6 +3540,9 @@ func (a *App) resetActiveFilter() {
 		a.convList.ResetFilter()
 	case viewConfig:
 		a.clearCfgSearch()
+	case viewPlugins:
+		a.plgSearchTerm = ""
+		a.rebuildPlgList()
 	}
 }
 
@@ -3555,6 +3596,22 @@ func (a *App) updateActiveList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, cmd
 		}
 		return a, nil
+	case viewPlugins:
+		if a.plgSearching {
+			if km, ok := msg.(tea.KeyMsg); ok {
+				return a.handlePlgSearch(km)
+			}
+			var cmd tea.Cmd
+			a.plgSearchInput, cmd = a.plgSearchInput.Update(msg)
+			return a, cmd
+		}
+		if a.listReady(&a.plgList) {
+			var cmd tea.Cmd
+			a.plgList, cmd = a.plgList.Update(msg)
+			a.updatePluginPreview()
+			return a, cmd
+		}
+		return a, nil
 	}
 	return a, nil
 }
@@ -3604,6 +3661,14 @@ func (a *App) updateActiveComponent(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			a.cfgList, cmd = a.cfgList.Update(msg)
 			a.updateConfigPreview()
+			return a, cmd
+		}
+		return a, nil
+	case viewPlugins:
+		if a.listReady(&a.plgList) {
+			var cmd tea.Cmd
+			a.plgList, cmd = a.plgList.Update(msg)
+			a.updatePluginPreview()
 			return a, cmd
 		}
 		return a, nil
@@ -3708,6 +3773,13 @@ func (a *App) resizeAll() tea.Cmd {
 		a.cfgList.SetSize(a.cfgSplit.ListWidth(a.width, a.splitRatio), contentH)
 		a.cfgList.Select(idx)
 		a.cfgSplit.CacheKey = "" // force preview re-render at new size
+	}
+	// Plugin explorer view
+	if a.plgList.Width() > 0 {
+		idx := a.plgList.Index()
+		a.plgList.SetSize(a.plgSplit.ListWidth(a.width, a.splitRatio), contentH)
+		a.plgList.Select(idx)
+		a.plgSplit.CacheKey = ""
 	}
 	// Hooks view
 	if a.hooksVP.Width > 0 {
@@ -3818,6 +3890,14 @@ func (a *App) renderBreadcrumb() string {
 		}
 		if a.cfgTree != nil && a.cfgTree.ProjectName != "" {
 			crumbs = append(crumbs, crumb{a.cfgTree.ProjectName, viewConfig})
+		}
+	case viewPlugins:
+		label := " Plugins"
+		if a.plgSearchTerm != "" {
+			label += " [" + a.plgSearchTerm + "]"
+		}
+		crumbs = []crumb{
+			{label, viewPlugins},
 		}
 	case viewMessageFull:
 		crumbs = []crumb{
@@ -4077,6 +4157,9 @@ func (a *App) navigateTo(target viewState) (tea.Model, tea.Cmd) {
 
 	case viewConfig:
 		return a.openConfigExplorer()
+
+	case viewPlugins:
+		return a.openPluginExplorer()
 	}
 	return a, nil
 }

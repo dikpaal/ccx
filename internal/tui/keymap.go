@@ -44,8 +44,9 @@ type ActionsKeymap struct {
 
 // ViewsKeymap defines configurable keybindings for the views menu.
 type ViewsKeymap struct {
-	Stats  string `yaml:"stats"`
-	Config string `yaml:"config"`
+	Stats   string `yaml:"stats"`
+	Config  string `yaml:"config"`
+	Plugins string `yaml:"plugins"`
 }
 
 // NavigationKeymap defines extra keybindings that alias standard navigation keys.
@@ -104,8 +105,9 @@ func DefaultKeymap() Keymap {
 			Jump:     "j",
 		},
 		Views: ViewsKeymap{
-			Stats:  "s",
-			Config: "c",
+			Stats:   "s",
+			Config:  "c",
+			Plugins: "p",
 		},
 		Navigation: NavigationKeymap{
 			Up:       []string{"k"},
@@ -234,6 +236,9 @@ func mergeKeymap(dst *Keymap, src Keymap) {
 	}
 	if src.Views.Config != "" {
 		dst.Views.Config = src.Views.Config
+	}
+	if src.Views.Plugins != "" {
+		dst.Views.Plugins = src.Views.Plugins
 	}
 
 	// Navigation (append, don't replace)

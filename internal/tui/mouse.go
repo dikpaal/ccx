@@ -96,6 +96,8 @@ func (a *App) activeSplitPane() *SplitPane {
 		return &a.conv.split
 	case viewConfig:
 		return &a.cfgSplit
+	case viewPlugins:
+		return &a.plgSplit
 	default:
 		return nil
 	}
@@ -132,6 +134,12 @@ func (a *App) handleMouseScroll(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		a.cfgSplit.HandleMouseScroll(msg.X, up, a.width, a.splitRatio)
 		if !scrolledPreview {
 			a.updateConfigPreview()
+		}
+
+	case viewPlugins:
+		a.plgSplit.HandleMouseScroll(msg.X, up, a.width, a.splitRatio)
+		if !scrolledPreview {
+			a.updatePluginPreview()
 		}
 	}
 
@@ -189,6 +197,10 @@ func (a *App) handleMouseClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	case viewConfig:
 		a.cfgSplit.HandleMouseClick(msg.X, contentY, a.width, a.splitRatio)
 		a.updateConfigPreview()
+
+	case viewPlugins:
+		a.plgSplit.HandleMouseClick(msg.X, contentY, a.width, a.splitRatio)
+		a.updatePluginPreview()
 	}
 
 	// Re-render fold preview after clicking in preview to update block cursor highlight

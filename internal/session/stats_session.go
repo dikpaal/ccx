@@ -38,6 +38,9 @@ func ScanSessionStats(path string) (SessionStats, error) {
 		CommandErrors:       make(map[string]int),
 		ToolCallTimestamps:  make(map[string][]time.Time),
 		ToolErrorTimestamps: make(map[string][]time.Time),
+		HookCounts:          make(map[string]int),
+		HookEventCounts:     make(map[string]int),
+		HookTimestamps:      make(map[string][]time.Time),
 	}
 
 	var toolIDMap map[string]string
@@ -67,6 +70,21 @@ func ScanSessionStats(path string) (SessionStats, error) {
 				stats.CompactionCount++
 			}
 			continue
+		}
+
+		// Hook progress lines are type:"progress" with data.type:"hook_progress".
+		// They have neither user nor assistant role, so we must intercept before the role filter.
+		if bytes.Contains(line, bHookProgress) {
+			if bytes.Contains(line, bTypeProgress) || bytes.Contains(line, bTypeProgressS) {
+				if _, hi, ok := parseHookProgress(line); ok {
+					stats.HookCounts[hi.Command]++
+					stats.HookEventCounts[hi.Event]++
+					ts := extractTimestamp(line)
+					if !ts.IsZero() {
+						stats.HookTimestamps[hi.Command] = append(stats.HookTimestamps[hi.Command], ts)
+					}
+				}
+			}
 		}
 
 		if bytes.Contains(line, bCmdTag) {

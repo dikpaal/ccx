@@ -21,9 +21,10 @@ const (
 	statsDetailSkills                   // skills
 	statsDetailCommands                 // commands
 	statsDetailErrors                   // error breakdown
+	statsDetailHooks                    // hooks
 )
 
-const statsDetailLast = statsDetailErrors
+const statsDetailLast = statsDetailHooks
 
 func (m statsDetailMode) next() statsDetailMode {
 	n := m + 1
@@ -56,6 +57,8 @@ func renderStatsDetail(mode statsDetailMode, stats session.GlobalStats, width in
 		return renderCategoryDetail("COMMANDS", stats.CommandCounts, stats.CommandErrors, nil, nil, width)
 	case statsDetailErrors:
 		return renderErrorDetail(stats, width)
+	case statsDetailHooks:
+		return renderCategoryDetail("HOOKS", stats.HookCounts, nil, stats.HookTimestamps, nil, width)
 	}
 	return ""
 }
@@ -75,6 +78,8 @@ func statsDetailTitle(mode statsDetailMode) string {
 		return "Commands"
 	case statsDetailErrors:
 		return "Errors"
+	case statsDetailHooks:
+		return "Hooks"
 	}
 	return ""
 }

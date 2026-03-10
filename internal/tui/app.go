@@ -303,6 +303,17 @@ type App struct {
 	plgSearchInput textinput.Model
 	plgSearchTerm  string
 
+	// Plugin selection & actions
+	plgSelectedSet       map[string]bool // plugin ID → selected
+	plgActionsMenu       bool            // actions menu open
+	plgUninstallConfirm  bool            // waiting for second x press
+
+	// Plugin detail drill-down
+	plgDetailActive bool            // true = showing component list for a plugin
+	plgDetailPlugin session.Plugin  // the plugin being inspected
+	plgDetailList   list.Model      // component list
+	plgDetailSplit  SplitPane       // component list + file preview
+
 	// Hooks view (legacy, kept for viewport reuse)
 	hooksVP viewport.Model
 
@@ -392,6 +403,8 @@ func NewApp(sessions []session.Session, cfg Config) *App {
 	a.conv.split = SplitPane{List: &a.convList, Show: true, Folds: &FoldState{}, ItemHeight: 1}
 	a.cfgSplit = SplitPane{List: &a.cfgList, ItemHeight: 1}
 	a.plgSplit = SplitPane{List: &a.plgList, ItemHeight: 1}
+	a.plgDetailSplit = SplitPane{List: &a.plgDetailList, ItemHeight: 1}
+	a.plgSelectedSet = make(map[string]bool)
 	a.cmdRegistry = buildCmdRegistry()
 
 	// Apply CLI flags for initial group/preview mode
@@ -449,6 +462,26 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.refreshConfigExplorer()
 		}
 		return a, nil
+
+	case pluginTestDoneMsg:
+		os.RemoveAll(msg.tmpDir)
+		a.clearPlgSelection()
+		return a, nil
+
+
+	case pluginCmdDoneMsg:
+		if msg.err != nil {
+			a.copiedMsg = "Error: " + msg.err.Error()
+		} else {
+			label := msg.action
+			if len(label) > 0 {
+				label = strings.ToUpper(label[:1]) + label[1:]
+			}
+			a.copiedMsg = label + " done"
+		}
+		a.clearPlgSelection()
+		// Re-scan plugins to reflect changes
+		return a.openPluginExplorer()
 
 	case liveInputSentMsg:
 		if msg.err != nil {
@@ -774,9 +807,12 @@ func (a *App) View() string {
 			if a.copyModeActive {
 				help = formatHelp(pos + "  ↑↓:move v/sp:sel y/↵:copy home/end esc:cancel")
 			} else {
-				sh := pos + "  ↑↓:blocks ←→:fold n/N:msg f/F:all v:copy y:all /:filter"
-				if a.msgFull.searchTerm != "" {
-					sh = pos + fmt.Sprintf("  [%d/%d] n/N:match ↑↓:blocks ←→:fold f/F:all v:copy y:all", a.msgFull.searchIdx+1, len(a.msgFull.searchLines))
+				selCount := len(a.msgFull.folds.Selected)
+				sh := pos + "  ↑↓:blocks ←→:fold sp:select n/N:msg f/F:all v:copy y:all /:filter"
+				if selCount > 0 {
+					sh = pos + fmt.Sprintf("  [%d sel] ↑↓:blocks sp:select y:copy esc:clear", selCount)
+				} else if a.msgFull.searchTerm != "" {
+					sh = pos + fmt.Sprintf("  [%d/%d] n/N:match ↑↓:blocks ←→:fold sp:select f/F:all v:copy y:all", a.msgFull.searchIdx+1, len(a.msgFull.searchLines))
 				}
 				// Show active block filter badge
 				if a.msgFull.folds.BlockFilter != "" {
@@ -833,17 +869,31 @@ func (a *App) View() string {
 
 	case viewPlugins:
 		title = a.renderBreadcrumb()
-		content = a.renderPluginSplit()
-		if a.plgSearching {
-			help = "  " + a.plgSearchInput.View() + helpStyle.Render("  enter:apply esc:cancel")
-		} else if a.plgSearchTerm != "" {
-			help = "  " + filterBadge.Render(a.plgSearchTerm) + formatHelp(" n/N:next/prev esc:clear")
-		} else {
-			h := "↑↓:nav →:preview /:search v:views esc:back q:quit"
-			if a.plgSplit.Show && a.plgSplit.Focus {
+		if a.plgDetailActive {
+			content = a.renderPluginDetailSplit()
+			h := "↑↓:nav →:preview esc:back q:quit"
+			if a.plgDetailSplit.Show && a.plgDetailSplit.Focus {
 				h = "↑↓:scroll ←:unfocus q:quit"
 			}
 			help = "  " + formatHelp(h)
+		} else {
+			content = a.renderPluginSplit()
+			if a.plgSearching {
+				help = "  " + a.plgSearchInput.View() + helpStyle.Render("  enter:apply esc:cancel")
+			} else if a.plgSearchTerm != "" {
+				help = "  " + filterBadge.Render(a.plgSearchTerm) + formatHelp(" n/N:next/prev esc:clear")
+			} else {
+				h := "↑↓:nav ↵:open →:preview sp:select x:actions /:search v:views esc:back q:quit"
+				if a.plgSplit.Show && a.plgSplit.Focus {
+					h = "↑↓:scroll ←:unfocus q:quit"
+				}
+				if a.plgHasSelection() {
+					badges := filterBadge.Render(fmt.Sprintf("%d sel", len(a.plgSelectedSet)))
+					help = "  " + badges + formatHelp(" "+h)
+				} else {
+					help = "  " + formatHelp(h)
+				}
+			}
 		}
 	}
 
@@ -857,6 +907,13 @@ func (a *App) View() string {
 	// Config actions menu hint box
 	if a.cfgActionsMenu && a.state == viewConfig {
 		hintBox := a.renderCfgActionsHintBox()
+		content = placeHintBox(content, hintBox)
+		help = formatHelp("x:actions — pick an action")
+	}
+
+	// Plugin actions menu hint box
+	if a.plgActionsMenu && a.state == viewPlugins {
+		hintBox := a.renderPlgActionsHintBox()
 		content = placeHintBox(content, hintBox)
 		help = formatHelp("x:actions — pick an action")
 	}
@@ -3467,6 +3524,12 @@ func (a *App) renderSearchHintBox() string {
 			h.Render("is:") + d.Render("memory skill agent command hook mcp"),
 			d.Render("text: filename description"),
 		}
+	case viewPlugins:
+		lines = []string{
+			h.Render("is:") + d.Render("installed available enabled blocked"),
+			h.Render("has:") + d.Render("agent skill command hook mcp lsp script setting memory"),
+			d.Render("text: name marketplace description"),
+		}
 	default:
 		return ""
 	}
@@ -3597,6 +3660,15 @@ func (a *App) updateActiveList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return a, nil
 	case viewPlugins:
+		if a.plgDetailActive {
+			if a.listReady(&a.plgDetailList) {
+				var cmd tea.Cmd
+				a.plgDetailList, cmd = a.plgDetailList.Update(msg)
+				a.updatePluginDetailPreview()
+				return a, cmd
+			}
+			return a, nil
+		}
 		if a.plgSearching {
 			if km, ok := msg.(tea.KeyMsg); ok {
 				return a.handlePlgSearch(km)
@@ -3665,6 +3737,15 @@ func (a *App) updateActiveComponent(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return a, nil
 	case viewPlugins:
+		if a.plgDetailActive {
+			if a.listReady(&a.plgDetailList) {
+				var cmd tea.Cmd
+				a.plgDetailList, cmd = a.plgDetailList.Update(msg)
+				a.updatePluginDetailPreview()
+				return a, cmd
+			}
+			return a, nil
+		}
 		if a.listReady(&a.plgList) {
 			var cmd tea.Cmd
 			a.plgList, cmd = a.plgList.Update(msg)
@@ -3780,6 +3861,12 @@ func (a *App) resizeAll() tea.Cmd {
 		a.plgList.SetSize(a.plgSplit.ListWidth(a.width, a.splitRatio), contentH)
 		a.plgList.Select(idx)
 		a.plgSplit.CacheKey = ""
+	}
+	if a.plgDetailList.Width() > 0 {
+		idx := a.plgDetailList.Index()
+		a.plgDetailList.SetSize(a.plgDetailSplit.ListWidth(a.width, a.splitRatio), contentH)
+		a.plgDetailList.Select(idx)
+		a.plgDetailSplit.CacheKey = ""
 	}
 	// Hooks view
 	if a.hooksVP.Width > 0 {
@@ -3898,6 +3985,9 @@ func (a *App) renderBreadcrumb() string {
 		}
 		crumbs = []crumb{
 			{label, viewPlugins},
+		}
+		if a.plgDetailActive {
+			crumbs = append(crumbs, crumb{a.plgDetailPlugin.Name, viewPlugins})
 		}
 	case viewMessageFull:
 		crumbs = []crumb{

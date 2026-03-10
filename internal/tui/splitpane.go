@@ -50,6 +50,7 @@ type FoldState struct {
 	BlockVisible []bool   // nil = all visible; non-nil = per-block visibility
 	BlockFilter  string   // current filter expression (empty = no filter)
 	HideHooks    bool     // true = suppress hook badges/details in render
+	Selected     foldSet  // block indices selected for copy
 }
 
 // ListWidth returns the list width given total width and split ratio.
@@ -411,7 +412,7 @@ func (sp *SplitPane) RefreshFoldPreview(totalW, splitRatio int) {
 	oldOffset := sp.Preview.YOffset
 
 	cursor := sp.Folds.BlockCursor
-	ro := renderOpts{visible: sp.Folds.BlockVisible, hideHooks: sp.Folds.HideHooks}
+	ro := renderOpts{visible: sp.Folds.BlockVisible, hideHooks: sp.Folds.HideHooks, selected: sp.Folds.Selected}
 	rp := renderFullMessageWithCursor(sp.Folds.Entry, previewW, sp.Folds.Collapsed, sp.Folds.Formatted, cursor, ro)
 	sp.Folds.BlockStarts = rp.blockStarts
 	sp.cachedRP = &rp
@@ -460,7 +461,7 @@ func (sp *SplitPane) RefreshFoldCursor(totalW, splitRatio int) {
 	// Fold state unchanged — re-render with new cursor position only
 	previewW := sp.PreviewWidth(totalW, splitRatio)
 	cursor := sp.Folds.BlockCursor
-	ro := renderOpts{visible: sp.Folds.BlockVisible, hideHooks: sp.Folds.HideHooks}
+	ro := renderOpts{visible: sp.Folds.BlockVisible, hideHooks: sp.Folds.HideHooks, selected: sp.Folds.Selected}
 	rp := renderFullMessageWithCursor(sp.Folds.Entry, previewW, sp.Folds.Collapsed, sp.Folds.Formatted, cursor, ro)
 	sp.Folds.BlockStarts = rp.blockStarts
 	sp.cachedRP = &rp
@@ -669,6 +670,21 @@ func (fs *FoldState) HandleKey(key string) foldResult {
 			return foldCursorMoved
 		}
 		return foldUnhandled
+	case " ":
+		// Toggle block selection for copy
+		if fs.Selected == nil {
+			fs.Selected = make(foldSet)
+		}
+		if fs.Selected[fs.BlockCursor] {
+			delete(fs.Selected, fs.BlockCursor)
+		} else {
+			fs.Selected[fs.BlockCursor] = true
+		}
+		// Auto-advance to next block
+		if next := fs.nextVisibleBlock(fs.BlockCursor); next >= 0 {
+			fs.BlockCursor = next
+		}
+		return foldHandled
 	case "f":
 		fs.Collapsed = defaultFolds(fs.Entry)
 		fs.Formatted = nil
@@ -755,6 +771,7 @@ func (fs *FoldState) Reset(entry session.Entry) {
 	fs.Collapsed = defaultFolds(entry)
 	fs.Formatted = nil
 	fs.BlockCursor = 0
+	fs.Selected = nil
 }
 
 // ResetWithPrefs initializes fold state for a new entry using persistent

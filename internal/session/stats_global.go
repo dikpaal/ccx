@@ -17,6 +17,9 @@ func AggregateStats(sessions []Session) GlobalStats {
 		CommandErrors:          make(map[string]int),
 		AllToolCallTimestamps:  make(map[string][]time.Time),
 		AllToolErrorTimestamps: make(map[string][]time.Time),
+		HookCounts:            make(map[string]int),
+		HookEventCounts:       make(map[string]int),
+		HookTimestamps:        make(map[string][]time.Time),
 	}
 
 	allFiles := make(map[string]bool)
@@ -113,6 +116,15 @@ func AggregateStats(sessions []Session) GlobalStats {
 		}
 		for name, ts := range stats.ToolErrorTimestamps {
 			g.AllToolErrorTimestamps[name] = append(g.AllToolErrorTimestamps[name], ts...)
+		}
+		for k, v := range stats.HookCounts {
+			g.HookCounts[k] += v
+		}
+		for k, v := range stats.HookEventCounts {
+			g.HookEventCounts[k] += v
+		}
+		for k, ts := range stats.HookTimestamps {
+			g.HookTimestamps[k] = append(g.HookTimestamps[k], ts...)
 		}
 	}
 

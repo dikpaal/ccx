@@ -358,8 +358,9 @@ func renderFullMessageFolded(e session.Entry, width int, folds foldSet) string {
 
 // renderOpts bundles optional rendering flags for renderFullMessageImpl.
 type renderOpts struct {
-	visible   []bool // per-block visibility (nil = all visible)
-	hideHooks bool   // suppress hook badges/details
+	visible   []bool  // per-block visibility (nil = all visible)
+	hideHooks bool    // suppress hook badges/details
+	selected  foldSet // blocks selected for copy (nil = none)
 }
 
 func renderFullMessageWithCursor(e session.Entry, width int, folds foldSet, formats foldSet, blockCursor int, opts ...renderOpts) renderedPreview {
@@ -408,15 +409,23 @@ func renderFullMessageImpl(e session.Entry, width int, folds foldSet, formats fo
 		}
 		folded := folds != nil && folds[i]
 		formatted := formats != nil && formats[i]
-		isSelected := blockCursor == i
+		isCursor := blockCursor == i
+		isMarked := opts.selected != nil && opts.selected[i]
 
 		// Fold/format indicators (only in block-navigation mode)
 		isFoldable := block.Type == "tool_use" || block.Type == "tool_result" || block.Type == "thinking"
 		var cursorPrefix string
 		if blockCursor >= 0 {
 			indicator := " "
-			if isSelected {
-				// Selected block: bright indicator
+			if isMarked {
+				// Selected block: ✓ replaces the arrow/indicator
+				if isCursor {
+					indicator = blockCursorStyle.Render("✓")
+				} else {
+					indicator = lipgloss.NewStyle().Foreground(colorAccent).Render("✓")
+				}
+			} else if isCursor {
+				// Cursor block: bright indicator
 				if formatted {
 					indicator = blockCursorStyle.Render("✦")
 				} else if isFoldable {
@@ -429,7 +438,7 @@ func renderFullMessageImpl(e session.Entry, width int, folds foldSet, formats fo
 					indicator = blockCursorStyle.Render("›")
 				}
 			} else {
-				// Non-selected block: dim indicator
+				// Non-cursor block: dim indicator
 				if formatted {
 					indicator = dimStyle.Render("✦")
 				} else if isFoldable {
@@ -539,8 +548,8 @@ func renderFullMessageImpl(e session.Entry, width int, folds foldSet, formats fo
 			buf.WriteString(dimStyle.Render(block.Text) + "\n\n")
 		}
 
-		// Apply background highlight to the selected block
-		if isSelected && buf.Len() > 0 {
+		// Apply background highlight to the cursor block (or marked blocks)
+		if (isCursor || isMarked) && buf.Len() > 0 {
 			raw := buf.String()
 			// Remove final newline so Split doesn't create an extra empty element
 			hasFinalNL := strings.HasSuffix(raw, "\n")

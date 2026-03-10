@@ -75,6 +75,11 @@ type SessionStats struct {
 
 	// Models used
 	Models map[string]int
+
+	// Hook usage: command -> count, event -> count
+	HookCounts        map[string]int // command path -> total invocations
+	HookEventCounts   map[string]int // event type ("PreToolUse", "PostToolUse", "Stop") -> count
+	HookTimestamps    map[string][]time.Time // command -> timestamps
 }
 
 // ModelUsage tracks token counts per model for cost estimation.
@@ -133,4 +138,8 @@ type GlobalStats struct {
 	AllToolErrorTimestamps map[string][]time.Time
 
 	AllMsgTimestamps []time.Time
+
+	HookCounts      map[string]int            // command -> total invocations
+	HookEventCounts map[string]int            // event type -> count
+	HookTimestamps  map[string][]time.Time    // command -> timestamps
 }

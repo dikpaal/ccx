@@ -245,6 +245,10 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					sp.ScrollToBlock()
 					return a, nil
 				}
+				if fr == foldHandled {
+					sp.RefreshFoldCursor(a.width, a.splitRatio)
+					return a, nil
+				}
 				return a, nil
 			}
 		}

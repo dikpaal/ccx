@@ -263,6 +263,18 @@ func renderSessionStats(stats session.SessionStats, width int) string {
 		sb.WriteString("\n")
 	}
 
+	// ── HOOKS ──
+	if len(stats.HookCounts) > 0 {
+		totalHooks := 0
+		for _, c := range stats.HookCounts {
+			totalHooks += c
+		}
+		sb.WriteString(titleStyle.Render(fmt.Sprintf("HOOKS (%d)", totalHooks)) + "\n")
+		sb.WriteString(ruler + "\n")
+		renderToolBarN(&sb, stats.HookCounts, width, 10)
+		sb.WriteString("\n")
+	}
+
 	// ── MODELS ──
 	if len(stats.Models) > 0 {
 		sb.WriteString(titleStyle.Render("MODELS") + "\n")
@@ -477,6 +489,18 @@ func renderGlobalStats(stats session.GlobalStats, width int) string {
 		sb.WriteString(titleStyle.Render(fmt.Sprintf("COMMANDS (%d)", totalCmds)) + "\n")
 		sb.WriteString(ruler + "\n")
 		renderToolBarWithErrors(&sb, stats.CommandCounts, stats.CommandErrors, width, 15)
+		sb.WriteString("\n")
+	}
+
+	// ── HOOKS ──
+	if len(stats.HookCounts) > 0 {
+		totalHooks := 0
+		for _, c := range stats.HookCounts {
+			totalHooks += c
+		}
+		sb.WriteString(titleStyle.Render(fmt.Sprintf("HOOKS (%d)", totalHooks)) + "\n")
+		sb.WriteString(ruler + "\n")
+		renderToolBarN(&sb, stats.HookCounts, width, 15)
 		sb.WriteString("\n")
 	}
 

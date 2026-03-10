@@ -56,6 +56,7 @@ type Plugin struct {
 	Name        string // just the plugin name part
 	Marketplace string // just the marketplace part
 	Installed   bool
+	Enabled     bool // from settings.json enabledPlugins
 	Install     PluginInstall
 	Manifest    *PluginManifest
 	Components  []PluginComponent
@@ -108,6 +109,9 @@ func ScanPlugins(claudeDir string) (*PluginTree, error) {
 	// Parse marketplaces
 	marketplaces := parseMarketplaces(filepath.Join(pluginsDir, "known_marketplaces.json"))
 
+	// Parse enabledPlugins from settings.json
+	enabledPlugins := parseEnabledPlugins(filepath.Join(claudeDir, "settings.json"))
+
 	// Build installed plugins
 	seen := map[string]bool{} // plugin ID → true
 	var plugins []Plugin
@@ -159,6 +163,14 @@ func ScanPlugins(claudeDir string) (*PluginTree, error) {
 			p.BlockReason = reason
 		}
 
+		// Set enabled state from settings.json
+		if enabled, ok := enabledPlugins[id]; ok {
+			p.Enabled = enabled
+		} else {
+			// Default: installed and not blocked = enabled
+			p.Enabled = !p.Blocked
+		}
+
 		plugins = append(plugins, p)
 	}
 
@@ -183,6 +195,10 @@ func ScanPlugins(claudeDir string) (*PluginTree, error) {
 			if reason, blocked := blocklist[ap.ID]; blocked {
 				ap.Blocked = true
 				ap.BlockReason = reason
+			}
+			// Available (not installed) plugins: check enabledPlugins too
+			if enabled, ok := enabledPlugins[ap.ID]; ok {
+				ap.Enabled = enabled
 			}
 			plugins = append(plugins, ap)
 		}
@@ -310,6 +326,20 @@ func parseMarketplaces(path string) map[string]MarketplaceInfo {
 		result[name] = info
 	}
 	return result
+}
+
+func parseEnabledPlugins(path string) map[string]bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var raw struct {
+		EnabledPlugins map[string]bool `json:"enabledPlugins"`
+	}
+	if json.Unmarshal(data, &raw) != nil {
+		return nil
+	}
+	return raw.EnabledPlugins
 }
 
 func splitPluginID(id string) (name, marketplace string) {

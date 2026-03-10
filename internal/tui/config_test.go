@@ -31,7 +31,7 @@ func TestExtractRelConfigPath(t *testing.T) {
 	}
 }
 
-func TestBuildTestConfigDir(t *testing.T) {
+func TestBuildConfigTestEnv(t *testing.T) {
 	// Create a fake source file to symlink
 	srcDir := t.TempDir()
 	srcFile := filepath.Join(srcDir, "test.md")
@@ -42,7 +42,7 @@ func TestBuildTestConfigDir(t *testing.T) {
 	os.MkdirAll(skillDir, 0o755)
 	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("# Skill"), 0o644)
 
-	// We need to mock the home dir, so we test buildTestConfigDir indirectly
+	// We need to mock the home dir, so we test buildConfigTestEnv indirectly
 	// by testing the symlink structure logic
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -67,14 +67,14 @@ func TestBuildTestConfigDir(t *testing.T) {
 		{Category: session.ConfigGlobal, Name: "CLAUDE.md", Path: claudeMD},
 	}
 
-	tmpDir, err := buildTestConfigDir(items)
+	env, err := buildConfigTestEnv(items)
 	if err != nil {
-		t.Fatalf("buildTestConfigDir failed: %v", err)
+		t.Fatalf("buildConfigTestEnv failed: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer env.Cleanup()
 
 	// Verify symlink exists
-	symlink := filepath.Join(tmpDir, ".claude", "CLAUDE.md")
+	symlink := filepath.Join(env.ConfigDir, "CLAUDE.md")
 	info, err := os.Lstat(symlink)
 	if err != nil {
 		t.Fatalf("symlink not created: %v", err)
@@ -90,6 +90,11 @@ func TestBuildTestConfigDir(t *testing.T) {
 	}
 	if target != claudeMD {
 		t.Errorf("symlink target = %q, want %q", target, claudeMD)
+	}
+
+	// Verify MCP config exists
+	if _, err := os.Stat(env.MCPConfigPath()); err != nil {
+		t.Error("mcp-config.json not created:", err)
 	}
 }
 

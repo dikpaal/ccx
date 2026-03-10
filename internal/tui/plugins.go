@@ -1,9 +1,11 @@
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -32,7 +34,8 @@ func (p plgItem) FilterValue() string {
 // --- Plugin delegate ---
 
 type plgDelegate struct {
-	searchTerm string
+	searchTerm  string
+	selectedSet map[string]bool
 }
 
 func (d plgDelegate) Height() int                             { return 1 }
@@ -48,8 +51,11 @@ func (d plgDelegate) Render(w io.Writer, m list.Model, index int, item list.Item
 	selected := index == m.Index()
 	width := m.Width()
 
+	isMarked := !pi.isHeader && d.selectedSet[pi.plugin.ID]
 	cursor := "  "
-	if selected {
+	if isMarked {
+		cursor = lipgloss.NewStyle().Foreground(lipgloss.Color("#22C55E")).Bold(true).Render("✓ ")
+	} else if selected {
 		cursor = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("▸ ")
 	}
 	cursorW := 2
@@ -106,6 +112,9 @@ func (d plgDelegate) Render(w io.Writer, m list.Model, index int, item list.Item
 		statusW = lipgloss.Width(statusStr)
 	} else if !p.Installed {
 		statusStr = dimStyle.Render(" (available)")
+		statusW = lipgloss.Width(statusStr)
+	} else if !p.Enabled {
+		statusStr = lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B")).Render(" DISABLED")
 		statusW = lipgloss.Width(statusStr)
 	}
 
@@ -260,12 +269,22 @@ func (a *App) openPluginExplorer() (tea.Model, tea.Cmd) {
 }
 
 func (a *App) handlePluginKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Route to detail view if active
+	if a.plgDetailActive {
+		return a.handlePluginDetailKeys(msg)
+	}
+
 	sp := &a.plgSplit
 	key := msg.String()
 
 	// Route to text inputs before nav translation
 	if a.plgSearching {
 		return a.handlePlgSearch(msg)
+	}
+
+	// Actions menu
+	if a.plgActionsMenu {
+		return a.handlePlgActionsMenu(msg.String())
 	}
 
 	// Translate navigation aliases
@@ -311,6 +330,10 @@ func (a *App) handlePluginKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case a.keymap.Session.Quit:
 		return a, tea.Quit
 	case "esc":
+		if a.plgHasSelection() {
+			a.clearPlgSelection()
+			return a, nil
+		}
 		if a.plgSearchTerm != "" {
 			a.plgSearchTerm = ""
 			a.rebuildPlgList()
@@ -318,8 +341,28 @@ func (a *App) handlePluginKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		a.state = viewSessions
 		return a, nil
+	case a.keymap.Session.Open:
+		// Enter: open plugin detail (skip headers)
+		if pi, ok := a.plgList.SelectedItem().(plgItem); ok && !pi.isHeader {
+			return a.openPluginDetail(pi.plugin)
+		}
+		return a, nil
 	case a.keymap.Session.Views:
 		a.viewsMenu = true
+		return a, nil
+	case "x":
+		a.plgActionsMenu = true
+		return a, nil
+	case " ":
+		// Toggle selection on current plugin
+		if pi, ok := a.plgList.SelectedItem().(plgItem); ok && !pi.isHeader {
+			if a.plgSelectedSet[pi.plugin.ID] {
+				delete(a.plgSelectedSet, pi.plugin.ID)
+			} else {
+				a.plgSelectedSet[pi.plugin.ID] = true
+			}
+			a.applyPlgDelegate()
+		}
 		return a, nil
 	case a.keymap.Session.Search:
 		return a, a.startPlgSearch()
@@ -333,6 +376,9 @@ func (a *App) handlePluginKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.plgSearchNext(-1)
 		}
 		return a, nil
+	case "R":
+		a.copiedMsg = "Refreshing plugins…"
+		return a.openPluginExplorer()
 	}
 
 	// Pass navigation keys to list
@@ -453,8 +499,12 @@ func renderPluginDetail(p session.Plugin, width int) string {
 		writeField("Category:", p.Manifest.Category)
 	}
 
-	if p.Installed {
-		writeField("Status:", "installed")
+	if p.Blocked {
+		writeField("Status:", "blocked")
+	} else if p.Installed && p.Enabled {
+		writeField("Status:", "installed, enabled")
+	} else if p.Installed {
+		writeField("Status:", "installed, disabled")
 	} else {
 		writeField("Status:", "available")
 	}
@@ -615,6 +665,359 @@ func formatSize(bytes int64) string {
 	}
 }
 
+// --- Plugin detail (drill-down into a single plugin) ---
+
+// plgCompItem represents a component or sub-plugin in the detail list.
+type plgCompItem struct {
+	comp      session.PluginComponent
+	subPlugin *session.SubPlugin // non-nil for sub-plugin entries
+	isHeader  bool
+	label     string
+}
+
+func (c plgCompItem) FilterValue() string {
+	if c.isHeader {
+		return c.label
+	}
+	if c.subPlugin != nil {
+		return c.subPlugin.Name
+	}
+	return c.comp.Name
+}
+
+// plgCompDelegate renders a component row in the detail list.
+type plgCompDelegate struct{}
+
+func (d plgCompDelegate) Height() int                             { return 1 }
+func (d plgCompDelegate) Spacing() int                            { return 0 }
+func (d plgCompDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
+
+func (d plgCompDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
+	ci, ok := item.(plgCompItem)
+	if !ok {
+		return
+	}
+
+	selected := index == m.Index()
+	width := m.Width()
+
+	cursor := "  "
+	if selected {
+		cursor = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("▸ ")
+	}
+	cursorW := 2
+
+	if ci.isHeader {
+		style := lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
+		line := cursor + style.Render(ci.label)
+		if lineW := cursorW + lipgloss.Width(style.Render(ci.label)); lineW < width {
+			line += strings.Repeat(" ", width-lineW)
+		}
+		fmt.Fprint(w, line)
+		return
+	}
+
+	// Sub-plugin entry
+	if sp := ci.subPlugin; sp != nil {
+		nameStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
+		if selected {
+			nameStyle = nameStyle.Bold(true)
+		}
+		nameStr := nameStyle.Render(sp.Name)
+		badge := componentBadge(sp.Components)
+		badgeStr := ""
+		if badge != "" {
+			badgeStr = dimStyle.Render(" " + badge)
+		}
+		line := cursor + nameStr + badgeStr
+		lineW := cursorW + lipgloss.Width(nameStr) + lipgloss.Width(badgeStr)
+		if lineW < width {
+			line += strings.Repeat(" ", width-lineW)
+		}
+		fmt.Fprint(w, line)
+		return
+	}
+
+	// Component entry
+	c := ci.comp
+	icon := componentIcon(c.Type)
+
+	nameStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
+	if selected {
+		nameStyle = nameStyle.Bold(true)
+	}
+	nameStr := nameStyle.Render(c.Name)
+
+	sizeStr := ""
+	if c.Size > 0 {
+		sizeStr = dimStyle.Render("  " + formatSize(c.Size))
+	}
+
+	iconStr := dimStyle.Render(icon + " ")
+	line := cursor + iconStr + nameStr + sizeStr
+	lineW := cursorW + lipgloss.Width(iconStr) + lipgloss.Width(nameStr) + lipgloss.Width(sizeStr)
+	if lineW < width {
+		line += strings.Repeat(" ", width-lineW)
+	}
+	fmt.Fprint(w, line)
+}
+
+func (a *App) openPluginDetail(p session.Plugin) (tea.Model, tea.Cmd) {
+	a.plgDetailActive = true
+	a.plgDetailPlugin = p
+
+	items := buildComponentItems(p)
+	contentH := ContentHeight(a.height)
+	listW := a.plgDetailSplit.ListWidth(a.width, a.splitRatio)
+
+	l := list.New(items, plgCompDelegate{}, listW, contentH)
+	l.SetShowTitle(false)
+	l.SetShowStatusBar(false)
+	l.SetShowFilter(false)
+	l.SetShowPagination(false)
+	l.SetFilteringEnabled(false)
+	l.SetShowHelp(false)
+	l.DisableQuitKeybindings()
+	l.KeyMap.Filter.SetEnabled(false)
+	l.KeyMap.ClearFilter.SetEnabled(false)
+	l.SetSize(listW, contentH)
+
+	// Skip to first non-header item
+	for i, item := range items {
+		if ci, ok := item.(plgCompItem); ok && !ci.isHeader {
+			l.Select(i)
+			break
+		}
+	}
+
+	a.plgDetailList = l
+	a.plgDetailSplit.Show = true
+	a.plgDetailSplit.Focus = false
+	a.plgDetailSplit.CacheKey = ""
+	a.updatePluginDetailPreview()
+	return a, nil
+}
+
+func buildComponentItems(p session.Plugin) []list.Item {
+	typeLabels := map[string]string{
+		"agent":   "Agents",
+		"skill":   "Skills",
+		"command": "Commands",
+		"hook":    "Hooks",
+		"mcp":     "MCP Servers",
+		"lsp":     "LSP Servers",
+		"script":  "Scripts",
+		"setting": "Settings",
+		"memory":  "Memory",
+	}
+
+	byType := map[string][]session.PluginComponent{}
+	for _, c := range p.Components {
+		byType[c.Type] = append(byType[c.Type], c)
+	}
+
+	var items []list.Item
+
+	// Component sections
+	for _, typ := range componentTypeOrder {
+		comps := byType[typ]
+		if len(comps) == 0 {
+			continue
+		}
+		label := typeLabels[typ]
+		if label == "" {
+			label = strings.ToUpper(typ)
+		}
+		items = append(items, plgCompItem{
+			isHeader: true,
+			label:    fmt.Sprintf("%s (%d)", label, len(comps)),
+		})
+		for _, c := range comps {
+			items = append(items, plgCompItem{comp: c})
+		}
+	}
+
+	// Sub-plugins section
+	if len(p.SubPlugins) > 0 {
+		items = append(items, plgCompItem{
+			isHeader: true,
+			label:    fmt.Sprintf("Sub-plugins (%d)", len(p.SubPlugins)),
+		})
+		for i := range p.SubPlugins {
+			items = append(items, plgCompItem{subPlugin: &p.SubPlugins[i]})
+		}
+	}
+
+	return items
+}
+
+func (a *App) handlePluginDetailKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	sp := &a.plgDetailSplit
+	key := msg.String()
+
+	// Translate navigation aliases
+	if nav, navMsg := a.keymap.TranslateNav(key, msg); nav != "" {
+		key = nav
+		msg = navMsg
+	}
+
+	// Split pane navigation
+	result := sp.HandleSplitKey(key, a.width, a.height, a.splitRatio, func(delta int) {
+		newRatio := a.splitRatio + delta
+		if newRatio < 20 {
+			newRatio = 20
+		}
+		if newRatio > 80 {
+			newRatio = 80
+		}
+		a.splitRatio = newRatio
+	})
+	switch result {
+	case splitKeyClosed:
+		// esc closes detail, go back to plugin list
+		a.plgDetailActive = false
+		return a, nil
+	case splitKeyOpened, splitKeyFocused:
+		a.updatePluginDetailPreview()
+		return a, nil
+	case splitKeyUnfocused:
+		return a, nil
+	case splitKeyHandled, splitKeyScrolled:
+		return a, nil
+	}
+
+	switch key {
+	case a.keymap.Session.Quit:
+		return a, tea.Quit
+	case "esc":
+		a.plgDetailActive = false
+		return a, nil
+	}
+
+	// Pass navigation keys to list or viewport
+	if isNavKey(msg) {
+		if sp.Focus {
+			var cmd tea.Cmd
+			sp.Preview, cmd = sp.Preview.Update(msg)
+			return a, cmd
+		}
+		var cmd tea.Cmd
+		a.plgDetailList, cmd = a.plgDetailList.Update(msg)
+		a.updatePluginDetailPreview()
+		return a, cmd
+	}
+
+	return a, nil
+}
+
+func (a *App) renderPluginDetailSplit() string {
+	if a.plgDetailList.Width() == 0 {
+		return ""
+	}
+	clampPaginator(&a.plgDetailList)
+	return a.plgDetailSplit.Render(a.width, a.height, a.splitRatio)
+}
+
+func (a *App) updatePluginDetailPreview() {
+	sp := &a.plgDetailSplit
+	if !sp.Show {
+		return
+	}
+
+	ci, ok := a.plgDetailList.SelectedItem().(plgCompItem)
+	if !ok {
+		// No items (empty component list) — show plugin metadata
+		previewW := sp.PreviewWidth(a.width, a.splitRatio)
+		if sp.CacheKey != "plugin-meta" {
+			sp.CacheKey = "plugin-meta"
+			sp.Preview.SetContent(renderPluginDetail(a.plgDetailPlugin, previewW))
+			sp.Preview.GotoTop()
+		}
+		return
+	}
+
+	cacheKey := ci.comp.Path
+	if ci.isHeader {
+		cacheKey = "header:" + ci.label
+	} else if ci.subPlugin != nil {
+		cacheKey = "subplugin:" + ci.subPlugin.Name
+	}
+	if sp.CacheKey == cacheKey {
+		return
+	}
+	sp.CacheKey = cacheKey
+
+	if ci.isHeader {
+		sp.Preview.SetContent(dimStyle.Render("(section header)"))
+		return
+	}
+
+	previewW := sp.PreviewWidth(a.width, a.splitRatio)
+
+	// Sub-plugin entry: show description + its components
+	if sp := ci.subPlugin; sp != nil {
+		var b strings.Builder
+		titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF"))
+		labelStyle := lipgloss.NewStyle().Foreground(colorPrimary)
+
+		b.WriteString(titleStyle.Render(sp.Name))
+		b.WriteString("\n")
+		if sp.Description != "" {
+			b.WriteString(wordWrap(dimStyle.Render(sp.Description), previewW))
+			b.WriteString("\n")
+		}
+		if sp.Version != "" {
+			b.WriteString(labelStyle.Render("Version: "))
+			b.WriteString(sp.Version)
+			b.WriteString("\n")
+		}
+		if len(sp.Components) > 0 {
+			b.WriteString("\n")
+			for _, c := range sp.Components {
+				icon := componentIcon(c.Type)
+				b.WriteString(fmt.Sprintf("  %s %s", icon, c.Name))
+				if c.Size > 0 {
+					b.WriteString(dimStyle.Render("  " + formatSize(c.Size)))
+				}
+				b.WriteString("\n")
+			}
+		}
+		a.plgDetailSplit.Preview.SetContent(b.String())
+		a.plgDetailSplit.Preview.GotoTop()
+		return
+	}
+
+	c := ci.comp
+
+	// LSP components have no file
+	if c.Path == "" {
+		a.plgDetailSplit.Preview.SetContent(dimStyle.Render(fmt.Sprintf("(%s: %s — no file)", c.Type, c.Name)))
+		return
+	}
+
+	data, err := os.ReadFile(c.Path)
+	if err != nil {
+		a.plgDetailSplit.Preview.SetContent(dimStyle.Render("(cannot read file)"))
+		return
+	}
+
+	content := string(data)
+
+	// Pretty-print JSON
+	if strings.HasSuffix(c.Path, ".json") {
+		var buf interface{}
+		if json.Unmarshal(data, &buf) == nil {
+			if pretty, err := json.MarshalIndent(buf, "", "  "); err == nil {
+				content = string(pretty)
+			}
+		}
+	}
+
+	wrapped := wordWrap(content, previewW)
+	a.plgDetailSplit.Preview.SetContent(wrapped)
+	a.plgDetailSplit.Preview.GotoTop()
+}
+
 // --- Plugin search ---
 
 func (a *App) startPlgSearch() tea.Cmd {
@@ -653,14 +1056,23 @@ func (a *App) rebuildPlgList() {
 	contentH := ContentHeight(a.height)
 	listW := a.plgSplit.ListWidth(a.width, a.splitRatio)
 	a.plgList = newPluginList(items, listW, contentH)
-	// Update delegate search term for highlighting
-	a.plgList.SetDelegate(plgDelegate{searchTerm: a.plgSearchTerm})
+	a.applyPlgDelegate()
 	a.plgSplit.CacheKey = ""
 	a.updatePluginPreview()
 }
 
 func filterPluginItems(items []list.Item, term string) []list.Item {
-	lower := strings.ToLower(term)
+	// Split into terms — all must match (AND logic)
+	var terms []string
+	for _, t := range strings.Fields(strings.ToLower(term)) {
+		if t != "" {
+			terms = append(terms, t)
+		}
+	}
+	if len(terms) == 0 {
+		return items
+	}
+
 	var filtered []list.Item
 	var lastHeader list.Item
 	headerUsed := false
@@ -668,15 +1080,19 @@ func filterPluginItems(items []list.Item, term string) []list.Item {
 	for _, item := range items {
 		pi := item.(plgItem)
 		if pi.isHeader {
-			if lastHeader != nil && !headerUsed {
-				// Previous header had no matches, skip it
-			}
 			lastHeader = item
 			headerUsed = false
 			continue
 		}
 		searchable := pluginSearchText(pi.plugin)
-		if strings.Contains(searchable, lower) {
+		match := true
+		for _, t := range terms {
+			if !strings.Contains(searchable, t) {
+				match = false
+				break
+			}
+		}
+		if match {
 			if lastHeader != nil && !headerUsed {
 				filtered = append(filtered, lastHeader)
 				headerUsed = true
@@ -695,6 +1111,31 @@ func pluginSearchText(p session.Plugin) string {
 	for _, sp := range p.SubPlugins {
 		s += " " + strings.ToLower(sp.Name+" "+sp.Description)
 	}
+
+	// Synthetic is: tags for filtering
+	if p.Installed {
+		s += " is:installed"
+	} else {
+		s += " is:available"
+	}
+	if p.Blocked {
+		s += " is:blocked"
+	}
+	if p.Enabled {
+		s += " is:enabled"
+	} else {
+		s += " is:disabled"
+	}
+
+	// Component type tags: has:agent, has:skill, etc.
+	seen := map[string]bool{}
+	for _, c := range p.Components {
+		if !seen[c.Type] {
+			s += " has:" + c.Type
+			seen[c.Type] = true
+		}
+	}
+
 	return s
 }
 
@@ -702,7 +1143,15 @@ func (a *App) plgSearchNext(dir int) {
 	if a.plgSearchTerm == "" {
 		return
 	}
-	lower := strings.ToLower(a.plgSearchTerm)
+	var terms []string
+	for _, t := range strings.Fields(strings.ToLower(a.plgSearchTerm)) {
+		if t != "" {
+			terms = append(terms, t)
+		}
+	}
+	if len(terms) == 0 {
+		return
+	}
 	items := a.plgList.Items()
 	n := len(items)
 	if n == 0 {
@@ -715,12 +1164,301 @@ func (a *App) plgSearchNext(dir int) {
 		if !ok || pi.isHeader {
 			continue
 		}
-		if strings.Contains(pluginSearchText(pi.plugin), lower) {
+		searchable := pluginSearchText(pi.plugin)
+		match := true
+		for _, t := range terms {
+			if !strings.Contains(searchable, t) {
+				match = false
+				break
+			}
+		}
+		if match {
 			a.plgList.Select(idx)
 			a.updatePluginPreview()
 			return
 		}
 	}
+}
+
+// --- Plugin selection & test ---
+
+type pluginTestDoneMsg struct{ tmpDir string }
+
+func (a *App) plgHasSelection() bool {
+	return len(a.plgSelectedSet) > 0
+}
+
+func (a *App) clearPlgSelection() {
+	clear(a.plgSelectedSet)
+	a.applyPlgDelegate()
+}
+
+func (a *App) applyPlgDelegate() {
+	a.plgList.SetDelegate(plgDelegate{searchTerm: a.plgSearchTerm, selectedSet: a.plgSelectedSet})
+}
+
+func (a *App) selectedPlugins() []session.Plugin {
+	if a.plgTree == nil {
+		return nil
+	}
+	var plugins []session.Plugin
+	for _, p := range a.plgTree.Plugins {
+		if a.plgSelectedSet[p.ID] {
+			plugins = append(plugins, p)
+		}
+	}
+	return plugins
+}
+
+func (a *App) handlePlgActionsMenu(key string) (tea.Model, tea.Cmd) {
+	// Clear uninstall confirm on any key except x
+	if a.plgUninstallConfirm && key != "x" {
+		a.plgUninstallConfirm = false
+	}
+
+	switch key {
+	case "t":
+		a.plgActionsMenu = false
+		return a.launchPluginTest()
+	case "e":
+		a.plgActionsMenu = false
+		return a.togglePluginEnabled(true)
+	case "d":
+		a.plgActionsMenu = false
+		return a.togglePluginEnabled(false)
+	case "u":
+		a.plgActionsMenu = false
+		return a.runPluginCmd("update")
+	case "x":
+		// Second press confirms uninstall
+		if a.plgUninstallConfirm {
+			a.plgUninstallConfirm = false
+			a.plgActionsMenu = false
+			return a.runPluginCmd("uninstall")
+		}
+		// First press: show confirmation
+		a.plgUninstallConfirm = true
+		targets := a.plgActionTargets()
+		if len(targets) == 1 {
+			a.copiedMsg = "Uninstall " + targets[0].Name + "? Press x to confirm"
+		} else {
+			a.copiedMsg = fmt.Sprintf("Uninstall %d plugins? Press x to confirm", len(targets))
+		}
+		return a, nil
+	default:
+		a.plgActionsMenu = false
+	}
+	return a, nil
+}
+
+// plgActionTargets returns either selected plugins or the current cursor plugin.
+func (a *App) plgActionTargets() []session.Plugin {
+	if a.plgHasSelection() {
+		return a.selectedPlugins()
+	}
+	if pi, ok := a.plgList.SelectedItem().(plgItem); ok && !pi.isHeader {
+		return []session.Plugin{pi.plugin}
+	}
+	return nil
+}
+
+// togglePluginEnabled enables or disables target plugins by updating settings.json.
+func (a *App) togglePluginEnabled(enable bool) (tea.Model, tea.Cmd) {
+	targets := a.plgActionTargets()
+	if len(targets) == 0 {
+		return a, nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		a.copiedMsg = "Error: " + err.Error()
+		return a, nil
+	}
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+
+	// Read existing settings
+	data, _ := os.ReadFile(settingsPath)
+	var settings map[string]json.RawMessage
+	if json.Unmarshal(data, &settings) != nil {
+		settings = make(map[string]json.RawMessage)
+	}
+
+	// Parse enabledPlugins
+	var enabled map[string]bool
+	if raw, ok := settings["enabledPlugins"]; ok {
+		json.Unmarshal(raw, &enabled)
+	}
+	if enabled == nil {
+		enabled = make(map[string]bool)
+	}
+
+	// Toggle targets
+	var names []string
+	for _, p := range targets {
+		enabled[p.ID] = enable
+		names = append(names, p.Name)
+	}
+
+	// Write back
+	raw, _ := json.Marshal(enabled)
+	settings["enabledPlugins"] = raw
+	out, _ := json.MarshalIndent(settings, "", "  ")
+	if err := os.WriteFile(settingsPath, out, 0o644); err != nil {
+		a.copiedMsg = "Write failed: " + err.Error()
+		return a, nil
+	}
+
+	// Update in-memory state
+	for i := range a.plgTree.Plugins {
+		if enabled, ok := enabled[a.plgTree.Plugins[i].ID]; ok {
+			a.plgTree.Plugins[i].Enabled = enabled
+		}
+	}
+
+	action := "Enabled"
+	if !enable {
+		action = "Disabled"
+	}
+	a.copiedMsg = fmt.Sprintf("%s %s", action, strings.Join(names, ", "))
+	a.clearPlgSelection()
+	a.rebuildPlgList()
+	return a, nil
+}
+
+type pluginCmdDoneMsg struct {
+	action string
+	err    error
+}
+
+// runPluginCmd runs `claude plugin <action> <id>` for each target plugin.
+func (a *App) runPluginCmd(action string) (tea.Model, tea.Cmd) {
+	targets := a.plgActionTargets()
+	if len(targets) == 0 {
+		return a, nil
+	}
+
+	// Only installed plugins can be updated/uninstalled
+	var ids []string
+	for _, p := range targets {
+		if p.Installed {
+			ids = append(ids, p.ID)
+		}
+	}
+	if len(ids) == 0 {
+		a.copiedMsg = "No installed plugins to " + action
+		return a, nil
+	}
+
+	label := action
+	if len(label) > 0 {
+		label = strings.ToUpper(label[:1]) + label[1:]
+	}
+	a.copiedMsg = fmt.Sprintf("%sing %d plugin(s)…", label, len(ids))
+
+	return a, func() tea.Msg {
+		var lastErr error
+		for _, id := range ids {
+			cmd := exec.Command("claude", "plugin", action, id)
+			if err := cmd.Run(); err != nil {
+				lastErr = fmt.Errorf("%s %s: %w", action, id, err)
+			}
+		}
+		return pluginCmdDoneMsg{action: action, err: lastErr}
+	}
+}
+
+// renderPlgActionsHintBox renders the plugin actions menu popup.
+func (a *App) renderPlgActionsHintBox() string {
+	hl := lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	d := dimStyle
+
+	var lines []string
+	if a.plgHasSelection() {
+		header := fmt.Sprintf("%d selected", len(a.plgSelectedSet))
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(header))
+	}
+	sp := "  "
+	line1 := hl.Render("e") + d.Render(":enable") + sp + hl.Render("d") + d.Render(":disable")
+	line2 := hl.Render("u") + d.Render(":update") + sp + hl.Render("x") + d.Render(":uninstall")
+	if a.plgHasSelection() {
+		line2 += sp + hl.Render("t") + d.Render(":test")
+	}
+	lines = append(lines, line1, line2)
+	lines = append(lines, d.Render("esc:cancel"))
+
+	body := strings.Join(lines, "\n")
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorDim).
+		Padding(0, 1)
+	return boxStyle.Render(body)
+}
+
+// launchPluginTest launches a sandboxed Claude session with only selected plugins active.
+func (a *App) launchPluginTest() (tea.Model, tea.Cmd) {
+	if !a.plgHasSelection() {
+		a.copiedMsg = "No plugins selected (space to select)"
+		return a, nil
+	}
+	if !inTmux() {
+		a.copiedMsg = "Requires tmux"
+		return a, nil
+	}
+
+	plugins := a.selectedPlugins()
+	env, err := buildPluginTestEnv(plugins)
+	if err != nil {
+		a.copiedMsg = "Failed: " + err.Error()
+		return a, nil
+	}
+
+	script := env.Script()
+	a.copiedMsg = fmt.Sprintf("Testing %d plugins…", len(plugins))
+
+	return a, func() tea.Msg {
+		env.RunPopup(script)
+		return pluginTestDoneMsg{tmpDir: env.HomeDir}
+	}
+}
+
+// buildPluginTestEnv creates an isolated environment for plugin testing.
+// Symlinks real plugin data so Claude can load selected plugins.
+func buildPluginTestEnv(plugins []session.Plugin) (*isolatedEnv, error) {
+	env, err := newIsolatedEnv("ccx-plgtest-")
+	if err != nil {
+		return nil, err
+	}
+
+	// Symlink real plugin files so Claude can load them
+	home, _ := os.UserHomeDir()
+	realClaude := filepath.Join(home, ".claude")
+	pluginsDir := filepath.Join(env.ConfigDir, "plugins")
+	os.MkdirAll(pluginsDir, 0o755)
+
+	// Symlink installed_plugins.json, cache, marketplaces
+	for _, name := range []string{
+		"plugins/installed_plugins.json",
+		"plugins/cache",
+		"plugins/marketplaces",
+		"plugins/known_marketplaces.json",
+	} {
+		src := filepath.Join(realClaude, name)
+		if _, err := os.Stat(src); err == nil {
+			os.Symlink(src, filepath.Join(env.ConfigDir, name))
+		}
+	}
+
+	// Write settings.json: only selected plugins enabled
+	enabledMap := make(map[string]bool)
+	for _, p := range plugins {
+		enabledMap[p.ID] = true
+	}
+	settingsData, _ := json.MarshalIndent(map[string]interface{}{
+		"enabledPlugins": enabledMap,
+	}, "", "  ")
+	env.WriteSettings(settingsData)
+
+	return env, nil
 }
 
 // highlightSearchTerm is a simple in-line highlighter for search matches.

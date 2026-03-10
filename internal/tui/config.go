@@ -462,19 +462,6 @@ func cfgScopeGroups(tree *session.ConfigTree) []cfgScopeGroup {
 	}
 }
 
-// cfgMemoryScopeGroups returns scope groups optimized for the MEMORY filter view:
-// project-level first (most specific), then user-level (most general).
-func cfgMemoryScopeGroups(tree *session.ConfigTree) []cfgScopeGroup {
-	return []cfgScopeGroup{
-		{fmt.Sprintf("PROJECT: %s", tree.ProjectName), []cfgSection{
-			{session.ConfigLocal, ""},
-			{session.ConfigProject, ""},
-		}},
-		{"USER", []cfgSection{
-			{session.ConfigGlobal, ""},
-		}},
-	}
-}
 
 func buildConfigItems(tree *session.ConfigTree) []list.Item {
 	var items []list.Item
@@ -591,29 +578,6 @@ func appendGroupedItems(items []list.Item, catItems []session.ConfigItem) []list
 				treeLast:  i == len(g.items)-1,
 			})
 		}
-	}
-	return items
-}
-
-// appendRefTreeItems renders items as a reference tree using RefDepth.
-// Root items (RefDepth=0) are top-level, referenced items (RefDepth>0) are children.
-// Items with keyword Group get keywords shown as description instead of file heading.
-func appendRefTreeItems(items []list.Item, catItems []session.ConfigItem) []list.Item {
-	for i, ci := range catItems {
-		item := ci
-		// For keyword-triggered items, use keywords as description
-		if item.Group != "" {
-			item.Description = item.Group
-		}
-		depth := 1
-		if item.RefDepth > 0 {
-			depth = item.RefDepth + 1
-		}
-		items = append(items, cfgItem{
-			item:      item,
-			treeDepth: depth,
-			treeLast:  i == len(catItems)-1,
-		})
 	}
 	return items
 }
@@ -822,33 +786,21 @@ func extractRelConfigPath(path, claudeDir string) string {
 
 // buildTestConfigDir creates a temp directory with symlinks to selected config files
 // in the correct structure for Claude Code to discover them.
-func buildTestConfigDir(items []session.ConfigItem) (string, error) {
+func buildConfigTestEnv(items []session.ConfigItem) (*isolatedEnv, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("home dir: %w", err)
+		return nil, fmt.Errorf("home dir: %w", err)
 	}
 	claudeDir := filepath.Join(home, ".claude")
 
-	tmpDir, err := os.MkdirTemp("", "ccx-cfgtest-")
+	env, err := newIsolatedEnv("ccx-cfgtest-")
 	if err != nil {
-		return "", fmt.Errorf("create temp dir: %w", err)
-	}
-
-	tmpClaude := filepath.Join(tmpDir, ".claude")
-	if err := os.MkdirAll(tmpClaude, 0o755); err != nil {
-		os.RemoveAll(tmpDir)
-		return "", err
-	}
-
-	// Copy .claude.json from real HOME (required by Claude startup — has workspace trust)
-	claudeJSON := filepath.Join(home, ".claude.json")
-	if data, err := os.ReadFile(claudeJSON); err == nil {
-		os.WriteFile(filepath.Join(tmpDir, ".claude.json"), data, 0o644)
+		return nil, err
 	}
 
 	// Create empty settings.json so hooks/MCP from the real HOME are not loaded.
 	// Selected settings.json/hooks will be symlinked below if the user chose them.
-	os.WriteFile(filepath.Join(tmpClaude, "settings.json"), []byte("{}"), 0o644)
+	env.WriteSettings([]byte("{}"))
 
 	hasHooks := false
 	for _, item := range items {
@@ -857,7 +809,7 @@ func buildTestConfigDir(items []session.ConfigItem) (string, error) {
 			continue
 		}
 
-		dst := filepath.Join(tmpClaude, rel)
+		dst := filepath.Join(env.ConfigDir, rel)
 
 		// For skills, symlink the entire skill directory
 		if item.Category == session.ConfigSkill {
@@ -891,10 +843,10 @@ func buildTestConfigDir(items []session.ConfigItem) (string, error) {
 	// If hooks were selected, copy the hooks config from settings.json
 	// so Claude knows which events trigger which hook scripts.
 	if hasHooks {
-		injectHooksConfig(filepath.Join(claudeDir, "settings.json"), filepath.Join(tmpClaude, "settings.json"))
+		injectHooksConfig(filepath.Join(claudeDir, "settings.json"), env.SettingsPath())
 	}
 
-	return tmpDir, nil
+	return env, nil
 }
 
 // injectHooksConfig copies the "hooks" key from srcSettings into dstSettings.
@@ -941,37 +893,31 @@ func (a *App) launchConfigTest() (tea.Model, tea.Cmd) {
 	}
 
 	items := a.selectedConfigItems()
-	tmpDir, err := buildTestConfigDir(items)
+	env, err := buildConfigTestEnv(items)
 	if err != nil {
 		a.copiedMsg = "Failed: " + err.Error()
 		return a, nil
 	}
 
-	// Strategy: read selected config files and inject as --system-prompt.
-	// This keeps HOME unchanged (auth works), uses --settings for clean hooks/MCP,
-	// and replaces the system prompt with only the selected config content.
-	settingsPath := filepath.Join(tmpDir, ".claude", "settings.json")
-
 	// Build combined prompt from selected config file contents
-	promptFile := filepath.Join(tmpDir, "system-prompt.txt")
+	promptFile := filepath.Join(env.HomeDir, "system-prompt.txt")
 	if err := buildSystemPromptFile(items, promptFile); err != nil {
-		os.RemoveAll(tmpDir)
+		env.Cleanup()
 		a.copiedMsg = "Failed: " + err.Error()
 		return a, nil
 	}
 
-	script := fmt.Sprintf(
-		`unset CLAUDECODE; claude --system-prompt "$(cat %s)" --settings %s --setting-sources ""; `+
-			`rc=$?; if [ $rc -ne 0 ]; then echo ""; echo "[claude exited: $rc] press any key"; read -n1; fi`,
-		shellQuote(promptFile), shellQuote(settingsPath),
+	script := env.Script(
+		fmt.Sprintf("--system-prompt \"$(cat %s)\"", shellQuote(promptFile)),
+		"--settings", shellQuote(env.SettingsPath()),
+		"--setting-sources", `""`,
 	)
 
 	a.copiedMsg = fmt.Sprintf("Testing %d configs…", len(items))
 
 	return a, func() tea.Msg {
-		exec.Command("tmux", "display-popup", "-E", "-w", "90%", "-h", "80%",
-			"bash", "-c", script).Run()
-		return configTestDoneMsg{tmpDir: tmpDir}
+		env.RunPopup(script)
+		return configTestDoneMsg{tmpDir: env.HomeDir}
 	}
 }
 
@@ -1101,31 +1047,26 @@ func buildConfigItemsFiltered(tree *session.ConfigTree, filterCat int, searchTer
 			}
 		}
 	}
-	filterActive := filterCat >= 0
-	isMemoryFilter := filterCat == cfgFilterMemory
 
-	// Use memory-specific scope groups and tree rendering for MEMORY filter
-	scopeGroups := cfgScopeGroups(tree)
-	if isMemoryFilter {
-		scopeGroups = cfgMemoryScopeGroups(tree)
+	if filterCat == cfgFilterMemory || filterCat == int(session.ConfigGlobal) {
+		return buildMemoryFilterItems(tree, terms)
 	}
+
+	filterActive := filterCat >= 0
+	scopeGroups := cfgScopeGroups(tree)
 
 	var items []list.Item
 	for _, group := range scopeGroups {
 		var groupItems []list.Item
 
 		for _, sec := range group.sections {
-			if !isMemoryFilter && filterActive && int(sec.category) != filterCat {
+			if filterActive && int(sec.category) != filterCat {
 				continue
 			}
 
 			var catItems []session.ConfigItem
 			for _, item := range tree.Items {
 				if item.Category != sec.category {
-					continue
-				}
-				// In MEMORY filter, skip settings files (not instructions)
-				if isMemoryFilter && strings.HasSuffix(item.Name, ".json") {
 					continue
 				}
 				if len(terms) > 0 && !cfgMatchesSearch(item, terms) {
@@ -1142,11 +1083,7 @@ func buildConfigItemsFiltered(tree *session.ConfigTree, filterCat int, searchTer
 				groupItems = append(groupItems, cfgItem{isHeader: true, label: "    " + sec.label})
 			}
 
-			if isMemoryFilter {
-				groupItems = appendRefTreeItems(groupItems, catItems)
-			} else {
-				groupItems = appendGroupedItems(groupItems, catItems)
-			}
+			groupItems = appendGroupedItems(groupItems, catItems)
 		}
 
 		// Skip empty scope groups when searching
@@ -1158,6 +1095,137 @@ func buildConfigItemsFiltered(tree *session.ConfigTree, filterCat int, searchTer
 		items = append(items, groupItems...)
 	}
 	return items
+}
+
+// buildMemoryFilterItems builds items for the MEMORY filter:
+// 1. CLAUDE.md files (user / project / local)
+// 2. All @-referenced files with source and keyword info
+func buildMemoryFilterItems(tree *session.ConfigTree, terms []string) []list.Item {
+	memoryCategories := map[session.ConfigCategory]bool{
+		session.ConfigGlobal:  true,
+		session.ConfigProject: true,
+		session.ConfigLocal:   true,
+	}
+
+	var claudeMDs []session.ConfigItem
+	var referenced []session.ConfigItem
+
+	for _, item := range tree.Items {
+		if !memoryCategories[item.Category] {
+			continue
+		}
+		if strings.HasSuffix(item.Name, ".json") {
+			continue
+		}
+		if len(terms) > 0 && !cfgMatchesSearch(item, terms) {
+			continue
+		}
+		if item.RefDepth == 0 {
+			claudeMDs = append(claudeMDs, item)
+		} else {
+			referenced = append(referenced, item)
+		}
+	}
+
+	var items []list.Item
+
+	// --- CLAUDE.md files grouped by scope ---
+	if len(claudeMDs) > 0 {
+		items = append(items, cfgItem{isHeader: true, label: "  CLAUDE.md"})
+
+		// Group by scope
+		type scopeGroup struct {
+			label string
+			items []session.ConfigItem
+		}
+		scopes := []scopeGroup{
+			{"user", nil},
+			{"project", nil},
+			{"local", nil},
+		}
+		for _, ci := range claudeMDs {
+			switch ci.Category {
+			case session.ConfigGlobal:
+				scopes[0].items = append(scopes[0].items, ci)
+			case session.ConfigProject:
+				scopes[1].items = append(scopes[1].items, ci)
+			case session.ConfigLocal:
+				scopes[2].items = append(scopes[2].items, ci)
+			}
+		}
+
+		// Count non-empty scopes for tree connectors
+		nonEmpty := 0
+		for _, s := range scopes {
+			if len(s.items) > 0 {
+				nonEmpty++
+			}
+		}
+		scopeIdx := 0
+		for _, s := range scopes {
+			if len(s.items) == 0 {
+				continue
+			}
+			scopeIdx++
+			isLastScope := scopeIdx == nonEmpty
+			items = append(items, cfgItem{isHeader: true, label: "    " + s.label})
+			for i, ci := range s.items {
+				items = append(items, cfgItem{
+					item: ci, treeDepth: 2, treeLast: isLastScope && i == len(s.items)-1,
+				})
+			}
+		}
+	}
+
+	// Build scope map: path → scope label (e.g. "user", "local/build-catalog")
+	scopeMap := buildScopeMap(claudeMDs)
+
+	// --- @-referenced files ---
+	if len(referenced) > 0 {
+		items = append(items, cfgItem{isHeader: true, label: "  REFERENCED (@)"})
+		for i, ci := range referenced {
+			item := ci
+			desc := scopedRefDesc(item.RefBy, scopeMap)
+			item.Description = desc
+			items = append(items, cfgItem{
+				item: item, treeDepth: 1, treeLast: i == len(referenced)-1,
+			})
+		}
+	}
+
+	return items
+}
+
+// buildScopeMap maps CLAUDE.md file paths to scope-qualified labels.
+// e.g. "/home/user/.claude/CLAUDE.md" → "user/CLAUDE.md"
+//
+//	"/path/to/project/CLAUDE.md" → "local/CLAUDE.md"
+func buildScopeMap(claudeMDs []session.ConfigItem) map[string]string {
+	m := make(map[string]string, len(claudeMDs))
+	for _, ci := range claudeMDs {
+		scope := ""
+		switch ci.Category {
+		case session.ConfigGlobal:
+			scope = "user"
+		case session.ConfigProject:
+			scope = "project"
+		case session.ConfigLocal:
+			scope = "local"
+		}
+		m[ci.Path] = scope + "/" + ci.Name
+	}
+	return m
+}
+
+// scopedRefDesc returns "@ <scope/file>" showing which CLAUDE.md references this item.
+func scopedRefDesc(refBy string, scopeMap map[string]string) string {
+	if refBy == "" {
+		return ""
+	}
+	if label, ok := scopeMap[refBy]; ok {
+		return "@ " + label
+	}
+	return "@ " + filepath.Base(refBy)
 }
 
 // --- Draft config creation ---

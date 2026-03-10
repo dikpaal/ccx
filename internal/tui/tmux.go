@@ -524,6 +524,111 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
+// --- Isolated test environment ---
+//
+// Creates a fake HOME directory for running Claude in full isolation:
+// no memories, no CLAUDE.md, no MCP servers, no marketplace discovery.
+// Auth is provided via CLAUDE_CODE_OAUTH_TOKEN (bypasses macOS keychain).
+
+// isolatedEnv holds paths for an isolated Claude test environment.
+type isolatedEnv struct {
+	HomeDir   string // fake HOME (tmpDir)
+	ConfigDir string // fake HOME/.claude
+}
+
+// newIsolatedEnv creates a temp HOME with onboarding state seeded
+// and an empty MCP config to block all MCP servers.
+func newIsolatedEnv(prefix string) (*isolatedEnv, error) {
+	tmpDir, err := os.MkdirTemp("", prefix)
+	if err != nil {
+		return nil, fmt.Errorf("create temp dir: %w", err)
+	}
+
+	configDir := filepath.Join(tmpDir, ".claude")
+	os.MkdirAll(configDir, 0o755)
+
+	// Copy onboarding/trust state so Claude skips first-run setup
+	seedTestHome(tmpDir)
+
+	// Empty MCP config to block all MCP servers
+	os.WriteFile(filepath.Join(configDir, "mcp-config.json"), []byte(`{"mcpServers":{}}`), 0o644)
+
+	return &isolatedEnv{HomeDir: tmpDir, ConfigDir: configDir}, nil
+}
+
+// MCPConfigPath returns the path to the empty MCP config file.
+func (e *isolatedEnv) MCPConfigPath() string {
+	return filepath.Join(e.ConfigDir, "mcp-config.json")
+}
+
+// SettingsPath returns the path to settings.json in the config dir.
+func (e *isolatedEnv) SettingsPath() string {
+	return filepath.Join(e.ConfigDir, "settings.json")
+}
+
+// WriteSettings writes a JSON settings file to the config dir.
+func (e *isolatedEnv) WriteSettings(data []byte) error {
+	return os.WriteFile(e.SettingsPath(), data, 0o644)
+}
+
+// Script builds a shell script that runs claude in this isolated env.
+// Extra args are appended to the claude command.
+func (e *isolatedEnv) Script(extraArgs ...string) string {
+	args := strings.Join(extraArgs, " ")
+	mcpArgs := fmt.Sprintf("--mcp-config %s --strict-mcp-config", shellQuote(e.MCPConfigPath()))
+	claudeCmd := "claude " + mcpArgs
+	if args != "" {
+		claudeCmd += " " + args
+	}
+	return fmt.Sprintf(
+		`unset CLAUDECODE; %sexport HOME=%s; cd %s; %s; `+
+			`rc=$?; if [ $rc -ne 0 ]; then echo ""; echo "[claude exited: $rc] press any key"; read -n1; fi`,
+		oauthTokenEnv(), shellQuote(e.HomeDir), shellQuote(e.HomeDir), claudeCmd,
+	)
+}
+
+// RunPopup launches the script in a tmux display-popup and blocks until it exits.
+func (e *isolatedEnv) RunPopup(script string) {
+	exec.Command("tmux", "display-popup", "-E", "-w", "90%", "-h", "80%",
+		"bash", "-c", script).Run()
+}
+
+// Cleanup removes the temp directory.
+func (e *isolatedEnv) Cleanup() {
+	os.RemoveAll(e.HomeDir)
+}
+
+// oauthTokenEnv returns a shell snippet to export CLAUDE_CODE_OAUTH_TOKEN if set.
+func oauthTokenEnv() string {
+	if token := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"); token != "" {
+		return fmt.Sprintf("export CLAUDE_CODE_OAUTH_TOKEN=%s; ", shellQuote(token))
+	}
+	return ""
+}
+
+// seedTestHome copies onboarding/trust state into an isolated HOME directory
+// so Claude skips first-run setup in test environments.
+// It copies both ~/.claude/.claude.json → fakeHome/.claude/.claude.json
+// and ~/.claude.json → fakeHome/.claude.json (Claude reads both locations).
+func seedTestHome(fakeHome string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Copy config-dir level state (inside .claude/)
+	configDir := filepath.Join(fakeHome, ".claude")
+	os.MkdirAll(configDir, 0o755)
+	if data, err := os.ReadFile(filepath.Join(home, ".claude", ".claude.json")); err == nil {
+		os.WriteFile(filepath.Join(configDir, ".claude.json"), data, 0o644)
+	}
+
+	// Copy home-level state (at HOME/.claude.json)
+	if data, err := os.ReadFile(filepath.Join(home, ".claude.json")); err == nil {
+		os.WriteFile(filepath.Join(fakeHome, ".claude.json"), data, 0o644)
+	}
+}
+
 // moveWithAndSwitchPane moves the current pane (CSB) to the target's tmux window
 // as a side-by-side split, then focuses the target pane.
 func moveWithAndSwitchPane(target tmuxPane) error {

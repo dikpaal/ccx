@@ -99,7 +99,13 @@ func (a *App) handleMessageFullKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q":
 		return a, tea.Quit
 	case "esc":
-		// Clear block filter first
+		// Clear block selection first
+		if len(a.msgFull.folds.Selected) > 0 {
+			a.msgFull.folds.Selected = nil
+			a.refreshMsgFullPreview()
+			return a, nil
+		}
+		// Clear block filter
 		if a.msgFull.folds.BlockFilter != "" {
 			a.clearMsgFullBlockFilter()
 			return a, nil
@@ -113,8 +119,7 @@ func (a *App) handleMessageFullKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.enterMsgFullCopyMode()
 		return a, nil
 	case "y":
-		copyToClipboard(stripANSI(a.msgFull.content))
-		a.copiedMsg = "Copied!"
+		a.copyMsgFullBlocks()
 		return a, nil
 	case "L":
 		return a.toggleLiveTail()
@@ -253,7 +258,7 @@ func (a *App) handleLiveTailMsgFull() {
 	}
 
 	// Re-render and scroll to bottom
-	ro := renderOpts{visible: fs.BlockVisible, hideHooks: fs.HideHooks}
+	ro := renderOpts{visible: fs.BlockVisible, hideHooks: fs.HideHooks, selected: fs.Selected}
 	rp := renderFullMessageWithCursor(fs.Entry, a.width, fs.Collapsed, fs.Formatted, fs.BlockCursor, ro)
 	fs.BlockStarts = rp.blockStarts
 	a.msgFull.content = rp.content
@@ -271,7 +276,7 @@ func (a *App) handleLiveTailMsgFull() {
 // refreshMsgFullPreview re-renders the message full viewport.
 func (a *App) refreshMsgFullPreview() {
 	fs := &a.msgFull.folds
-	ro := renderOpts{visible: fs.BlockVisible, hideHooks: fs.HideHooks}
+	ro := renderOpts{visible: fs.BlockVisible, hideHooks: fs.HideHooks, selected: fs.Selected}
 	rp := renderFullMessageWithCursor(fs.Entry, a.width, fs.Collapsed, fs.Formatted, fs.BlockCursor, ro)
 	fs.BlockStarts = rp.blockStarts
 
@@ -494,6 +499,59 @@ func (a *App) findAgentInMsgFull(entry session.Entry) (session.Subagent, bool) {
 		return best, true
 	}
 	return session.Subagent{}, false
+}
+
+// copyMsgFullBlocks copies selected blocks (if any) or the entire message content.
+func (a *App) copyMsgFullBlocks() {
+	fs := &a.msgFull.folds
+	if len(fs.Selected) > 0 {
+		// Copy only selected blocks' raw text
+		var parts []string
+		for i, block := range fs.Entry.Content {
+			if !fs.Selected[i] {
+				continue
+			}
+			text := blockPlainText(block)
+			if text != "" {
+				parts = append(parts, text)
+			}
+		}
+		joined := strings.Join(parts, "\n\n")
+		copyToClipboard(joined)
+		n := len(fs.Selected)
+		a.copiedMsg = fmt.Sprintf("Copied %d block", n)
+		if n != 1 {
+			a.copiedMsg += "s"
+		}
+		a.copiedMsg += "!"
+		// Clear selection after copy
+		fs.Selected = nil
+		a.refreshMsgFullPreview()
+		return
+	}
+	// No selection: copy all
+	copyToClipboard(stripANSI(a.msgFull.content))
+	a.copiedMsg = "Copied!"
+}
+
+// blockPlainText extracts the plain text content of a single block.
+func blockPlainText(b session.ContentBlock) string {
+	switch b.Type {
+	case "text":
+		return strings.TrimSpace(session.StripXMLTags(b.Text))
+	case "tool_use":
+		header := "Tool: " + b.ToolName
+		if b.ToolInput != "" {
+			header += "  " + b.ToolInput
+		}
+		return header
+	case "tool_result":
+		return strings.TrimSpace(b.Text)
+	case "thinking":
+		return strings.TrimSpace(b.Text)
+	default:
+		return strings.TrimSpace(b.Text)
+	}
 }
 
 // enterMsgFullCopyMode enters copy mode for the message full view.

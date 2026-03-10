@@ -70,6 +70,13 @@ var (
 	bTUIDCol   = []byte(`"tool_use_id":"`)
 	bTUIDColS  = []byte(`"tool_use_id": "`)
 
+	// Hook markers (inside progress lines)
+	bHookProgress  = []byte(`"hook_progress"`)
+	bHookEvent     = []byte(`"hookEvent":"`)
+	bHookEventS    = []byte(`"hookEvent": "`)
+	bHookCommand   = []byte(`"command":"`)
+	bHookCommandS  = []byte(`"command": "`)
+
 	// Path decode cache
 	decodedPathCache sync.Map // dirName → decoded path (string, "" if unresolvable)
 )

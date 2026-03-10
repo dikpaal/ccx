@@ -843,7 +843,7 @@ func (a *App) View() string {
 			}
 			help = "  " + filterBadge.Render(badge) + formatHelp(" n/N:next/prev esc:clear")
 		} else {
-			h := "sp:sel x:actions p:page tab:filter P:project a:new /:search v:views q:quit"
+			h := "sp:sel x:actions p:page tab:filter P:project a:new /:search R:refresh v:views q:quit"
 			if a.cfgHasSelection() {
 				h = "sp:sel x:actions p:page tab:filter esc:clear q:quit"
 			}
@@ -871,7 +871,7 @@ func (a *App) View() string {
 		title = a.renderBreadcrumb()
 		if a.plgDetailActive {
 			content = a.renderPluginDetailSplit()
-			h := "↑↓:nav →:preview esc:back q:quit"
+			h := "↑↓:nav →:preview e:edit esc:back q:quit"
 			if a.plgDetailSplit.Show && a.plgDetailSplit.Focus {
 				h = "↑↓:scroll ←:unfocus q:quit"
 			}
@@ -883,7 +883,7 @@ func (a *App) View() string {
 			} else if a.plgSearchTerm != "" {
 				help = "  " + filterBadge.Render(a.plgSearchTerm) + formatHelp(" n/N:next/prev esc:clear")
 			} else {
-				h := "↑↓:nav ↵:open →:preview sp:select x:actions /:search v:views esc:back q:quit"
+				h := "↑↓:nav ↵:open →:preview sp:select x:actions /:search R:refresh v:views esc:back q:quit"
 				if a.plgSplit.Show && a.plgSplit.Focus {
 					h = "↑↓:scroll ←:unfocus q:quit"
 				}

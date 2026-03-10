@@ -587,10 +587,22 @@ func (e *isolatedEnv) Script(extraArgs ...string) string {
 	)
 }
 
-// RunPopup launches the script in a tmux display-popup and blocks until it exits.
+// RunPopup launches the script in a tmux display-popup with a nested tmux
+// session for scrollback support. Blocks until the popup exits.
 func (e *isolatedEnv) RunPopup(script string) {
+	// Write script to file to avoid quoting issues with nested tmux
+	scriptPath := filepath.Join(e.HomeDir, "run.sh")
+	os.WriteFile(scriptPath, []byte("#!/bin/bash\n"+script+"\n"), 0o755)
+
+	// Nested tmux session enables mouse scroll and scrollback in the popup.
+	// status off hides the inner status bar; mouse on enables scroll.
+	sessionName := "ccx-test-" + filepath.Base(e.HomeDir)
+	nestedCmd := fmt.Sprintf(
+		"tmux new-session -s %s 'bash %s' \\; set status off \\; set mouse on",
+		shellQuote(sessionName), shellQuote(scriptPath),
+	)
 	exec.Command("tmux", "display-popup", "-E", "-w", "90%", "-h", "80%",
-		"bash", "-c", script).Run()
+		"bash", "-c", nestedCmd).Run()
 }
 
 // Cleanup removes the temp directory.

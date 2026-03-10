@@ -281,6 +281,9 @@ func (a *App) handleConfigKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	case "u":
 		return a.undoCfgDelete()
+	case "R":
+		a.copiedMsg = "Refreshing configs…"
+		return a.openConfigExplorer()
 	}
 
 	// Split pane navigation

@@ -91,6 +91,7 @@ var componentDirs = []struct {
 	{"scripts", "script", nil},
 	{"settings", "setting", []string{".md", ".json", ".yaml", ".yml"}},
 	{"memory", "memory", []string{".md"}},
+	{"references", "reference", nil},
 }
 
 // ScanPlugins discovers installed and available plugins from claudeDir/plugins/.
@@ -371,6 +372,17 @@ func scanAllComponents(installPath string) []PluginComponent {
 	for _, cd := range componentDirs {
 		dir := filepath.Join(installPath, cd.Dir)
 		components = append(components, scanDirRecursive(dir, cd.Type, cd.Exts)...)
+	}
+
+	// Pick up top-level README.md as a reference doc
+	readme := filepath.Join(installPath, "README.md")
+	if info, err := os.Stat(readme); err == nil {
+		components = append(components, PluginComponent{
+			Type: "reference",
+			Name: "README.md",
+			Path: readme,
+			Size: info.Size(),
+		})
 	}
 
 	return components

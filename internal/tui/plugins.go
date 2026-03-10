@@ -137,7 +137,7 @@ func (d plgDelegate) Render(w io.Writer, m list.Model, index int, item list.Item
 	fmt.Fprint(w, line)
 }
 
-var componentTypeOrder = []string{"agent", "skill", "command", "hook", "mcp", "lsp", "script", "setting", "memory"}
+var componentTypeOrder = []string{"agent", "skill", "command", "hook", "mcp", "lsp", "script", "setting", "memory", "reference"}
 
 func componentBadge(components []session.PluginComponent) string {
 	counts := map[string]int{}
@@ -560,7 +560,8 @@ func renderPluginDetail(p session.Plugin, width int) string {
 		"lsp":     "LSP Servers",
 		"script":  "Scripts",
 		"setting": "Settings",
-		"memory":  "Memory",
+		"memory":    "Memory",
+		"reference": "References",
 	}
 
 	hasAny := false
@@ -649,6 +650,8 @@ func componentIcon(typ string) string {
 		return "="
 	case "memory":
 		return "+"
+	case "reference":
+		return "?"
 	default:
 		return "-"
 	}
@@ -808,7 +811,8 @@ func buildComponentItems(p session.Plugin) []list.Item {
 		"lsp":     "LSP Servers",
 		"script":  "Scripts",
 		"setting": "Settings",
-		"memory":  "Memory",
+		"memory":    "Memory",
+		"reference": "References",
 	}
 
 	byType := map[string][]session.PluginComponent{}
@@ -892,6 +896,8 @@ func (a *App) handlePluginDetailKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		a.plgDetailActive = false
 		return a, nil
+	case "e":
+		return a.editPluginComponent()
 	}
 
 	// Pass navigation keys to list or viewport
@@ -908,6 +914,27 @@ func (a *App) handlePluginDetailKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return a, nil
+}
+
+// editPluginComponent opens the selected component file in $EDITOR.
+func (a *App) editPluginComponent() (tea.Model, tea.Cmd) {
+	ci, ok := a.plgDetailList.SelectedItem().(plgCompItem)
+	if !ok || ci.isHeader {
+		return a, nil
+	}
+
+	path := ci.comp.Path
+	if ci.subPlugin != nil {
+		// Sub-plugins don't have a single editable file
+		a.copiedMsg = "Sub-plugin (no single file to edit)"
+		return a, nil
+	}
+	if path == "" {
+		a.copiedMsg = "No file path"
+		return a, nil
+	}
+
+	return a.openInEditor(path)
 }
 
 func (a *App) renderPluginDetailSplit() string {
@@ -1220,6 +1247,9 @@ func (a *App) handlePlgActionsMenu(key string) (tea.Model, tea.Cmd) {
 	case "t":
 		a.plgActionsMenu = false
 		return a.launchPluginTest()
+	case "i":
+		a.plgActionsMenu = false
+		return a.runPluginInstall()
 	case "e":
 		a.plgActionsMenu = false
 		return a.togglePluginEnabled(true)
@@ -1367,6 +1397,38 @@ func (a *App) runPluginCmd(action string) (tea.Model, tea.Cmd) {
 	}
 }
 
+// runPluginInstall installs available (not-installed) plugins via `claude plugin install`.
+func (a *App) runPluginInstall() (tea.Model, tea.Cmd) {
+	targets := a.plgActionTargets()
+	if len(targets) == 0 {
+		return a, nil
+	}
+
+	var ids []string
+	for _, p := range targets {
+		if !p.Installed {
+			ids = append(ids, p.ID)
+		}
+	}
+	if len(ids) == 0 {
+		a.copiedMsg = "Already installed"
+		return a, nil
+	}
+
+	a.copiedMsg = fmt.Sprintf("Installing %d plugin(s)…", len(ids))
+
+	return a, func() tea.Msg {
+		var lastErr error
+		for _, id := range ids {
+			cmd := exec.Command("claude", "plugin", "install", id)
+			if err := cmd.Run(); err != nil {
+				lastErr = fmt.Errorf("install %s: %w", id, err)
+			}
+		}
+		return pluginCmdDoneMsg{action: "install", err: lastErr}
+	}
+}
+
 // renderPlgActionsHintBox renders the plugin actions menu popup.
 func (a *App) renderPlgActionsHintBox() string {
 	hl := lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
@@ -1378,7 +1440,7 @@ func (a *App) renderPlgActionsHintBox() string {
 		lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(header))
 	}
 	sp := "  "
-	line1 := hl.Render("e") + d.Render(":enable") + sp + hl.Render("d") + d.Render(":disable")
+	line1 := hl.Render("i") + d.Render(":install") + sp + hl.Render("e") + d.Render(":enable") + sp + hl.Render("d") + d.Render(":disable")
 	line2 := hl.Render("u") + d.Render(":update") + sp + hl.Render("x") + d.Render(":uninstall")
 	if a.plgHasSelection() {
 		line2 += sp + hl.Render("t") + d.Render(":test")

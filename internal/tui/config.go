@@ -807,12 +807,25 @@ func buildConfigTestEnv(items []session.ConfigItem) (*isolatedEnv, error) {
 
 	hasHooks := false
 	for _, item := range items {
+		// Determine destination path based on whether file is inside ~/.claude/
 		rel := extractRelConfigPath(item.Path, claudeDir)
-		if rel == "" {
-			continue
+		var dst string
+		if rel != "" {
+			// Inside ~/.claude/ → symlink into fake ~/.claude/
+			dst = filepath.Join(env.ConfigDir, rel)
+		} else {
+			// Outside ~/.claude/ (project/local configs) → place relative to cwd (tmpDir).
+			// Claude looks for project CLAUDE.md at cwd/CLAUDE.md and cwd/.claude/
+			name := filepath.Base(item.Path)
+			dir := filepath.Base(filepath.Dir(item.Path))
+			if dir == ".claude" {
+				// e.g. project/.claude/CLAUDE.md → tmpDir/.claude/CLAUDE.md (already env.ConfigDir)
+				dst = filepath.Join(env.ConfigDir, name)
+			} else {
+				// e.g. project/CLAUDE.md → tmpDir/CLAUDE.md
+				dst = filepath.Join(env.HomeDir, name)
+			}
 		}
-
-		dst := filepath.Join(env.ConfigDir, rel)
 
 		// For skills, symlink the entire skill directory
 		if item.Category == session.ConfigSkill {

@@ -309,10 +309,12 @@ type App struct {
 	plgUninstallConfirm  bool            // waiting for second x press
 
 	// Plugin detail drill-down
-	plgDetailActive bool            // true = showing component list for a plugin
-	plgDetailPlugin session.Plugin  // the plugin being inspected
-	plgDetailList   list.Model      // component list
-	plgDetailSplit  SplitPane       // component list + file preview
+	plgDetailActive      bool              // true = showing component list for a plugin
+	plgDetailPlugin      session.Plugin    // the plugin being inspected
+	plgDetailList        list.Model        // component list
+	plgDetailSplit       SplitPane         // component list + file preview
+	plgCompSelectedSet   map[string]bool   // selected component paths
+	plgCompActionsMenu   bool              // actions menu active
 
 	// Hooks view (legacy, kept for viewport reuse)
 	hooksVP viewport.Model
@@ -405,6 +407,7 @@ func NewApp(sessions []session.Session, cfg Config) *App {
 	a.plgSplit = SplitPane{List: &a.plgList, ItemHeight: 1}
 	a.plgDetailSplit = SplitPane{List: &a.plgDetailList, ItemHeight: 1}
 	a.plgSelectedSet = make(map[string]bool)
+	a.plgCompSelectedSet = make(map[string]bool)
 	a.cmdRegistry = buildCmdRegistry()
 
 	// Apply CLI flags for initial group/preview mode
@@ -871,7 +874,7 @@ func (a *App) View() string {
 		title = a.renderBreadcrumb()
 		if a.plgDetailActive {
 			content = a.renderPluginDetailSplit()
-			h := "↑↓:nav →:preview e:edit esc:back q:quit"
+			h := "↑↓:nav →:preview sp:sel x:actions e:edit esc:back q:quit"
 			if a.plgDetailSplit.Show && a.plgDetailSplit.Focus {
 				h = "↑↓:scroll ←:unfocus q:quit"
 			}
@@ -914,6 +917,13 @@ func (a *App) View() string {
 	// Plugin actions menu hint box
 	if a.plgActionsMenu && a.state == viewPlugins {
 		hintBox := a.renderPlgActionsHintBox()
+		content = placeHintBox(content, hintBox)
+		help = formatHelp("x:actions — pick an action")
+	}
+
+	// Plugin detail actions menu hint box
+	if a.plgCompActionsMenu && a.state == viewPlugins && a.plgDetailActive {
+		hintBox := a.renderPlgCompActionsHintBox()
 		content = placeHintBox(content, hintBox)
 		help = formatHelp("x:actions — pick an action")
 	}

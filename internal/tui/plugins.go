@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -689,7 +690,9 @@ func (c plgCompItem) FilterValue() string {
 }
 
 // plgCompDelegate renders a component row in the detail list.
-type plgCompDelegate struct{}
+type plgCompDelegate struct {
+	selectedSet map[string]bool
+}
 
 func (d plgCompDelegate) Height() int                             { return 1 }
 func (d plgCompDelegate) Spacing() int                            { return 0 }
@@ -704,8 +707,11 @@ func (d plgCompDelegate) Render(w io.Writer, m list.Model, index int, item list.
 	selected := index == m.Index()
 	width := m.Width()
 
+	isMarked := !ci.isHeader && ci.comp.Path != "" && d.selectedSet[ci.comp.Path]
 	cursor := "  "
-	if selected {
+	if isMarked {
+		cursor = lipgloss.NewStyle().Foreground(lipgloss.Color("#22C55E")).Bold(true).Render("✓ ")
+	} else if selected {
 		cursor = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("▸ ")
 	}
 	cursorW := 2
@@ -768,12 +774,14 @@ func (d plgCompDelegate) Render(w io.Writer, m list.Model, index int, item list.
 func (a *App) openPluginDetail(p session.Plugin) (tea.Model, tea.Cmd) {
 	a.plgDetailActive = true
 	a.plgDetailPlugin = p
+	clear(a.plgCompSelectedSet)
+	a.plgCompActionsMenu = false
 
 	items := buildComponentItems(p)
 	contentH := ContentHeight(a.height)
 	listW := a.plgDetailSplit.ListWidth(a.width, a.splitRatio)
 
-	l := list.New(items, plgCompDelegate{}, listW, contentH)
+	l := list.New(items, plgCompDelegate{selectedSet: a.plgCompSelectedSet}, listW, contentH)
 	l.SetShowTitle(false)
 	l.SetShowStatusBar(false)
 	l.SetShowFilter(false)
@@ -859,6 +867,11 @@ func (a *App) handlePluginDetailKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	sp := &a.plgDetailSplit
 	key := msg.String()
 
+	// Actions menu
+	if a.plgCompActionsMenu {
+		return a.handlePlgCompActionsMenu(key)
+	}
+
 	// Translate navigation aliases
 	if nav, navMsg := a.keymap.TranslateNav(key, msg); nav != "" {
 		key = nav
@@ -878,6 +891,10 @@ func (a *App) handlePluginDetailKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	})
 	switch result {
 	case splitKeyClosed:
+		if a.plgCompHasSelection() {
+			a.clearPlgCompSelection()
+			return a, nil
+		}
 		// esc closes detail, go back to plugin list
 		a.plgDetailActive = false
 		return a, nil
@@ -894,10 +911,28 @@ func (a *App) handlePluginDetailKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case a.keymap.Session.Quit:
 		return a, tea.Quit
 	case "esc":
+		if a.plgCompHasSelection() {
+			a.clearPlgCompSelection()
+			return a, nil
+		}
 		a.plgDetailActive = false
 		return a, nil
 	case "e":
 		return a.editPluginComponent()
+	case "x":
+		a.plgCompActionsMenu = true
+		return a, nil
+	case " ":
+		// Toggle selection on current component
+		if ci, ok := a.plgDetailList.SelectedItem().(plgCompItem); ok && !ci.isHeader && ci.comp.Path != "" {
+			if a.plgCompSelectedSet[ci.comp.Path] {
+				delete(a.plgCompSelectedSet, ci.comp.Path)
+			} else {
+				a.plgCompSelectedSet[ci.comp.Path] = true
+			}
+			a.applyPlgCompDelegate()
+		}
+		return a, nil
 	}
 
 	// Pass navigation keys to list or viewport
@@ -916,25 +951,89 @@ func (a *App) handlePluginDetailKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
-// editPluginComponent opens the selected component file in $EDITOR.
+func (a *App) plgCompHasSelection() bool {
+	return len(a.plgCompSelectedSet) > 0
+}
+
+func (a *App) clearPlgCompSelection() {
+	clear(a.plgCompSelectedSet)
+	a.applyPlgCompDelegate()
+}
+
+func (a *App) applyPlgCompDelegate() {
+	a.plgDetailList.SetDelegate(plgCompDelegate{selectedSet: a.plgCompSelectedSet})
+}
+
+func (a *App) handlePlgCompActionsMenu(key string) (tea.Model, tea.Cmd) {
+	a.plgCompActionsMenu = false
+
+	switch key {
+	case "e":
+		return a.editPluginComponent()
+	}
+	// Any other key cancels
+	return a, nil
+}
+
+func (a *App) renderPlgCompActionsHintBox() string {
+	hl := lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	d := dimStyle
+
+	var lines []string
+	if a.plgCompHasSelection() {
+		header := fmt.Sprintf("%d selected", len(a.plgCompSelectedSet))
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(header))
+	}
+	line := hl.Render("e") + d.Render(":edit")
+	lines = append(lines, line)
+	lines = append(lines, d.Render("esc:cancel"))
+
+	body := strings.Join(lines, "\n")
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorDim).
+		Padding(0, 1)
+	return boxStyle.Render(body)
+}
+
+// editPluginComponent opens selected component files (or current item) in $EDITOR.
 func (a *App) editPluginComponent() (tea.Model, tea.Cmd) {
+	if a.plgCompHasSelection() {
+		// Multi-select: open all selected files in editor
+		var paths []string
+		for path := range a.plgCompSelectedSet {
+			paths = append(paths, path)
+		}
+		if len(paths) == 0 {
+			return a, nil
+		}
+		sort.Strings(paths)
+		editor := os.Getenv("EDITOR")
+		if editor == "" {
+			editor = "vi"
+		}
+		c := exec.Command(editor, paths...)
+		return a, tea.ExecProcess(c, func(err error) tea.Msg {
+			return editorDoneMsg{}
+		})
+	}
+
+	// Single item
 	ci, ok := a.plgDetailList.SelectedItem().(plgCompItem)
 	if !ok || ci.isHeader {
 		return a, nil
 	}
 
-	path := ci.comp.Path
 	if ci.subPlugin != nil {
-		// Sub-plugins don't have a single editable file
 		a.copiedMsg = "Sub-plugin (no single file to edit)"
 		return a, nil
 	}
-	if path == "" {
+	if ci.comp.Path == "" {
 		a.copiedMsg = "No file path"
 		return a, nil
 	}
 
-	return a.openInEditor(path)
+	return a.openInEditor(ci.comp.Path)
 }
 
 func (a *App) renderPluginDetailSplit() string {

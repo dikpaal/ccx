@@ -43,6 +43,8 @@ type Session struct {
 	TeamRole     string // "leader", "teammate", ""
 	TeammateName string // e.g. "build-deploy" (teammate only)
 
+	ParentSessionID string // UUID of parent session (empty if not a fork)
+
 	HasAgents     bool
 	HasCompaction bool
 	HasSkills     bool
@@ -62,12 +64,23 @@ type Entry struct {
 	RawJSON   string
 }
 
+type HookInfo struct {
+	Event   string // "PreToolUse", "PostToolUse", "Stop"
+	Name    string // "PostToolUse:Read"
+	Command string // "uv run ~/.claude/hooks/go_vet.py"
+	// Note: UserPromptSubmit and Notification hooks are NOT recorded as
+	// hook_progress entries in Claude Code's JSONL. Only PreToolUse,
+	// PostToolUse, and Stop events generate hook_progress entries.
+}
+
 type ContentBlock struct {
 	Type      string
 	Text      string
 	ToolName  string
 	ToolInput string
 	IsError   bool
+	ID        string     // tool_use block ID (e.g., "toolu_01...")
+	Hooks     []HookInfo // hooks that ran for this tool_use block
 }
 
 type Subagent struct {

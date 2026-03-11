@@ -4,6 +4,7 @@ import "github.com/charmbracelet/lipgloss"
 
 var (
 	colorPrimary      = lipgloss.Color("#7C3AED")
+	colorTitleBg      = lipgloss.Color("#1E293B") // subtle dark bg for title bar
 	colorDim          = lipgloss.Color("#6B7280")
 	colorAccent       = lipgloss.Color("#10B981")
 	colorUser         = lipgloss.Color("#3B82F6")
@@ -37,6 +38,7 @@ var (
 	planBadge           = lipgloss.NewStyle().Foreground(lipgloss.Color("#A78BFA")).Bold(true)
 	liveBadge           = lipgloss.NewStyle().Foreground(lipgloss.Color("#22C55E")).Bold(true)
 	busyBadge           = lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B")).Bold(true)
+	forkBadge           = lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B")).Bold(true)
 	blockCursorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8")).Bold(true)
 	blockSelectedBg     = lipgloss.NewStyle().Background(lipgloss.Color("#1E293B"))
 	previewBorder       = lipgloss.NewStyle().
@@ -57,4 +59,24 @@ var (
 
 	// Help line: shortcut keys vs description text
 	helpKeyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
+
+	// Stats rendering (shared across renderSessionStats, renderGlobalStats, timelines)
+	statTitleStyle  = lipgloss.NewStyle().Foreground(colorPrimary).Bold(true)
+	statNumStyle    = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	statAccentStyle = lipgloss.NewStyle().Foreground(colorAccent)
+	statInputStyle  = lipgloss.NewStyle().Foreground(colorUser)
+	statOutputStyle = lipgloss.NewStyle().Foreground(colorAssistant)
+	statCostStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+
+	// Multi-select checkmark
+	selectMarkStyle = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+
+	// Task status icons in conversation
+	taskDoneStyle       = lipgloss.NewStyle().Foreground(colorAccent)
+	taskInProgressStyle = lipgloss.NewStyle().Foreground(colorAssistant)
+
+	// Skill and hook styles for message detail
+	skillBlockStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#A78BFA")).Bold(true)
+	hookBadgeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#FB923C"))
+	hookDetailStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")).Italic(true)
 )

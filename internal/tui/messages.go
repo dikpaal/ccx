@@ -356,7 +356,22 @@ func renderFullMessageFolded(e session.Entry, width int, folds foldSet) string {
 	return rp.content
 }
 
-func renderFullMessageWithCursor(e session.Entry, width int, folds foldSet, formats foldSet, blockCursor int) renderedPreview {
+// renderOpts bundles optional rendering flags for renderFullMessageImpl.
+type renderOpts struct {
+	visible   []bool  // per-block visibility (nil = all visible)
+	hideHooks bool    // suppress hook badges/details
+	selected  foldSet // blocks selected for copy (nil = none)
+}
+
+func renderFullMessageWithCursor(e session.Entry, width int, folds foldSet, formats foldSet, blockCursor int, opts ...renderOpts) renderedPreview {
+	var o renderOpts
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	return renderFullMessageImpl(e, width, folds, formats, blockCursor, o)
+}
+
+func renderFullMessageImpl(e session.Entry, width int, folds foldSet, formats foldSet, blockCursor int, opts renderOpts) renderedPreview {
 	w := max(width, 10)
 
 	// nlWriter counts actual newlines written, so blockStarts match the
@@ -388,17 +403,29 @@ func renderFullMessageWithCursor(e session.Entry, width int, folds foldSet, form
 
 	for i, block := range e.Content {
 		blockStarts[i] = nw.nl
+		// Skip blocks hidden by filter
+		if opts.visible != nil && i < len(opts.visible) && !opts.visible[i] {
+			continue
+		}
 		folded := folds != nil && folds[i]
 		formatted := formats != nil && formats[i]
-		isSelected := blockCursor == i
+		isCursor := blockCursor == i
+		isMarked := opts.selected != nil && opts.selected[i]
 
 		// Fold/format indicators (only in block-navigation mode)
 		isFoldable := block.Type == "tool_use" || block.Type == "tool_result" || block.Type == "thinking"
 		var cursorPrefix string
 		if blockCursor >= 0 {
 			indicator := " "
-			if isSelected {
-				// Selected block: bright indicator
+			if isMarked {
+				// Selected block: ✓ replaces the arrow/indicator
+				if isCursor {
+					indicator = blockCursorStyle.Render("✓")
+				} else {
+					indicator = lipgloss.NewStyle().Foreground(colorAccent).Render("✓")
+				}
+			} else if isCursor {
+				// Cursor block: bright indicator
 				if formatted {
 					indicator = blockCursorStyle.Render("✦")
 				} else if isFoldable {
@@ -411,7 +438,7 @@ func renderFullMessageWithCursor(e session.Entry, width int, folds foldSet, form
 					indicator = blockCursorStyle.Render("›")
 				}
 			} else {
-				// Non-selected block: dim indicator
+				// Non-cursor block: dim indicator
 				if formatted {
 					indicator = dimStyle.Render("✦")
 				} else if isFoldable {
@@ -443,7 +470,21 @@ func renderFullMessageWithCursor(e session.Entry, width int, folds foldSet, form
 			}
 		case "tool_use":
 			buf.WriteString(cursorPrefix)
-			buf.WriteString(toolBlockStyle.Render("Tool: " + block.ToolName))
+			// Show skill name prominently for Skill tool_use blocks
+			if block.ToolName == "Skill" {
+				skillName := extractSkillFromInput(block.ToolInput)
+				if skillName != "" {
+					buf.WriteString(skillBlockStyle.Render("Skill: " + skillName))
+				} else {
+					buf.WriteString(toolBlockStyle.Render("Tool: Skill"))
+				}
+			} else {
+				buf.WriteString(toolBlockStyle.Render("Tool: " + block.ToolName))
+			}
+			// Show hook badges inline (unless hidden)
+			if len(block.Hooks) > 0 && !opts.hideHooks {
+				buf.WriteString(renderHookBadges(block.Hooks))
+			}
 			if folded {
 				summary := session.StripXMLTags(stripANSI(block.ToolInput))
 				if len(summary) > 60 {
@@ -459,6 +500,10 @@ func renderFullMessageWithCursor(e session.Entry, width int, folds foldSet, form
 					}
 					wrapped := wrapText(input, w)
 					buf.WriteString(dimStyle.Render(wrapped) + "\n")
+				}
+				// Show hook details when unfolded (unless hidden)
+				if len(block.Hooks) > 0 && !opts.hideHooks {
+					buf.WriteString(renderHookDetails(block.Hooks))
 				}
 				buf.WriteString("\n")
 			}
@@ -498,10 +543,13 @@ func renderFullMessageWithCursor(e session.Entry, width int, folds foldSet, form
 				wrapped := wrapText(block.Text, w)
 				buf.WriteString(dimStyle.Render(wrapped) + "\n\n")
 			}
+		case "image":
+			buf.WriteString(cursorPrefix)
+			buf.WriteString(dimStyle.Render(block.Text) + "\n\n")
 		}
 
-		// Apply background highlight to the selected block
-		if isSelected && buf.Len() > 0 {
+		// Apply background highlight to the cursor block (or marked blocks)
+		if (isCursor || isMarked) && buf.Len() > 0 {
 			raw := buf.String()
 			// Remove final newline so Split doesn't create an extra empty element
 			hasFinalNL := strings.HasSuffix(raw, "\n")
@@ -583,6 +631,66 @@ func wrapText(text string, width int) string {
 		}
 	}
 	return strings.Join(result, "\n")
+}
+
+// extractSkillFromInput parses the "skill" field from a Skill tool_use input JSON.
+func extractSkillFromInput(input string) string {
+	var parsed struct {
+		Skill string `json:"skill"`
+	}
+	if json.Unmarshal([]byte(input), &parsed) == nil && parsed.Skill != "" {
+		return parsed.Skill
+	}
+	return ""
+}
+
+// renderHookBadges returns inline hook summary for tool_use blocks.
+// Shows short script names e.g. "⚡ go_vet.py, ts_lint.py"
+func renderHookBadges(hooks []session.HookInfo) string {
+	if len(hooks) == 0 {
+		return ""
+	}
+	var names []string
+	for _, h := range hooks {
+		names = append(names, hookScriptName(h.Command))
+	}
+	return "  " + hookBadgeStyle.Render("⚡"+strings.Join(names, ", "))
+}
+
+// renderHookDetails returns expanded hook info lines for unfolded tool_use blocks.
+func renderHookDetails(hooks []session.HookInfo) string {
+	var sb strings.Builder
+	for _, h := range hooks {
+		event := h.Event
+		script := hookScriptName(h.Command)
+		sb.WriteString(hookDetailStyle.Render(fmt.Sprintf("  ⚡ %s  %s", event, script)) + "\n")
+		// Show full command if different from script name
+		if h.Command != script {
+			sb.WriteString(hookDetailStyle.Render("    "+h.Command) + "\n")
+		}
+	}
+	return sb.String()
+}
+
+// hookScriptName extracts a short script name from a hook command string.
+// e.g. "uv run ~/.claude/hooks/go_vet.py" → "go_vet.py"
+func hookScriptName(command string) string {
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return command
+	}
+	// Take the last part that looks like a file path
+	for i := len(parts) - 1; i >= 0; i-- {
+		p := parts[i]
+		if strings.Contains(p, "/") || strings.Contains(p, ".") {
+			// Extract basename
+			if idx := strings.LastIndex(p, "/"); idx >= 0 {
+				return p[idx+1:]
+			}
+			return p
+		}
+	}
+	return parts[len(parts)-1]
 }
 
 // tryFormatJSON attempts to pretty-print s as JSON. Returns s unchanged if not valid JSON.

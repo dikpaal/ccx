@@ -36,11 +36,18 @@ type rawMessage struct {
 
 type rawContentBlock struct {
 	Type    string          `json:"type"`
+	ID      string          `json:"id"`
 	Text    string          `json:"text"`
 	Name    string          `json:"name"`
 	Content json.RawMessage `json:"content"`
 	Input   any             `json:"input"`
 	IsError bool            `json:"is_error"`
+	Source  *imageSource    `json:"source"`
+}
+
+type imageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
 }
 
 func ParseEntry(line string) (Entry, error) {
@@ -100,6 +107,7 @@ func parseContentBlocks(raw json.RawMessage) []ContentBlock {
 		case "text":
 			cb.Text = b.Text
 		case "tool_use":
+			cb.ID = b.ID
 			cb.ToolName = b.Name
 			if b.Input != nil {
 				inputBytes, _ := json.Marshal(b.Input)
@@ -109,6 +117,12 @@ func parseContentBlocks(raw json.RawMessage) []ContentBlock {
 			cb.Text = parseToolResultContent(b.Content)
 		case "thinking":
 			cb.Text = b.Text
+		case "image":
+			media := "image"
+			if b.Source != nil && b.Source.MediaType != "" {
+				media = b.Source.MediaType
+			}
+			cb.Text = fmt.Sprintf("[Image: %s]", media)
 		default:
 			cb.Text = b.Text
 		}
@@ -145,6 +159,40 @@ func parseToolResultContent(raw json.RawMessage) string {
 	return string(raw)
 }
 
+// rawHookProgress represents a hook_progress entry from the JSONL.
+type rawHookProgress struct {
+	Type      string `json:"type"` // "progress"
+	ToolUseID string `json:"toolUseID"`
+	Data      struct {
+		Type      string `json:"type"` // "hook_progress"
+		HookEvent string `json:"hookEvent"`
+		HookName  string `json:"hookName"`
+		Command   string `json:"command"`
+	} `json:"data"`
+}
+
+// parseHookProgress extracts hook info from a progress line.
+// Returns the toolUseID and HookInfo, or empty if not a hook_progress.
+// Skips "callback" hooks (internal permission checks) as they're not informative.
+func parseHookProgress(line []byte) (string, HookInfo, bool) {
+	var raw rawHookProgress
+	if err := json.Unmarshal(line, &raw); err != nil {
+		return "", HookInfo{}, false
+	}
+	if raw.Data.Type != "hook_progress" || raw.ToolUseID == "" {
+		return "", HookInfo{}, false
+	}
+	// Skip built-in callback hooks — they fire on every tool use and carry no useful info
+	if raw.Data.Command == "" || raw.Data.Command == "callback" {
+		return "", HookInfo{}, false
+	}
+	return raw.ToolUseID, HookInfo{
+		Event:   raw.Data.HookEvent,
+		Name:    raw.Data.HookName,
+		Command: raw.Data.Command,
+	}, true
+}
+
 func ExtractMetadata(line string) (cwd, gitBranch string) {
 	var raw rawEntry
 	if err := json.Unmarshal([]byte(line), &raw); err != nil {
@@ -171,13 +219,20 @@ func EntryPreview(e Entry) string {
 	}
 
 	var tools []string
+	var images int
 	for _, block := range e.Content {
-		if block.Type == "tool_use" {
+		switch block.Type {
+		case "tool_use":
 			tools = append(tools, block.ToolName)
+		case "image":
+			images++
 		}
 	}
 	if len(tools) > 0 {
 		return "[" + strings.Join(tools, ", ") + "]"
+	}
+	if images > 0 {
+		return fmt.Sprintf("[%d image(s)]", images)
 	}
 	return "(no content)"
 }

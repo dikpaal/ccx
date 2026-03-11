@@ -1,8 +1,6 @@
 package tui
 
 import (
-	"fmt"
-	"os"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -10,15 +8,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/sendbird/ccx/internal/session"
 )
-
-func debugLog(format string, args ...interface{}) {
-	f, err := os.OpenFile("/tmp/ccx-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, format+"\n", args...)
-}
 
 // SplitPane manages a list + viewport split layout with focus toggling.
 type SplitPane struct {
@@ -40,6 +29,11 @@ type SplitPane struct {
 	// Used during live tailing so new content appears at a stable bottom position.
 	BottomAlign bool
 
+	// Persistent per-type fold preferences. Survives across entry changes.
+	// Updated when the user manually folds/unfolds blocks via HandleKey.
+	TypeFoldPrefs map[string]bool // type → should collapse
+	TypeFmtPrefs  map[string]bool // type → should format
+
 	// Render cache: skip re-render when only block cursor moved
 	cachedRP    *renderedPreview
 	cachedFolds uint64 // hash of collapsed+formatted state at last render
@@ -48,11 +42,15 @@ type SplitPane struct {
 // FoldState holds fold/unfold and block cursor state for previews
 // that render structured content blocks.
 type FoldState struct {
-	Collapsed   foldSet
-	Formatted   foldSet
-	Entry       session.Entry
-	BlockCursor int
-	BlockStarts []int
+	Collapsed    foldSet
+	Formatted    foldSet
+	Entry        session.Entry
+	BlockCursor  int
+	BlockStarts  []int
+	BlockVisible []bool   // nil = all visible; non-nil = per-block visibility
+	BlockFilter  string   // current filter expression (empty = no filter)
+	HideHooks    bool     // true = suppress hook badges/details in render
+	Selected     foldSet  // block indices selected for copy
 }
 
 // ListWidth returns the list width given total width and split ratio.
@@ -91,8 +89,7 @@ func (sp *SplitPane) Render(totalW, totalH, splitRatio int) string {
 	if sp.Preview.Width != previewW || sp.Preview.Height != contentH {
 		sp.Preview.Width = previewW
 		sp.Preview.Height = max(contentH, 1)
-		sp.CacheKey = "" // force re-render at new width
-		sp.cachedRP = nil
+		sp.cachedRP = nil // force re-render at new size, but preserve CacheKey (entry identity)
 	}
 
 	borderColor := colorBorderDim
@@ -184,6 +181,7 @@ func (sp *SplitPane) HandleSplitKey(key string, totalW, totalH, splitRatio int, 
 		if sp.Folds != nil {
 			result := sp.Folds.HandleKey(key)
 			if result == foldHandled {
+				sp.SyncTypePrefs(false) // left: don't sync format prefs (unformat is navigation, not intent)
 				return splitKeyHandled
 			}
 			// foldSwitchToList: fall through to unfocus
@@ -211,6 +209,7 @@ func (sp *SplitPane) HandleSplitKey(key string, totalW, totalH, splitRatio int, 
 		if sp.Folds != nil {
 			result := sp.Folds.HandleKey(key)
 			if result == foldHandled {
+				sp.SyncTypePrefs(true) // right: sync format prefs (explicit format toggle)
 				return splitKeyHandled
 			}
 		}
@@ -264,6 +263,9 @@ func (sp *SplitPane) HandleFocusedKeys(key string) SplitKeyResult {
 			return splitKeyCursorMoved
 		}
 		if result == foldHandled {
+			// Sync format prefs only for keys that explicitly change format state.
+			// "left" removes formatting as a navigation step, not user intent.
+			sp.SyncTypePrefs(key != "left")
 			sp.ScrollToBlock()
 			return splitKeyHandled
 		}
@@ -322,6 +324,7 @@ func (sp *SplitPane) HandleListBoundary(key string) bool {
 }
 
 // Resize adjusts list dimensions after terminal resize.
+// Preserves entry identity (CacheKey) and fold state; only re-renders preview content.
 func (sp *SplitPane) Resize(totalW, totalH, splitRatio int) {
 	if sp.List.Width() == 0 {
 		return
@@ -330,8 +333,11 @@ func (sp *SplitPane) Resize(totalW, totalH, splitRatio int) {
 	contentH := ContentHeight(totalH)
 	sp.List.SetSize(sp.ListWidth(totalW, splitRatio), contentH)
 	sp.List.Select(idx)
-	sp.CacheKey = "" // force preview re-render
 	sp.cachedRP = nil
+	// Re-render preview at new dimensions, preserving fold state and scroll position
+	if sp.Show && sp.Folds != nil && len(sp.Folds.Entry.Content) > 0 {
+		sp.RefreshFoldPreview(totalW, splitRatio)
+	}
 }
 
 // HandleMouseScroll handles mouse wheel events for the split pane.
@@ -406,7 +412,8 @@ func (sp *SplitPane) RefreshFoldPreview(totalW, splitRatio int) {
 	oldOffset := sp.Preview.YOffset
 
 	cursor := sp.Folds.BlockCursor
-	rp := renderFullMessageWithCursor(sp.Folds.Entry, previewW, sp.Folds.Collapsed, sp.Folds.Formatted, cursor)
+	ro := renderOpts{visible: sp.Folds.BlockVisible, hideHooks: sp.Folds.HideHooks, selected: sp.Folds.Selected}
+	rp := renderFullMessageWithCursor(sp.Folds.Entry, previewW, sp.Folds.Collapsed, sp.Folds.Formatted, cursor, ro)
 	sp.Folds.BlockStarts = rp.blockStarts
 	sp.cachedRP = &rp
 	sp.cachedFolds = foldHash(sp.Folds.Collapsed, sp.Folds.Formatted)
@@ -454,15 +461,12 @@ func (sp *SplitPane) RefreshFoldCursor(totalW, splitRatio int) {
 	// Fold state unchanged — re-render with new cursor position only
 	previewW := sp.PreviewWidth(totalW, splitRatio)
 	cursor := sp.Folds.BlockCursor
-	rp := renderFullMessageWithCursor(sp.Folds.Entry, previewW, sp.Folds.Collapsed, sp.Folds.Formatted, cursor)
+	ro := renderOpts{visible: sp.Folds.BlockVisible, hideHooks: sp.Folds.HideHooks, selected: sp.Folds.Selected}
+	rp := renderFullMessageWithCursor(sp.Folds.Entry, previewW, sp.Folds.Collapsed, sp.Folds.Formatted, cursor, ro)
 	sp.Folds.BlockStarts = rp.blockStarts
 	sp.cachedRP = &rp
 
 	oldOffset := sp.Preview.YOffset
-
-	debugLog("RefreshFoldCursor: cursor=%d lineCount=%d vpH=%d vpW=%d previewW=%d oldOffset=%d bottomAlign=%v",
-		cursor, rp.lineCount, sp.Preview.Height, sp.Preview.Width, previewW, oldOffset, sp.BottomAlign)
-	debugLog("  blockStarts=%v", sp.Folds.BlockStarts)
 
 	content := rp.content
 	padLines := 0
@@ -472,19 +476,15 @@ func (sp *SplitPane) RefreshFoldCursor(totalW, splitRatio int) {
 		for i := range sp.Folds.BlockStarts {
 			sp.Folds.BlockStarts[i] += padLines
 		}
-		debugLog("  BottomAlign: padLines=%d, adjusted blockStarts=%v", padLines, sp.Folds.BlockStarts)
 	}
 	sp.Preview.SetContent(content)
 
 	totalLines := sp.Preview.TotalLineCount()
 	maxOffset := max(totalLines-sp.Preview.Height, 0)
-	debugLog("  after SetContent: vpOffset=%d totalLines=%d maxOffset=%d TotalLineCount=%d",
-		sp.Preview.YOffset, totalLines, maxOffset, sp.Preview.TotalLineCount())
 	if oldOffset > maxOffset {
 		oldOffset = maxOffset
 	}
 	sp.Preview.YOffset = oldOffset
-	debugLog("  restored offset=%d", oldOffset)
 
 	// Ensure block cursor is visible after content update
 	sp.ScrollToBlock()
@@ -497,27 +497,18 @@ func (sp *SplitPane) ScrollToBlock() {
 	}
 	fs := sp.Folds
 	if fs.BlockCursor < 0 || fs.BlockCursor >= len(fs.BlockStarts) {
-		debugLog("ScrollToBlock: BAIL cursor=%d starts=%d", fs.BlockCursor, len(fs.BlockStarts))
 		return
 	}
 	blockLine := fs.BlockStarts[fs.BlockCursor]
 	vpHeight := sp.Preview.Height
 	totalLines := sp.Preview.TotalLineCount()
-	oldOffset := sp.Preview.YOffset
-
-	debugLog("ScrollToBlock: cursor=%d blockLine=%d vpH=%d totalL=%d offset=%d (range=%d-%d)",
-		fs.BlockCursor, blockLine, vpHeight, totalLines, oldOffset, oldOffset, oldOffset+vpHeight-1)
 
 	if blockLine < sp.Preview.YOffset {
 		sp.Preview.YOffset = max(blockLine-1, 0)
-		debugLog("  -> scrolled UP to %d", sp.Preview.YOffset)
 		return
 	}
 	if blockLine >= sp.Preview.YOffset+vpHeight {
 		sp.Preview.YOffset = min(blockLine-vpHeight/2, max(totalLines-vpHeight, 0))
-		debugLog("  -> scrolled DOWN to %d (block now at vpPos=%d)", sp.Preview.YOffset, blockLine-sp.Preview.YOffset)
-	} else {
-		debugLog("  -> no scroll needed (block at vpPos=%d)", blockLine-sp.Preview.YOffset)
 	}
 }
 
@@ -531,6 +522,66 @@ func foldHash(collapsed, formatted foldSet) uint64 {
 		h ^= uint64(k)*2654435761 + 0x9e3779b9
 	}
 	return h
+}
+
+// SyncTypePrefs merges fold/format preferences from the current FoldState
+// into the SplitPane's persistent TypeFoldPrefs/TypeFmtPrefs maps.
+// Only updates prefs for block types present in the current entry,
+// preserving prefs for types not in this entry (e.g., tool_use prefs
+// survive while viewing a text-only user message).
+//
+// syncFmt controls whether format (Formatted) preferences are updated.
+// Pass false for "left" key actions — left progressively collapses
+// (unformat → fold → switch-to-list), and the intermediate unformat
+// step should NOT clear the persistent format preference. Pass true
+// for "right" (explicit format toggle) and "f"/"F" (reset all folds).
+func (sp *SplitPane) SyncTypePrefs(syncFmt bool) {
+	if sp.Folds == nil || len(sp.Folds.Entry.Content) == 0 {
+		return
+	}
+	debugLog.Printf("SyncTypePrefs: BEFORE foldPrefs=%v fmtPrefs=%v collapsed=%v formatted=%v",
+		sp.TypeFoldPrefs, sp.TypeFmtPrefs, sp.Folds.Collapsed, sp.Folds.Formatted)
+	if sp.TypeFoldPrefs == nil {
+		sp.TypeFoldPrefs = make(map[string]bool)
+	}
+	// Collect per-type fold state from current entry (any-unfolded wins)
+	localFold := make(map[string]bool)
+	for i, block := range sp.Folds.Entry.Content {
+		bt := block.Type
+		if prev, seen := localFold[bt]; !seen {
+			localFold[bt] = sp.Folds.Collapsed[i]
+		} else if prev && !sp.Folds.Collapsed[i] {
+			localFold[bt] = false
+		}
+	}
+	// Merge into persistent prefs (only types present in current entry)
+	for bt, collapsed := range localFold {
+		sp.TypeFoldPrefs[bt] = collapsed
+	}
+
+	// Collect per-type format state from current entry (only when syncFmt is true)
+	if syncFmt {
+		if sp.TypeFmtPrefs == nil {
+			sp.TypeFmtPrefs = make(map[string]bool)
+		}
+		localFmt := make(map[string]bool)
+		seenTypes := make(map[string]bool)
+		for i, block := range sp.Folds.Entry.Content {
+			seenTypes[block.Type] = true
+			if sp.Folds.Formatted != nil && sp.Folds.Formatted[i] {
+				localFmt[block.Type] = true
+			}
+		}
+		// Merge: update only types present in current entry
+		for bt := range seenTypes {
+			if localFmt[bt] {
+				sp.TypeFmtPrefs[bt] = true
+			} else {
+				delete(sp.TypeFmtPrefs, bt)
+			}
+		}
+	}
+	debugLog.Printf("SyncTypePrefs: AFTER foldPrefs=%v fmtPrefs=%v", sp.TypeFoldPrefs, sp.TypeFmtPrefs)
 }
 
 // --- FoldState ---
@@ -556,14 +607,16 @@ func (fs *FoldState) HandleKey(key string) foldResult {
 
 	switch key {
 	case "up":
-		if fs.BlockCursor > 0 {
-			fs.BlockCursor--
+		next := fs.prevVisibleBlock(fs.BlockCursor)
+		if next >= 0 {
+			fs.BlockCursor = next
 			return foldCursorMoved
 		}
 		return foldUnhandled
 	case "down":
-		if fs.BlockCursor < nBlocks-1 {
-			fs.BlockCursor++
+		next := fs.nextVisibleBlock(fs.BlockCursor)
+		if next >= 0 {
+			fs.BlockCursor = next
 			return foldCursorMoved
 		}
 		return foldUnhandled
@@ -604,17 +657,34 @@ func (fs *FoldState) HandleKey(key string) foldResult {
 		// Fall through to viewport scroll — lets user read long blocks page by page
 		return foldUnhandled
 	case "home":
-		if fs.BlockCursor != 0 {
-			fs.BlockCursor = 0
+		first := fs.firstVisibleBlock()
+		if first >= 0 && fs.BlockCursor != first {
+			fs.BlockCursor = first
 			return foldCursorMoved
 		}
 		return foldUnhandled
 	case "end":
-		if fs.BlockCursor != nBlocks-1 {
-			fs.BlockCursor = nBlocks - 1
+		last := fs.lastVisibleBlock()
+		if last >= 0 && fs.BlockCursor != last {
+			fs.BlockCursor = last
 			return foldCursorMoved
 		}
 		return foldUnhandled
+	case " ":
+		// Toggle block selection for copy
+		if fs.Selected == nil {
+			fs.Selected = make(foldSet)
+		}
+		if fs.Selected[fs.BlockCursor] {
+			delete(fs.Selected, fs.BlockCursor)
+		} else {
+			fs.Selected[fs.BlockCursor] = true
+		}
+		// Auto-advance to next block
+		if next := fs.nextVisibleBlock(fs.BlockCursor); next >= 0 {
+			fs.BlockCursor = next
+		}
+		return foldHandled
 	case "f":
 		fs.Collapsed = defaultFolds(fs.Entry)
 		fs.Formatted = nil
@@ -625,6 +695,57 @@ func (fs *FoldState) HandleKey(key string) foldResult {
 		return foldHandled
 	}
 	return foldUnhandled
+}
+
+// isBlockVisible returns whether block i is visible under the current filter.
+func (fs *FoldState) isBlockVisible(i int) bool {
+	if fs.BlockVisible == nil {
+		return true
+	}
+	if i < 0 || i >= len(fs.BlockVisible) {
+		return false
+	}
+	return fs.BlockVisible[i]
+}
+
+// nextVisibleBlock returns the next visible block index after current, or -1.
+func (fs *FoldState) nextVisibleBlock(current int) int {
+	for i := current + 1; i < len(fs.Entry.Content); i++ {
+		if fs.isBlockVisible(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+// prevVisibleBlock returns the previous visible block index before current, or -1.
+func (fs *FoldState) prevVisibleBlock(current int) int {
+	for i := current - 1; i >= 0; i-- {
+		if fs.isBlockVisible(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+// firstVisibleBlock returns the first visible block index, or -1.
+func (fs *FoldState) firstVisibleBlock() int {
+	for i := 0; i < len(fs.Entry.Content); i++ {
+		if fs.isBlockVisible(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+// lastVisibleBlock returns the last visible block index, or -1.
+func (fs *FoldState) lastVisibleBlock() int {
+	for i := len(fs.Entry.Content) - 1; i >= 0; i-- {
+		if fs.isBlockVisible(i) {
+			return i
+		}
+	}
+	return -1
 }
 
 // SelectBlockAtLine moves the block cursor to the block containing the given line.
@@ -644,21 +765,85 @@ func (fs *FoldState) SelectBlockAtLine(line int) {
 	fs.BlockCursor = best
 }
 
-// Reset initializes fold state for a new entry.
+// Reset initializes fold state for a new entry (cold start, no preferences).
 func (fs *FoldState) Reset(entry session.Entry) {
 	fs.Entry = entry
 	fs.Collapsed = defaultFolds(entry)
 	fs.Formatted = nil
 	fs.BlockCursor = 0
+	fs.Selected = nil
+}
+
+// ResetWithPrefs initializes fold state for a new entry using persistent
+// per-type preferences from the SplitPane. If prefs are nil, falls back to defaults.
+func (fs *FoldState) ResetWithPrefs(entry session.Entry, foldPrefs map[string]bool, fmtPrefs map[string]bool) {
+	fs.Entry = entry
+	fs.Collapsed = make(foldSet)
+	fs.BlockCursor = 0
+
+	// Log block types for debugging
+	types := make([]string, len(entry.Content))
+	for i, b := range entry.Content {
+		types[i] = b.Type
+	}
+	debugLog.Printf("  ResetWithPrefs: blockTypes=%v foldPrefs=%v fmtPrefs=%v", types, foldPrefs, fmtPrefs)
+
+	for i, block := range entry.Content {
+		if foldPrefs != nil {
+			if pref, ok := foldPrefs[block.Type]; ok {
+				if pref {
+					fs.Collapsed[i] = true
+				}
+				continue
+			}
+		}
+		// No preference — use default
+		if block.Type == "tool_use" || block.Type == "tool_result" || block.Type == "thinking" {
+			fs.Collapsed[i] = true
+		}
+	}
+
+	// Apply formatted preferences
+	if fmtPrefs != nil && len(fmtPrefs) > 0 {
+		fs.Formatted = make(foldSet)
+		for i, block := range entry.Content {
+			if fmtPrefs[block.Type] {
+				fs.Formatted[i] = true
+			}
+		}
+		if len(fs.Formatted) == 0 {
+			fs.Formatted = nil
+		}
+	} else {
+		fs.Formatted = nil
+	}
 }
 
 // GrowBlocks extends fold defaults for newly-appended blocks (live tail).
-func (fs *FoldState) GrowBlocks(entry session.Entry, oldBlockCount int) {
+// Uses persistent foldPrefs/fmtPrefs if available, otherwise defaults.
+func (fs *FoldState) GrowBlocks(entry session.Entry, oldBlockCount int, foldPrefs map[string]bool, fmtPrefs map[string]bool) {
 	fs.Entry = entry
 	for i := oldBlockCount; i < len(entry.Content); i++ {
 		block := entry.Content[i]
-		if block.Type == "tool_use" || block.Type == "tool_result" || block.Type == "thinking" {
+		collapsed := false
+		if foldPrefs != nil {
+			if pref, ok := foldPrefs[block.Type]; ok {
+				collapsed = pref
+			} else if block.Type == "tool_use" || block.Type == "tool_result" || block.Type == "thinking" {
+				collapsed = true
+			}
+		} else if block.Type == "tool_use" || block.Type == "tool_result" || block.Type == "thinking" {
+			collapsed = true
+		}
+		if collapsed {
 			fs.Collapsed[i] = true
+		}
+		// Apply format prefs to unfolded blocks
+		if !collapsed && fmtPrefs != nil && fmtPrefs[block.Type] {
+			if fs.Formatted == nil {
+				fs.Formatted = make(foldSet)
+			}
+			fs.Formatted[i] = true
 		}
 	}
 	if fs.BlockCursor >= len(entry.Content) {

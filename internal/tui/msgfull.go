@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -76,6 +77,11 @@ func (a *App) handleMessageFullKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a.handleCopyModeKeys(msg)
 	}
 
+	// Block filter input intercepts all keys
+	if a.msgFull.blockFiltering {
+		return a.handleMsgFullBlockFilterInput(msg)
+	}
+
 	// Search input mode intercepts all keys
 	if a.msgFull.searching {
 		return a.handleMsgFullSearchInput(msg)
@@ -83,10 +89,27 @@ func (a *App) handleMessageFullKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	key := msg.String()
 
+	// Translate navigation aliases (vim hjkl, etc.)
+	if nav, navMsg := a.keymap.TranslateNav(key, msg); nav != "" {
+		key = nav
+		msg = navMsg
+	}
+
 	switch key {
 	case "q":
 		return a, tea.Quit
 	case "esc":
+		// Clear block selection first
+		if len(a.msgFull.folds.Selected) > 0 {
+			a.msgFull.folds.Selected = nil
+			a.refreshMsgFullPreview()
+			return a, nil
+		}
+		// Clear block filter
+		if a.msgFull.folds.BlockFilter != "" {
+			a.clearMsgFullBlockFilter()
+			return a, nil
+		}
 		if a.msgFull.searchTerm != "" {
 			a.clearMsgFullSearch()
 			return a, nil
@@ -96,14 +119,16 @@ func (a *App) handleMessageFullKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.enterMsgFullCopyMode()
 		return a, nil
 	case "y":
-		copyToClipboard(stripANSI(a.msgFull.content))
-		a.copiedMsg = "Copied!"
+		a.copyMsgFullBlocks()
 		return a, nil
-	case "o":
-		openInPager(stripANSI(a.msgFull.content))
-		return a, nil
+	case "L":
+		return a.toggleLiveTail()
 	case "/":
-		a.startMsgFullSearch()
+		if a.msgFull.allMessages {
+			a.startMsgFullSearch()
+		} else {
+			a.startMsgFullBlockFilter()
+		}
 		return a, nil
 	}
 
@@ -174,14 +199,93 @@ func (a *App) handleMessageFullKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
+// handleLiveTailMsgFull refreshes the message detail view during live tail.
+// Re-loads messages from disk; if the current message (typically the last one)
+// has new content blocks, grow the fold state and scroll to the bottom.
+func (a *App) handleLiveTailMsgFull() {
+	oldMergedLen := len(a.msgFull.merged)
+	oldIdx := a.msgFull.idx
+	entries, err := session.LoadMessages(a.msgFull.sess.FilePath)
+	if err != nil {
+		return
+	}
+	a.msgFull.messages = entries
+	a.msgFull.merged = filterConversation(mergeConversationTurns(entries))
+
+	if len(a.msgFull.merged) == 0 {
+		return
+	}
+
+	if a.msgFull.allMessages {
+		a.msgFull.content = renderAllMessages(a.msgFull.merged, a.width)
+		content := a.msgFull.content
+		if a.msgFull.searchTerm != "" {
+			a.buildMsgFullSearchMatches()
+			content = highlightSearchMatches(content, a.msgFull.searchTerm, a.msgFullCurrentMatchLine())
+		}
+		a.msgFull.vp.SetContent(content)
+		a.msgFull.vp.YOffset = max(a.msgFull.vp.TotalLineCount()-a.msgFull.vp.Height, 0)
+		return
+	}
+
+	// If new messages appeared and we were on the last one, follow to new last
+	wasLast := oldMergedLen == 0 || oldIdx >= oldMergedLen-1
+	if wasLast {
+		a.msgFull.idx = len(a.msgFull.merged) - 1
+	}
+	// Clamp idx
+	if a.msgFull.idx >= len(a.msgFull.merged) {
+		a.msgFull.idx = len(a.msgFull.merged) - 1
+	}
+
+	newEntry := a.msgFull.merged[a.msgFull.idx].entry
+	fs := &a.msgFull.folds
+	oldEntry := fs.Entry
+	oldBlockCount := len(oldEntry.Content)
+	newBlockCount := len(newEntry.Content)
+
+	if newEntry.Role == oldEntry.Role && reflect.DeepEqual(newEntry.Content, oldEntry.Content) {
+		// No change — nothing to update
+		return
+	}
+
+	if oldBlockCount > 0 && newBlockCount > oldBlockCount {
+		// Grow: preserve existing fold state, add defaults for new blocks
+		fs.GrowBlocks(newEntry, oldBlockCount, nil, nil)
+	} else {
+		// Reset (new message or shrunk): full re-init
+		fs.Reset(newEntry)
+	}
+
+	// Re-render and scroll to bottom
+	ro := renderOpts{visible: fs.BlockVisible, hideHooks: fs.HideHooks, selected: fs.Selected}
+	rp := renderFullMessageWithCursor(fs.Entry, a.width, fs.Collapsed, fs.Formatted, fs.BlockCursor, ro)
+	fs.BlockStarts = rp.blockStarts
+	a.msgFull.content = rp.content
+	a.msgFull.vp.SetContent(rp.content)
+
+	// Move block cursor to last block and scroll to bottom
+	if len(fs.Entry.Content) > 0 {
+		fs.BlockCursor = len(fs.Entry.Content) - 1
+	}
+	total := a.msgFull.vp.TotalLineCount()
+	maxOffset := max(total-a.msgFull.vp.Height, 0)
+	a.msgFull.vp.YOffset = maxOffset
+}
+
 // refreshMsgFullPreview re-renders the message full viewport.
 func (a *App) refreshMsgFullPreview() {
 	fs := &a.msgFull.folds
-	rp := renderFullMessageWithCursor(fs.Entry, a.width, fs.Collapsed, fs.Formatted, fs.BlockCursor)
+	ro := renderOpts{visible: fs.BlockVisible, hideHooks: fs.HideHooks, selected: fs.Selected}
+	rp := renderFullMessageWithCursor(fs.Entry, a.width, fs.Collapsed, fs.Formatted, fs.BlockCursor, ro)
 	fs.BlockStarts = rp.blockStarts
 
 	oldOffset := a.msgFull.vp.YOffset
-	a.msgFull.vp.SetContent(rp.content)
+	content := rp.content
+	if a.msgFull.searchTerm != "" {
+		content = highlightSearchMatches(content, a.msgFull.searchTerm, a.msgFullCurrentMatchLine())
+	}
+	a.msgFull.vp.SetContent(content)
 
 	maxOffset := max(a.msgFull.vp.TotalLineCount()-a.msgFull.vp.Height, 0)
 	if oldOffset > maxOffset {
@@ -208,6 +312,75 @@ func (a *App) renderMessageFull() string {
 		a.msgFull.vp.YOffset = maxOffset
 	}
 	return a.msgFull.vp.View()
+}
+
+// --- Block filter for full-screen message view ---
+
+func (a *App) startMsgFullBlockFilter() {
+	ti := textinput.New()
+	ti.Prompt = "Filter: "
+	ti.Placeholder = "is:hook is:tool tool:Grep is:error ..."
+	ti.CharLimit = 200
+	ti.Width = a.width - 20
+	if a.msgFull.folds.BlockFilter != "" {
+		ti.SetValue(a.msgFull.folds.BlockFilter)
+	}
+	ti.Focus()
+	a.msgFull.blockFilterTI = ti
+	a.msgFull.blockFiltering = true
+}
+
+func (a *App) handleMsgFullBlockFilterInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	switch key {
+	case "enter":
+		a.commitMsgFullBlockFilter()
+		return a, nil
+	case "esc":
+		a.msgFull.blockFiltering = false
+		return a, nil
+	}
+	var cmd tea.Cmd
+	a.msgFull.blockFilterTI, cmd = a.msgFull.blockFilterTI.Update(msg)
+	return a, cmd
+}
+
+func (a *App) commitMsgFullBlockFilter() {
+	a.msgFull.blockFiltering = false
+	fs := &a.msgFull.folds
+	filter := a.msgFull.blockFilterTI.Value()
+	fs.BlockFilter = filter
+	fs.BlockVisible = applyBlockFilter(filter, fs.Entry)
+	if first := fs.firstVisibleBlock(); first >= 0 {
+		fs.BlockCursor = first
+	}
+	a.refreshMsgFullPreview()
+	a.msgFull.vp.YOffset = 0
+}
+
+func (a *App) clearMsgFullBlockFilter() {
+	fs := &a.msgFull.folds
+	fs.BlockFilter = ""
+	fs.BlockVisible = nil
+	a.refreshMsgFullPreview()
+}
+
+// renderMsgFullSearchHintBox renders a floating hint box for the full-screen message search.
+func renderMsgFullSearchHintBox() string {
+	h := lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8"))
+	d := dimStyle
+
+	lines := []string{
+		d.Render("text search across rendered content"),
+		h.Render("n/N") + d.Render(": next/prev match after search"),
+	}
+
+	body := strings.Join(lines, "\n")
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorDim).
+		Padding(0, 1)
+	return boxStyle.Render(body)
 }
 
 // pushNavFrame saves current conversation state onto the nav stack.
@@ -272,6 +445,8 @@ func (a *App) popNavFrame() (tea.Model, tea.Cmd) {
 
 		contentH := ContentHeight(a.height)
 		a.convList = newConvList(a.conv.items, a.conv.split.ListWidth(a.width, a.splitRatio), contentH)
+		a.conv.split.List = &a.convList
+
 		if frame.listIdx < len(a.conv.items) {
 			a.convList.Select(frame.listIdx)
 		}
@@ -326,11 +501,72 @@ func (a *App) findAgentInMsgFull(entry session.Entry) (session.Subagent, bool) {
 	return session.Subagent{}, false
 }
 
+// copyMsgFullBlocks copies selected blocks (if any) or the entire message content.
+func (a *App) copyMsgFullBlocks() {
+	fs := &a.msgFull.folds
+	if len(fs.Selected) > 0 {
+		// Copy only selected blocks' raw text
+		var parts []string
+		for i, block := range fs.Entry.Content {
+			if !fs.Selected[i] {
+				continue
+			}
+			text := blockPlainText(block)
+			if text != "" {
+				parts = append(parts, text)
+			}
+		}
+		joined := strings.Join(parts, "\n\n")
+		copyToClipboard(joined)
+		n := len(fs.Selected)
+		a.copiedMsg = fmt.Sprintf("Copied %d block", n)
+		if n != 1 {
+			a.copiedMsg += "s"
+		}
+		a.copiedMsg += "!"
+		// Clear selection after copy
+		fs.Selected = nil
+		a.refreshMsgFullPreview()
+		return
+	}
+	// No selection: copy all
+	copyToClipboard(stripANSI(a.msgFull.content))
+	a.copiedMsg = "Copied!"
+}
+
+// blockPlainText extracts the plain text content of a single block.
+func blockPlainText(b session.ContentBlock) string {
+	switch b.Type {
+	case "text":
+		return strings.TrimSpace(session.StripXMLTags(b.Text))
+	case "tool_use":
+		header := "Tool: " + b.ToolName
+		if b.ToolInput != "" {
+			header += "  " + b.ToolInput
+		}
+		return header
+	case "tool_result":
+		return strings.TrimSpace(b.Text)
+	case "thinking":
+		return strings.TrimSpace(b.Text)
+	default:
+		return strings.TrimSpace(b.Text)
+	}
+}
+
 // enterMsgFullCopyMode enters copy mode for the message full view.
 func (a *App) enterMsgFullCopyMode() {
 	a.copyLines = strings.Split(stripANSI(a.msgFull.content), "\n")
 	a.copyModeActive = true
-	a.copyCursor = a.msgFull.vp.YOffset
+
+	// Start cursor at current block position (if available), fall back to viewport offset
+	cursor := a.msgFull.vp.YOffset
+	fs := &a.msgFull.folds
+	if fs.BlockCursor >= 0 && fs.BlockCursor < len(fs.BlockStarts) {
+		cursor = fs.BlockStarts[fs.BlockCursor]
+	}
+	a.copyCursor = cursor
+
 	a.copyAnchor = -1
 	a.renderMsgFullCopyMode()
 }
@@ -410,6 +646,15 @@ func (a *App) commitMsgFullSearch() {
 	}
 	a.msgFull.searchTerm = term
 	a.buildMsgFullSearchMatches()
+
+	// Apply search highlighting
+	if a.msgFull.allMessages {
+		content := highlightSearchMatches(a.msgFull.content, term, a.msgFullCurrentMatchLine())
+		a.msgFull.vp.SetContent(content)
+	} else {
+		a.refreshMsgFullPreview()
+	}
+
 	// Jump to first match at or after current viewport
 	a.jumpMsgFullSearchForward()
 }
@@ -425,12 +670,31 @@ func (a *App) clearMsgFullSearch() {
 	a.msgFull.searchTerm = ""
 	a.msgFull.searchLines = nil
 	a.msgFull.searchIdx = 0
+
+	// Re-render without highlights
+	if a.msgFull.allMessages {
+		a.msgFull.vp.SetContent(a.msgFull.content)
+	} else {
+		a.refreshMsgFullPreview()
+	}
 }
 
 // buildMsgFullSearchMatches finds all lines matching the search term.
+// It scans the given content (the same content set on the viewport,
+// before highlight wrapping) so line numbers match what's displayed.
 func (a *App) buildMsgFullSearchMatches() {
 	term := strings.ToLower(a.msgFull.searchTerm)
-	fullPlain := stripANSI(a.msgFull.content)
+	// For single-message view, get the current rendered content
+	// (with cursor/folds) to match actual viewport line numbers.
+	var source string
+	if a.msgFull.allMessages {
+		source = a.msgFull.content
+	} else {
+		fs := &a.msgFull.folds
+		rp := renderFullMessageWithCursor(fs.Entry, a.width, fs.Collapsed, fs.Formatted, fs.BlockCursor)
+		source = rp.content
+	}
+	fullPlain := stripANSI(source)
 	lines := strings.Split(fullPlain, "\n")
 	a.msgFull.searchLines = nil
 	for i, line := range lines {
@@ -500,13 +764,166 @@ func (a *App) prevMsgFullSearchMatch() {
 	a.scrollToSearchMatch()
 }
 
-// scrollToSearchMatch scrolls viewport to show the current search match.
+// scrollToSearchMatch re-renders highlights and scrolls viewport to show the current search match.
 func (a *App) scrollToSearchMatch() {
 	if a.msgFull.searchIdx < 0 || a.msgFull.searchIdx >= len(a.msgFull.searchLines) {
 		return
 	}
+
+	// Re-render content with updated current-match highlight
+	currentLine := a.msgFullCurrentMatchLine()
+	if a.msgFull.allMessages {
+		content := highlightSearchMatches(a.msgFull.content, a.msgFull.searchTerm, currentLine)
+		a.msgFull.vp.SetContent(content)
+	} else {
+		fs := &a.msgFull.folds
+		rp := renderFullMessageWithCursor(fs.Entry, a.width, fs.Collapsed, fs.Formatted, fs.BlockCursor)
+		fs.BlockStarts = rp.blockStarts
+		content := highlightSearchMatches(rp.content, a.msgFull.searchTerm, currentLine)
+		a.msgFull.vp.SetContent(content)
+	}
+
 	line := a.msgFull.searchLines[a.msgFull.searchIdx]
-	maxOffset := max(a.msgFull.vp.TotalLineCount()-a.msgFull.vp.Height, 0)
-	target := min(max(line-a.msgFull.vp.Height/3, 0), maxOffset)
-	a.msgFull.vp.YOffset = target
+	target := max(line-a.msgFull.vp.Height/3, 0)
+	a.msgFull.vp.SetYOffset(target)
+}
+
+// msgFullCurrentMatchLine returns the line number of the current search match, or -1.
+func (a *App) msgFullCurrentMatchLine() int {
+	if len(a.msgFull.searchLines) == 0 || a.msgFull.searchIdx < 0 || a.msgFull.searchIdx >= len(a.msgFull.searchLines) {
+		return -1
+	}
+	return a.msgFull.searchLines[a.msgFull.searchIdx]
+}
+
+// highlightSearchMatches wraps occurrences of the search term with a
+// highlight background in the rendered viewport content.
+// currentLine is the line number of the active match (-1 for no active highlight).
+func highlightSearchMatches(content, term string, currentLine int) string {
+	if term == "" {
+		return content
+	}
+	lowerTerm := strings.ToLower(term)
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		plain := stripANSI(line)
+		if !strings.Contains(strings.ToLower(plain), lowerTerm) {
+			continue
+		}
+		lines[i] = highlightLine(line, term, i == currentLine)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// highlightLine inserts ANSI highlight escapes around case-insensitive matches
+// in a line that may contain existing ANSI sequences.
+// If isCurrent is true, uses a brighter style for the active match line.
+func highlightLine(line, term string, isCurrent bool) string {
+	hlStart := "\x1b[43;30m" // yellow bg, black fg
+	if isCurrent {
+		hlStart = "\x1b[46;30m" // cyan bg, black fg (current match)
+	}
+	const hlEnd = "\x1b[0m"
+
+	lowerTerm := strings.ToLower(term)
+	termLen := len(lowerTerm)
+
+	// Walk the line tracking visible character position vs ANSI escapes.
+	// Build a map from visible-char index to byte positions in the original line.
+	type charPos struct {
+		byteStart int
+		byteEnd   int
+	}
+	var visChars []charPos
+	i := 0
+	for i < len(line) {
+		if line[i] == '\x1b' && i+1 < len(line) && line[i+1] == '[' {
+			// Skip ANSI escape sequence
+			j := i + 2
+			for j < len(line) && line[j] != 'm' {
+				j++
+			}
+			if j < len(line) {
+				j++ // skip 'm'
+			}
+			i = j
+			continue
+		}
+		visChars = append(visChars, charPos{i, i + 1})
+		i++
+	}
+
+	if len(visChars) == 0 {
+		return line
+	}
+
+	// Find matches in visible text
+	visText := make([]byte, len(visChars))
+	for idx, cp := range visChars {
+		visText[idx] = line[cp.byteStart]
+	}
+	lowerVis := strings.ToLower(string(visText))
+
+	type matchRange struct{ start, end int } // visible char indices
+	var matches []matchRange
+	pos := 0
+	for {
+		idx := strings.Index(lowerVis[pos:], lowerTerm)
+		if idx < 0 {
+			break
+		}
+		mStart := pos + idx
+		matches = append(matches, matchRange{mStart, mStart + termLen})
+		pos = mStart + termLen
+	}
+
+	if len(matches) == 0 {
+		return line
+	}
+
+	// Rebuild the line, inserting highlight codes around matched visible chars.
+	// Track which visible chars are highlighted.
+	hlSet := make([]bool, len(visChars))
+	for _, m := range matches {
+		for j := m.start; j < m.end && j < len(visChars); j++ {
+			hlSet[j] = true
+		}
+	}
+
+	var sb strings.Builder
+	visIdx := 0
+	inHL := false
+	i = 0
+	for i < len(line) {
+		if line[i] == '\x1b' && i+1 < len(line) && line[i+1] == '[' {
+			// Copy ANSI escape through
+			j := i + 2
+			for j < len(line) && line[j] != 'm' {
+				j++
+			}
+			if j < len(line) {
+				j++
+			}
+			sb.WriteString(line[i:j])
+			i = j
+			continue
+		}
+		// Visible character
+		if visIdx < len(hlSet) {
+			if hlSet[visIdx] && !inHL {
+				sb.WriteString(hlStart)
+				inHL = true
+			} else if !hlSet[visIdx] && inHL {
+				sb.WriteString(hlEnd)
+				inHL = false
+			}
+		}
+		sb.WriteByte(line[i])
+		visIdx++
+		i++
+	}
+	if inHL {
+		sb.WriteString(hlEnd)
+	}
+	return sb.String()
 }

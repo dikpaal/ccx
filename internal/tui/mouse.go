@@ -94,6 +94,13 @@ func (a *App) activeSplitPane() *SplitPane {
 		return &a.sessSplit
 	case viewConversation:
 		return &a.conv.split
+	case viewConfig:
+		return &a.cfgSplit
+	case viewPlugins:
+		if a.plgDetailActive {
+			return &a.plgDetailSplit
+		}
+		return &a.plgSplit
 	default:
 		return nil
 	}
@@ -106,6 +113,10 @@ func (a *App) handleMouseScroll(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 	switch a.state {
 	case viewSessions:
+		// Live preview: no local scroll, use J/enter to jump to pane for scrollback
+		if scrolledPreview && a.sessPreviewMode == sessPreviewLive && a.paneProxy != nil {
+			return a, nil
+		}
 		a.sessSplit.HandleMouseScroll(msg.X, up, a.width, a.splitRatio)
 		if scrolledPreview {
 			a.sessPreviewPinned = !a.sessPreviewAtBottom()
@@ -121,11 +132,30 @@ func (a *App) handleMouseScroll(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 	case viewMessageFull:
 		mouseScrollVP(&a.msgFull.vp, up)
+
+	case viewConfig:
+		a.cfgSplit.HandleMouseScroll(msg.X, up, a.width, a.splitRatio)
+		if !scrolledPreview {
+			a.updateConfigPreview()
+		}
+
+	case viewPlugins:
+		if a.plgDetailActive {
+			a.plgDetailSplit.HandleMouseScroll(msg.X, up, a.width, a.splitRatio)
+			if !scrolledPreview {
+				a.updatePluginDetailPreview()
+			}
+		} else {
+			a.plgSplit.HandleMouseScroll(msg.X, up, a.width, a.splitRatio)
+			if !scrolledPreview {
+				a.updatePluginPreview()
+			}
+		}
 	}
 
 	// Re-render fold preview after scroll moved the block cursor
 	if scrolledPreview && sp != nil && sp.Folds != nil && sp.Focus {
-		a.refreshActivePreview()
+		return a, a.refreshActivePreview()
 	}
 
 	return a, nil
@@ -151,8 +181,7 @@ func (a *App) handleMouseClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		// Double-click in preview → toggle fold
 		sp := a.activeSplitPane()
 		if sp != nil && sp.HandleMouseDoubleClick(msg.X, a.width, a.splitRatio) {
-			a.refreshActivePreview()
-			return a, nil
+			return a, a.refreshActivePreview()
 		}
 		// Double-click in list → enter
 		enterMsg := tea.KeyMsg{Type: tea.KeyEnter}
@@ -163,24 +192,40 @@ func (a *App) handleMouseClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	sp := a.activeSplitPane()
 	clickedPreview := sp != nil && sp.Show && msg.X > sp.ListWidth(a.width, a.splitRatio)
 
+	var previewCmd tea.Cmd
 	switch a.state {
 	case viewSessions:
 		a.sessSplit.HandleMouseClick(msg.X, contentY, a.width, a.splitRatio)
-		a.updateSessionPreview()
+		previewCmd = a.updateSessionPreview()
 
 	case viewConversation:
 		a.conv.split.HandleMouseClick(msg.X, contentY, a.width, a.splitRatio)
 		if a.conv.split.Show {
 			a.updateConvPreview()
 		}
+
+	case viewConfig:
+		a.cfgSplit.HandleMouseClick(msg.X, contentY, a.width, a.splitRatio)
+		a.updateConfigPreview()
+
+	case viewPlugins:
+		if a.plgDetailActive {
+			a.plgDetailSplit.HandleMouseClick(msg.X, contentY, a.width, a.splitRatio)
+			a.updatePluginDetailPreview()
+		} else {
+			a.plgSplit.HandleMouseClick(msg.X, contentY, a.width, a.splitRatio)
+			a.updatePluginPreview()
+		}
 	}
 
 	// Re-render fold preview after clicking in preview to update block cursor highlight
 	if clickedPreview && sp != nil && sp.Folds != nil {
-		a.refreshActivePreview()
+		if c := a.refreshActivePreview(); c != nil {
+			previewCmd = c
+		}
 	}
 
-	return a, nil
+	return a, previewCmd
 }
 
 // mouseScrollVP scrolls a viewport by mouseScrollLines.

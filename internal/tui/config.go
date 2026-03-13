@@ -862,9 +862,77 @@ func buildConfigTestEnv(items []session.ConfigItem) (*isolatedEnv, error) {
 		injectHooksConfig(filepath.Join(claudeDir, "settings.json"), env.SettingsPath())
 	}
 
+	// Ensure Claude discovers memory files in the test env.
+	// Two modes:
+	//   1. Root CLAUDE.md selected → symlink it + all its @referenced files
+	//   2. Only referenced files selected → generate a CLAUDE.md referencing them
+	ensureTestMemory(env, items, claudeDir)
+
 	return env, nil
 }
 
+// ensureTestMemory handles memory file discovery in the test env.
+func ensureTestMemory(env *isolatedEnv, items []session.ConfigItem, claudeDir string) {
+	rootCLAUDE := filepath.Join(claudeDir, "CLAUDE.md")
+	claudeMdDst := filepath.Join(env.ConfigDir, "CLAUDE.md")
+
+	// Check if the root CLAUDE.md was selected
+	rootSelected := false
+	for _, item := range items {
+		if item.Path == rootCLAUDE {
+			rootSelected = true
+			break
+		}
+	}
+
+	if rootSelected {
+		// Mode 1: root CLAUDE.md selected → symlink it and ALL its referenced files.
+		// The symlink for CLAUDE.md itself was already created in the main loop.
+		// Now symlink every file it references so the @refs resolve.
+		allRefs := session.ExtractFileReferences(rootCLAUDE)
+		for _, refPath := range allRefs {
+			rel := extractRelConfigPath(refPath, claudeDir)
+			if rel == "" || rel == "CLAUDE.md" {
+				continue
+			}
+			dst := filepath.Join(env.ConfigDir, rel)
+			// Skip if already symlinked (user also selected this file)
+			if _, err := os.Lstat(dst); err == nil {
+				continue
+			}
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				continue
+			}
+			os.Symlink(refPath, dst)
+		}
+		return
+	}
+
+	// Mode 2: only referenced memory files selected → generate a minimal CLAUDE.md
+	var refs []string
+	for _, item := range items {
+		rel := extractRelConfigPath(item.Path, claudeDir)
+		if rel == "" || rel == "CLAUDE.md" {
+			continue
+		}
+		if !strings.HasSuffix(rel, ".md") && !strings.HasSuffix(rel, ".yaml") {
+			continue
+		}
+		refs = append(refs, rel)
+	}
+	if len(refs) == 0 {
+		return
+	}
+
+	var buf strings.Builder
+	buf.WriteString("# Test Environment\n\nSelected configs:\n\n")
+	for _, rel := range refs {
+		buf.WriteString("@~/.claude/" + rel + "\n")
+	}
+
+	os.Remove(claudeMdDst)
+	os.WriteFile(claudeMdDst, []byte(buf.String()), 0o644)
+}
 
 // injectHooksConfig copies the "hooks" key from srcSettings into dstSettings.
 // If dstSettings already has content (e.g. from being selected as MCP config),

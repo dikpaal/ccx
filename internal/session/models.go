@@ -49,6 +49,8 @@ type Session struct {
 	HasCompaction bool
 	HasSkills     bool
 	HasMCP        bool
+
+	TmuxWindowName string // tmux window name (set if pane CWD matches ProjectPath)
 }
 
 type Entry struct {

@@ -400,8 +400,8 @@ type fileRef struct {
 	keywords string // e.g. "bash, command, output" — empty if no keyword line
 }
 
-// extractFileReferences parses a file for @path references and returns resolved absolute paths.
-func extractFileReferences(filePath string) []string {
+// ExtractFileReferences parses a file for @path references and returns resolved absolute paths.
+func ExtractFileReferences(filePath string) []string {
 	refs := extractFileRefsWithContext(filePath)
 	paths := make([]string, len(refs))
 	for i, r := range refs {

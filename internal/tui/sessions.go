@@ -91,6 +91,9 @@ func (s sessionItem) FilterValue() string {
 		s.sess.ShortID,
 		s.sess.FirstPrompt,
 	}
+	if s.sess.TmuxWindowName != "" {
+		parts = append(parts, "win:"+s.sess.TmuxWindowName, s.sess.TmuxWindowName)
+	}
 	if s.sess.IsLive {
 		parts = append(parts, "is:live")
 	}

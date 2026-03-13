@@ -35,13 +35,14 @@ func extractClaudeOAuthToken() (string, error) {
 }
 
 type tmuxPane struct {
-	PaneID  string
-	Command string
-	Session string
-	Window  string
-	Pane    string
-	PID     int
-	Path    string
+	PaneID     string
+	Command    string
+	Session    string
+	Window     string
+	WindowName string
+	Pane       string
+	PID        int
+	Path       string
 }
 
 func inTmux() bool {
@@ -111,7 +112,7 @@ func findTmuxPane(projectPath string, sessionID ...string) (tmuxPane, bool) {
 
 func listTmuxPanes() ([]tmuxPane, error) {
 	out, err := exec.Command("tmux", "list-panes", "-a", "-F",
-		"#{pane_id}|#{pane_current_command}|#{session_name}|#{window_index}|#{pane_index}|#{pane_pid}|#{pane_current_path}",
+		"#{pane_id}|#{pane_current_command}|#{session_name}|#{window_index}|#{pane_index}|#{pane_pid}|#{pane_current_path}|#{window_name}",
 	).Output()
 	if err != nil {
 		return nil, err
@@ -119,12 +120,12 @@ func listTmuxPanes() ([]tmuxPane, error) {
 
 	var panes []tmuxPane
 	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		parts := strings.SplitN(line, "|", 7)
+		parts := strings.SplitN(line, "|", 8)
 		if len(parts) < 7 {
 			continue
 		}
 		pid, _ := strconv.Atoi(parts[5])
-		panes = append(panes, tmuxPane{
+		p := tmuxPane{
 			PaneID:  parts[0],
 			Command: parts[1],
 			Session: parts[2],
@@ -132,7 +133,11 @@ func listTmuxPanes() ([]tmuxPane, error) {
 			Pane:    parts[4],
 			PID:     pid,
 			Path:    parts[6],
-		})
+		}
+		if len(parts) >= 8 {
+			p.WindowName = parts[7]
+		}
+		panes = append(panes, p)
 	}
 	return panes, nil
 }
@@ -177,8 +182,9 @@ func claudeArgsForShell(shellPID int) string {
 
 // claudePane represents a tmux pane running a Claude process.
 type claudePane struct {
-	path string // absolute pane CWD
-	args string // claude process command line
+	path       string // absolute pane CWD
+	args       string // claude process command line
+	windowName string // tmux window name
 }
 
 // findClaudePanes returns tmux panes that have an active Claude child process,
@@ -199,7 +205,7 @@ func findClaudePanes() []claudePane {
 		}
 		absPath, _ := filepath.Abs(p.Path)
 		if absPath != "" {
-			result = append(result, claudePane{path: absPath, args: args})
+			result = append(result, claudePane{path: absPath, args: args, windowName: p.WindowName})
 		}
 	}
 	return result
@@ -259,9 +265,14 @@ func DetectLiveProjectPaths() []string {
 // markLiveSessions sets IsLive and IsResponding on sessions by matching
 // running Claude processes. In tmux, matches by session ID in process args
 // with fallback to most-recent-for-path. Outside tmux, matches by path only.
+// Also sets TmuxWindowName on all sessions whose ProjectPath matches a tmux pane CWD.
 func markLiveSessions(sessions []session.Session) {
 	if inTmux() {
 		markLiveSessionsTmux(sessions)
+		// Set TmuxWindowName for ALL sessions (not just live) by matching
+		// ProjectPath to any tmux pane's CWD. This allows searching by
+		// window name even for non-live sessions in the same project.
+		setTmuxWindowNames(sessions)
 	} else {
 		markLiveSessionsNonTmux(sessions)
 	}
@@ -272,6 +283,34 @@ func markLiveSessions(sessions []session.Session) {
 			if err == nil {
 				sessions[i].IsResponding = time.Since(info.ModTime()) < 10*time.Second
 			}
+		}
+	}
+}
+
+// setTmuxWindowNames maps all tmux pane CWDs to window names and applies
+// them to sessions. Sessions already having a window name (from live matching) are skipped.
+func setTmuxWindowNames(sessions []session.Session) {
+	panes, err := listTmuxPanes()
+	if err != nil {
+		return
+	}
+	// Build path → window name map (first pane wins per path)
+	pathWindow := make(map[string]string, len(panes))
+	for _, p := range panes {
+		absPath, _ := filepath.Abs(p.Path)
+		if absPath == "" || p.WindowName == "" {
+			continue
+		}
+		if _, ok := pathWindow[absPath]; !ok {
+			pathWindow[absPath] = p.WindowName
+		}
+	}
+	for i := range sessions {
+		if sessions[i].TmuxWindowName != "" {
+			continue
+		}
+		if wn, ok := pathWindow[sessions[i].ProjectPath]; ok {
+			sessions[i].TmuxWindowName = wn
 		}
 	}
 }
@@ -296,6 +335,7 @@ func markLiveSessionsTmux(sessions []session.Session) {
 			}
 			if strings.Contains(cp.args, sessions[si].ID) {
 				sessions[si].IsLive = true
+				sessions[si].TmuxWindowName = cp.windowName
 				matched[ci] = true
 				break
 			}
@@ -318,6 +358,7 @@ func markLiveSessionsTmux(sessions []session.Session) {
 		}
 		if bestIdx >= 0 {
 			sessions[bestIdx].IsLive = true
+			sessions[bestIdx].TmuxWindowName = cp.windowName
 		}
 	}
 }
@@ -622,9 +663,14 @@ func (e *isolatedEnv) Cleanup() {
 	os.RemoveAll(e.HomeDir)
 }
 
-// oauthTokenEnv returns a shell snippet to export CLAUDE_CODE_OAUTH_TOKEN if set.
+// oauthTokenEnv returns a shell snippet to export CLAUDE_CODE_OAUTH_TOKEN.
+// Checks env first, then falls back to extracting from macOS Keychain.
 func oauthTokenEnv() string {
-	if token := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"); token != "" {
+	token := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN")
+	if token == "" {
+		token, _ = extractClaudeOAuthToken()
+	}
+	if token != "" {
 		return fmt.Sprintf("export CLAUDE_CODE_OAUTH_TOKEN=%s; ", shellQuote(token))
 	}
 	return ""

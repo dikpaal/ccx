@@ -2,7 +2,7 @@
 
 A terminal UI for browsing, inspecting, and managing [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions.
 
-ccx gives you a full-cycle view of what Claude Code has been doing across all your projects — browse sessions, read conversations, inspect tool calls, view agent hierarchies, and get aggregated stats.
+Browse sessions, read conversations, inspect tool calls, view agent hierarchies, explore configs/plugins, and get aggregated stats — all from your terminal.
 
 ## Install
 
@@ -22,70 +22,133 @@ make install    # -> ~/.local/bin/ccx
 ## Usage
 
 ```bash
-ccx              # launch TUI
-ccx --version    # print version
+ccx                        # launch TUI
+ccx -view config           # start in config explorer
+ccx -view stats            # start in global stats
+ccx -view plugins          # start in plugin explorer
+ccx -group tree            # start with tree grouping
+ccx -preview stats         # start with stats preview open
+ccx -search "is:live"      # start filtered to live sessions
 ```
 
-The Claude data directory is resolved in this order:
-1. `--dir` flag
-2. `CLAUDE_CONFIG_DIR` environment variable
-3. `~/.claude` (default)
+### CLI Flags
 
-## Features
+| Flag | Description |
+|------|-------------|
+| `-version`, `-v` | Print version and exit |
+| `-dir PATH` | Claude data directory (default: `~/.claude`) |
+| `-view MODE` | Initial view: `sessions`, `config`, `plugins`, `stats` |
+| `-group MODE` | Initial grouping: `flat`, `proj`, `tree`, `chain`, `fork` |
+| `-preview MODE` | Initial preview: `conv`, `stats`, `mem`, `tasks` |
+| `-search QUERY` | Start with session filter applied |
+| `-tmux` | Enable tmux integration (auto-detected) |
+| `-tmux-auto-live` | Auto-enter live session in same tmux window |
+| `-worktree-dir NAME` | Worktree subdirectory name (default: `.worktree`) |
+
+The Claude data directory is resolved in order: `--dir` flag → `CLAUDE_CONFIG_DIR` env → `~/.claude`.
+
+## Views
 
 ### Session Browser
 
 Browse all Claude Code sessions across projects, sorted by recency.
 
 - **Live/Busy badges** — see which sessions are actively running
-- **Search** (`/`) — filter by project, branch, prompt, or tags (`is:live`, `is:team`, `team:name`)
-- **Search highlighting** — matched terms highlighted in session list and conversation view
-- **Group modes** (`G` to cycle):
+- **Search** (`/`) — filter by project, branch, prompt, window name, or tags
+- **Group modes** (`G` or `:group:*`):
   - **Flat** — simple list sorted by time
-  - **Project** — clustered by project path, children show branch name
+  - **Project** — clustered by project path
   - **Tree** — team hierarchy with leader/teammate nesting
+  - **Chain** — resume-chain grouping (parent → child)
+  - **Fork** — agent-fork grouping
 - **Directory filter** (`g`) — scope to a single project directory
-- **Session preview** (`Tab`) — inline conversation preview with fold/unfold
-- **Global stats** (`S`) — aggregated metrics across all sessions
+- **Preview pane** (`Tab` to cycle): conversation, stats, memory, tasks/plan, live
+- **Multi-select** (`Space`) — bulk delete, copy paths, send input
+- **Actions menu** (`x`) — delete, move, resume, copy path, worktree, kill, input, jump
+- **Command mode** (`:`) — vim-style commands with fuzzy suggestions
+
+#### Search Filters
+
+| Filter | Matches |
+|--------|---------|
+| `is:live` | Running Claude process |
+| `is:busy` | Actively responding |
+| `is:wt` | In a git worktree |
+| `is:team` | Part of a team session |
+| `is:fork` | Forked from another session |
+| `has:mem` | Has memory file |
+| `has:todo` | Has todos |
+| `has:task` | Has tasks |
+| `has:plan` | Has plan |
+| `has:agent` | Has subagents |
+| `has:compact` | Uses message compaction |
+| `has:skill` | Used skills |
+| `has:mcp` | Used MCP tools |
+| `team:NAME` | Filter by team name |
+| `win:NAME` | Filter by tmux window name |
+
+Plain text terms match against project path, name, branch, session ID, first prompt, and teammate name. Multiple terms are AND-matched.
 
 ### Conversation View
 
-Drill into any session to read the full conversation as a split-pane view.
+Drill into any session to read the full conversation.
 
-- **Message list** with role, timestamp, index range, and text preview
-- **Split-pane preview** (`Tab`/`→`) — foldable message detail on the right
-- **Full conversation** (`c`) — scrollable view of all messages concatenated
-- **Agent drill-down** (`Enter` on agent) — opens agent sub-session in the same split view, with recursive navigation
-- **Agent preview** — fold/unfold agent content blocks in the preview pane
-- **Search** (`/`) — filter messages with highlighted matches
+- **Split-pane preview** (`Tab`/`→`) — foldable message detail
+- **Block navigation** (`↑`/`↓`) — navigate text, tool calls, and results
+- **Fold/unfold** (`←`/`→`, `f`/`F`) — collapse/expand content blocks
+- **Block filter** (`/`) — filter by `is:tool`, `is:hook`, `is:error`, `tool:Name`
+- **Preview modes** (`Tab`) — cycle between text, tool, and hook views
+- **Agent drill-down** (`Enter` on agent) — recursive sub-session navigation
+- **Full conversation** (`c`) — scrollable concatenated view with copy mode
 - **Live tail** (`L`) — auto-follow active sessions in real-time
-- **Edit** (`e`) — open session file in editor
+- **Send input** (`I`) — send text to running Claude via tmux
+- **Jump to pane** (`J`) — switch to the tmux pane running the session
 
 ### Detail View
 
 Full-screen message viewer with block-level navigation.
 
-- **Block cursor** (`↑`/`↓`) — navigate between text, tool calls, and results
-- **Fold/unfold** (`←`/`→`) — collapse/expand individual blocks
-- **Bulk fold** (`f`/`F`) — fold/unfold all blocks at once
+- **Block cursor** (`↑`/`↓`) — navigate between blocks
+- **Fold/unfold** (`←`/`→`, `f`/`F`) — collapse/expand blocks
 - **Message navigation** (`n`/`N`) — step through messages
 - **Copy mode** (`v`) — select and copy text ranges
 - **Pager** (`o`) — open in external pager
 
-### Live Session Integration
+### Global Stats (`v` → `s`)
 
-- **Live modal** (`L` in session view) — real-time pane capture of active sessions
-- **Send input** (`I`) — inline prompt to send text to a running Claude Code session via tmux
-- **Jump to pane** (`J`) — switch to the tmux pane running the session
+Aggregated metrics across all sessions with detail drill-down.
 
-### Session Actions (`x` menu)
+- **Overview** — total sessions, messages, tokens, duration
+- **Tools** (`p` → `t`) — built-in tool usage with timelines
+- **MCP Tools** (`p` → `m`) — MCP tool usage with timelines
+- **Agents** (`p` → `a`) — agent type breakdown
+- **Skills** (`p` → `s`) — skill usage with error trends
+- **Commands** (`p` → `c`) — command usage with error trends
+- **Errors** (`p` → `e`) — error breakdown by category
+- **Hooks** — hook usage with timestamp analysis
 
-Press `x` to open the actions menu, then pick an action:
+### Config Explorer (`v` → `c`)
 
-- **d** — delete session
-- **m** — move session to a different project directory
-- **w** — create a git worktree from session
-- **r** — resume session in Claude Code
+Browse and manage all Claude Code configuration files.
+
+- **Category filter** (`Tab`) — global, project, local, skills, agents, commands, MCP, hooks
+- **Split preview** — file content with syntax awareness
+- **Multi-select** (`Space`) — select configs for testing
+- **Test env** (`t`) — launch isolated Claude session with only selected configs
+- **Edit** (`e` / `Enter`) — open in `$EDITOR`
+- **Actions menu** (`x`) — edit, copy path, open shell at path
+
+The test environment creates an isolated `HOME` with only selected memory/config files symlinked, preserving your editor config and extracting OAuth from keychain for connector MCP access.
+
+### Plugin Explorer (`v` → `p`)
+
+Browse installed Claude Code plugins and their components.
+
+- **Component drill-down** (`Enter`) — view plugin agents, skills, commands, hooks, MCP servers
+- **Multi-select** (`Space`) — select components for batch editing
+- **Edit** (`e`) — open component files in `$EDITOR`
+- **Actions menu** (`x`) — edit, copy path, open shell
+- **Component badges** — e.g. `[3a 2s 1c]` = 3 agents, 2 skills, 1 command
 
 ## Keybindings
 
@@ -96,32 +159,41 @@ Press `x` to open the actions menu, then pick an action:
 | `Enter` | Open conversation view |
 | `/` | Search/filter sessions |
 | `g` | Filter by project directory |
-| `G` | Cycle group mode (flat/project/tree) |
-| `Tab` | Toggle/cycle session preview |
-| `[` / `]` | Adjust split pane ratio |
-| `x` | Actions menu (delete/move/worktree/resume) |
-| `L` | Open live modal for active session |
-| `I` | Send input to live session (tmux) |
+| `G` | Cycle group mode |
+| `Tab` | Cycle preview mode |
+| `Shift+Tab` | Reverse cycle preview |
+| `→` | Open/focus preview |
+| `←` | Close/unfocus preview |
+| `[` / `]` | Adjust split ratio |
+| `Space` | Multi-select toggle |
+| `x` | Actions menu |
+| `v` | Views menu (stats/config/plugins) |
+| `:` | Command mode |
+| `L` | Live preview (tmux) |
+| `I` | Send input to live session |
 | `J` | Jump to tmux pane |
-| `R` | Manual refresh |
+| `R` | Refresh |
 | `S` | Global stats |
+| `?` | Help |
+| `q` | Quit |
 
 ### Conversation
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Open message detail / drill into agent |
-| `c` | Full conversation view (all messages) |
-| `/` | Search/filter messages |
-| `Tab` / `→` | Toggle/focus preview pane |
-| `↑` / `↓` | Navigate blocks (when preview focused) |
+| `Enter` | Open detail / drill into agent |
+| `c` | Full conversation view |
+| `/` | Filter blocks |
+| `Tab` | Cycle preview detail (text/tool/hook) |
+| `↑` / `↓` | Navigate messages/blocks |
 | `←` / `→` | Fold/unfold blocks |
-| `[` / `]` | Adjust split pane ratio |
+| `f` / `F` | Fold/unfold all |
+| `[` / `]` | Adjust split ratio |
 | `L` | Toggle live tail |
-| `R` | Manual refresh |
+| `I` | Send input |
+| `J` | Jump to pane |
 | `e` | Open in editor |
-| `I` | Send input to live session (tmux) |
-| `J` | Jump to tmux pane |
+| `R` | Refresh |
 
 ### Detail View
 
@@ -132,8 +204,29 @@ Press `x` to open the actions menu, then pick an action:
 | `f` / `F` | Fold/unfold all |
 | `n` / `N` | Next/prev message |
 | `v` | Copy mode |
-| `y` | Copy all to clipboard |
+| `y` | Copy to clipboard |
 | `o` | Open in pager |
+
+### Command Mode (`:`)
+
+| Command | Action |
+|---------|--------|
+| `group:flat` | Switch to flat grouping |
+| `group:proj` | Switch to project grouping |
+| `group:tree` | Switch to tree grouping |
+| `group:chain` | Switch to chain grouping |
+| `group:fork` | Switch to fork grouping |
+| `preview:conv` | Conversation preview |
+| `preview:stats` | Stats preview |
+| `preview:mem` | Memory preview |
+| `preview:tasks` | Tasks preview |
+| `view:stats` | Open global stats |
+| `view:config` | Open config explorer |
+| `view:plugins` | Open plugin explorer |
+| `refresh` | Refresh sessions |
+| `keymap:edit` | Edit keymap config |
+
+Short aliases: `g:flat`, `p:conv`, `v:stats`, `R`, `km:edit`.
 
 ### Global
 
@@ -142,9 +235,15 @@ Press `x` to open the actions menu, then pick an action:
 | `Esc` | Go back / close |
 | `q` | Quit |
 
+## Configuration
+
+Keymap config: `~/.config/ccx/config.yaml` (bootstrap with `:keymap:edit`)
+
 ## How It Works
 
 ccx reads Claude Code's session files from `~/.claude/projects/`. Each session is a JSONL file containing the full conversation history — user prompts, assistant responses, tool calls, and results.
+
+Session metadata is cached to `~/.claude/sessions.gob` for instant startup (~1ms). A full async scan runs in the background to pick up new sessions.
 
 The TUI is built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) and [Lip Gloss](https://github.com/charmbracelet/lipgloss).
 
@@ -152,6 +251,7 @@ The TUI is built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) a
 
 - Go 1.25+
 - Claude Code sessions in `~/.claude/projects/`
+- tmux (optional, for live session features)
 
 ## License
 

@@ -375,6 +375,7 @@ type Config struct {
 	Keymap       *Keymap // nil = use defaults
 	GroupMode    string  // initial group mode (flat|proj|tree|chain|fork)
 	PreviewMode  string  // initial preview mode (conv|stats|mem|tasks)
+	ViewMode     string  // initial view (sessions|config|plugins|stats)
 }
 
 func NewApp(sessions []session.Session, cfg Config) *App {
@@ -424,9 +425,22 @@ func NewApp(sessions []session.Session, cfg Config) *App {
 			a.sessSplit.Show = true
 		}
 	}
+	if cfg.ViewMode != "" {
+		modeMap := map[string]viewState{
+			"sessions": viewSessions, "config": viewConfig,
+			"plugins": viewPlugins, "stats": viewGlobalStats,
+		}
+		if m, ok := modeMap[cfg.ViewMode]; ok {
+			a.state = m
+		}
+	}
 
 	return a
 }
+
+// initViewMsg is sent after the first WindowSizeMsg to initialize the
+// starting view when launched with -view config/plugins/stats.
+type initViewMsg struct{}
 
 func (a *App) Init() tea.Cmd {
 	cmds := []tea.Cmd{tickCmd()}
@@ -446,10 +460,26 @@ func (a *App) Init() tea.Cmd {
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		first := a.width == 0 && a.height == 0
 		a.width = msg.Width
 		a.height = msg.Height
 		cmd := a.resizeAll()
+		// On first size, trigger deferred view init for -view flag
+		if first && a.state != viewSessions {
+			cmd = tea.Batch(cmd, func() tea.Msg { return initViewMsg{} })
+		}
 		return a, cmd
+
+	case initViewMsg:
+		switch a.state {
+		case viewConfig:
+			return a.openConfigExplorer()
+		case viewPlugins:
+			return a.openPluginExplorer()
+		case viewGlobalStats:
+			return a.openGlobalStats()
+		}
+		return a, nil
 
 	case editorDoneMsg:
 		if a.state == viewConfig {

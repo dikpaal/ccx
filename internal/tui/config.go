@@ -1442,9 +1442,11 @@ func (a *App) createDraftConfig(name string, cat session.ConfigCategory) (tea.Mo
 
 // cfgTrashEntry stores a deleted item for undo.
 type cfgTrashEntry struct {
-	origPath string // original file path
-	tmpPath  string // temp backup path
-	isDir    bool   // true for skill directories
+	origPath     string // original file path
+	tmpPath      string // temp backup path
+	isDir        bool   // true for skill directories
+	hookSettings string // settings.json path (non-empty if hook entry was removed)
+	hookBackup   []byte // original settings.json content for undo
 }
 
 // cfgDeletableCategories lists categories where files can be deleted.
@@ -1521,6 +1523,16 @@ func (a *App) executeCfgDelete() (tea.Model, tea.Cmd) {
 		if err != nil {
 			continue
 		}
+		// For hooks, also remove the entry from settings.json
+		if item.Category == session.ConfigHook && item.RefBy != "" {
+			backup, err := os.ReadFile(item.RefBy)
+			if err == nil {
+				if removeHookFromSettings(item.RefBy, item.Path, item.Group) == nil {
+					entry.hookSettings = item.RefBy
+					entry.hookBackup = backup
+				}
+			}
+		}
 		a.cfgTrash = append(a.cfgTrash, entry)
 		trashed++
 	}
@@ -1557,6 +1569,78 @@ func trashCfgItem(item session.ConfigItem) (cfgTrashEntry, error) {
 	return cfgTrashEntry{origPath: srcPath, tmpPath: tmpPath, isDir: isDir}, nil
 }
 
+// removeHookFromSettings removes a hook command referencing scriptPath
+// from the given event type in settings.json. Cleans up empty matchers/events.
+func removeHookFromSettings(settingsPath, scriptPath, eventType string) error {
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return err
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return err
+	}
+	hooksRaw, ok := obj["hooks"]
+	if !ok {
+		return fmt.Errorf("no hooks key")
+	}
+
+	type hookCmd struct {
+		Type    string `json:"type,omitempty"`
+		Command string `json:"command"`
+	}
+	type matcherEntry struct {
+		Matcher string    `json:"matcher"`
+		Hooks   []hookCmd `json:"hooks"`
+	}
+	var hooks map[string][]matcherEntry
+	if err := json.Unmarshal(hooksRaw, &hooks); err != nil {
+		return err
+	}
+
+	home, _ := os.UserHomeDir()
+	matchers := hooks[eventType]
+	changed := false
+	var kept []matcherEntry
+	for _, m := range matchers {
+		var keptHooks []hookCmd
+		for _, h := range m.Hooks {
+			resolved := session.ExtractScriptPath(h.Command, home)
+			if resolved == scriptPath {
+				changed = true
+				continue // remove this hook
+			}
+			keptHooks = append(keptHooks, h)
+		}
+		if len(keptHooks) > 0 {
+			m.Hooks = keptHooks
+			kept = append(kept, m)
+		}
+	}
+	if !changed {
+		return fmt.Errorf("hook not found in settings")
+	}
+
+	if len(kept) == 0 {
+		delete(hooks, eventType)
+	} else {
+		hooks[eventType] = kept
+	}
+
+	// Write back — preserve other top-level keys
+	if len(hooks) == 0 {
+		delete(obj, "hooks")
+	} else {
+		raw, _ := json.Marshal(hooks)
+		obj["hooks"] = raw
+	}
+	out, err := json.MarshalIndent(obj, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(settingsPath, out, 0o644)
+}
+
 func (a *App) undoCfgDelete() (tea.Model, tea.Cmd) {
 	if len(a.cfgTrash) == 0 {
 		a.copiedMsg = "Nothing to undo"
@@ -1575,6 +1659,11 @@ func (a *App) undoCfgDelete() (tea.Model, tea.Cmd) {
 	}
 	// Clean up empty temp dir
 	os.Remove(filepath.Dir(entry.tmpPath))
+
+	// Restore settings.json if hook entry was removed
+	if entry.hookSettings != "" && entry.hookBackup != nil {
+		os.WriteFile(entry.hookSettings, entry.hookBackup, 0o644)
+	}
 
 	a.refreshConfigExplorer()
 	a.copiedMsg = "Restored " + filepath.Base(entry.origPath)

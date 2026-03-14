@@ -301,7 +301,7 @@ func scanHooksFromSettings(tree *ConfigTree, settingsPath string) {
 				if cmd == "" {
 					continue
 				}
-				scriptPath := extractScriptPath(cmd, home)
+				scriptPath := ExtractScriptPath(cmd, home)
 				key := event + ":" + scriptPath
 				if scriptPath == "" || seen[key] {
 					continue
@@ -321,6 +321,7 @@ func scanHooksFromSettings(tree *ConfigTree, settingsPath string) {
 					Path:        scriptPath,
 					Description: desc,
 					Group:       event,
+					RefBy:       settingsPath,
 				}
 				if err == nil {
 					item.ModTime = info.ModTime()
@@ -332,9 +333,9 @@ func scanHooksFromSettings(tree *ConfigTree, settingsPath string) {
 	}
 }
 
-// extractScriptPath extracts the script file path from a hook command string.
+// ExtractScriptPath extracts the script file path from a hook command string.
 // Handles patterns like "python3 ~/.claude/hooks/foo.py", "uv run ~/.claude/hooks/bar.py".
-func extractScriptPath(cmd string, home string) string {
+func ExtractScriptPath(cmd string, home string) string {
 	parts := strings.Fields(cmd)
 	// Find the first argument that looks like a file path
 	for _, p := range parts {

@@ -2,270 +2,14 @@ package tui
 
 import (
 	"fmt"
-	"net/url"
-	"os"
-	"os/exec"
-	"regexp"
-	"runtime"
-	"sort"
 	"strings"
-	"sync"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/sendbird/ccx/internal/extract"
 	"github.com/sendbird/ccx/internal/session"
 )
-
-// urlItem represents a URL extracted from a session.
-type urlItem struct {
-	URL      string
-	Label    string // short display label
-	Category string // github, jira, slack, pr, other
-}
-
-// urlRegex matches http/https URLs in text.
-var urlRegex = regexp.MustCompile(`https?://[^\s<>"'\x60\x29\x5D]+`)
-
-// Package-level vars to avoid per-call allocation.
-var (
-	urlCleanReplacer = strings.NewReplacer(`\n`, "", `\t`, "", `\r`, "")
-	jsonEscReplacer  = strings.NewReplacer(`\/`, `/`, `\\`, `\`)
-	categoryOrder    = map[string]int{"pr": 0, "github": 1, "jira": 2, "slack": 3, "other": 4}
-	cachedHome       string
-	cachedHomeOnce   sync.Once
-)
-
-// extractSessionURLs loads all messages from a session file and extracts unique URLs.
-func extractSessionURLs(filePath string) []urlItem {
-	entries, err := session.LoadMessages(filePath)
-	if err != nil {
-		return nil
-	}
-	return extractEntryURLs(entries)
-}
-
-// extractEntryURLs extracts unique URLs from a set of entries.
-func extractEntryURLs(entries []session.Entry) []urlItem {
-	seen := make(map[string]bool)
-	var items []urlItem
-	for _, entry := range entries {
-		extractURLsFromBlocks(entry.Content, seen, &items)
-	}
-	sortURLItems(items)
-	return items
-}
-
-// extractBlockURLs extracts unique URLs from content blocks.
-func extractBlockURLs(blocks []session.ContentBlock) []urlItem {
-	seen := make(map[string]bool)
-	var items []urlItem
-	extractURLsFromBlocks(blocks, seen, &items)
-	sortURLItems(items)
-	return items
-}
-
-// extractURLsFromBlocks appends unique URLs from blocks to items.
-func extractURLsFromBlocks(blocks []session.ContentBlock, seen map[string]bool, items *[]urlItem) {
-	for _, block := range blocks {
-		for _, text := range [2]string{block.Text, block.ToolInput} {
-			if text == "" {
-				continue
-			}
-			for _, raw := range urlRegex.FindAllString(text, -1) {
-				u := cleanURL(raw)
-				if u == "" || seen[u] {
-					continue
-				}
-				seen[u] = true
-				*items = append(*items, categorizeURL(u))
-			}
-		}
-	}
-}
-
-func sortURLItems(items []urlItem) {
-	sort.SliceStable(items, func(i, j int) bool {
-		return categoryOrder[items[i].Category] < categoryOrder[items[j].Category]
-	})
-}
-
-// cleanURL strips JSON escape artifacts and trailing punctuation.
-func cleanURL(raw string) string {
-	// Strip literal \n, \t, \r that leak from JSON string values
-	raw = urlCleanReplacer.Replace(raw)
-	// Strip trailing backslashes (escaped newlines in JSON)
-	raw = strings.TrimRight(raw, `\`)
-	// Strip trailing punctuation that leaks from prose/markdown
-	raw = strings.TrimRight(raw, ".,;:!?)'\"")
-
-	// Validate
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		return ""
-	}
-	// Reject URLs with control chars or obviously broken hosts
-	if strings.ContainsAny(u.Host, " \t\n\\") {
-		return ""
-	}
-	return raw
-}
-
-// categorizeURL classifies a URL and generates a short label.
-func categorizeURL(u string) urlItem {
-	parsed, _ := url.Parse(u)
-	host := strings.ToLower(parsed.Host)
-
-	switch {
-	case strings.Contains(host, "github.com"):
-		label := githubLabel(parsed)
-		cat := "github"
-		if strings.Contains(parsed.Path, "/pull/") {
-			cat = "pr"
-		}
-		return urlItem{URL: u, Label: label, Category: cat}
-
-	case strings.Contains(host, "atlassian.net"):
-		label := jiraLabel(parsed)
-		return urlItem{URL: u, Label: label, Category: "jira"}
-
-	case strings.Contains(host, "slack.com"):
-		return urlItem{URL: u, Label: slackLabel(parsed), Category: "slack"}
-
-	default:
-		label := u
-		if len(label) > 80 {
-			label = label[:77] + "..."
-		}
-		return urlItem{URL: u, Label: label, Category: "other"}
-	}
-}
-
-func githubLabel(u *url.URL) string {
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(parts) >= 4 && (parts[2] == "pull" || parts[2] == "issues") {
-		return fmt.Sprintf("%s/%s#%s", parts[0], parts[1], parts[3])
-	}
-	if len(parts) >= 2 {
-		return strings.Join(parts[:2], "/")
-	}
-	return u.Path
-}
-
-func jiraLabel(u *url.URL) string {
-	path := u.Path
-	if strings.Contains(path, "/browse/") {
-		idx := strings.Index(path, "/browse/")
-		return path[idx+len("/browse/"):]
-	}
-	if len(path) > 50 {
-		return path[:47] + "..."
-	}
-	return path
-}
-
-func slackLabel(u *url.URL) string {
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(parts) >= 2 && parts[0] == "archives" {
-		return "slack#" + parts[1]
-	}
-	return "slack"
-}
-
-// openInBrowser opens a URL in the default browser.
-func openInBrowser(u string) error {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", u)
-	case "linux":
-		cmd = exec.Command("xdg-open", u)
-	default:
-		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
-	}
-	return cmd.Start()
-}
-
-// --- File path extraction ---
-
-// filePathTools maps tool names to their JSON field containing the file path.
-var filePathTools = map[string]string{
-	"Read":       "file_path",
-	"Write":      "file_path",
-	"Edit":       "file_path",
-	"Glob":       "path",
-	"Grep":       "path",
-	"LSP":        "filePath",
-	"NotebookEdit": "notebook_path",
-}
-
-// extractFilePaths extracts unique file paths from tool_use blocks.
-func extractFilePaths(blocks []session.ContentBlock) []urlItem {
-	seen := make(map[string]bool)
-	var items []urlItem
-
-	for _, block := range blocks {
-		if block.Type != "tool_use" || block.ToolInput == "" {
-			continue
-		}
-		field, ok := filePathTools[block.ToolName]
-		if !ok {
-			continue
-		}
-		path := extractJSONField(block.ToolInput, field)
-		if path == "" || seen[path] {
-			continue
-		}
-		seen[path] = true
-		items = append(items, urlItem{
-			URL:      path,
-			Label:    shortenPath(path),
-			Category: block.ToolName,
-		})
-	}
-	return items
-}
-
-// extractSessionFilePaths loads messages and extracts file paths.
-func extractSessionFilePaths(filePath string) []urlItem {
-	entries, err := session.LoadMessages(filePath)
-	if err != nil {
-		return nil
-	}
-	var blocks []session.ContentBlock
-	for _, entry := range entries {
-		blocks = append(blocks, entry.Content...)
-	}
-	return extractFilePaths(blocks)
-}
-
-// extractJSONField extracts a string field value from a JSON string.
-// Handles both "field":"value" and "field": "value" (with optional space).
-func extractJSONField(jsonStr, field string) string {
-	needle := `"` + field + `":`
-	idx := strings.Index(jsonStr, needle)
-	if idx < 0 {
-		return ""
-	}
-	rest := jsonStr[idx+len(needle):]
-	// Skip optional whitespace between : and opening quote
-	rest = strings.TrimLeft(rest, " \t")
-	if len(rest) == 0 || rest[0] != '"' {
-		return ""
-	}
-	rest = rest[1:] // skip opening quote
-	end := strings.Index(rest, `"`)
-	if end < 0 {
-		return ""
-	}
-	return jsonEscReplacer.Replace(rest[:end])
-}
-
-// shortenPath creates a display label from a file path.
-func shortenPath(path string) string {
-	cachedHomeOnce.Do(func() { cachedHome, _ = os.UserHomeDir() })
-	return session.ShortenPath(path, cachedHome)
-}
 
 // --- Conversation/message-full actions menu ---
 
@@ -306,30 +50,30 @@ func renderConvActionsHintBox() string {
 
 // openConvURLMenu opens the URL menu scoped to the conversation context.
 func (a *App) openConvURLMenu() (tea.Model, tea.Cmd) {
-	return a.openScopedMenu(extractBlockURLs, extractSessionURLs, "")
+	return a.openScopedMenu(extract.BlockURLs, extract.SessionURLs, "")
 }
 
 // openMsgFullURLMenu opens the URL menu scoped to the message-full context.
 func (a *App) openMsgFullURLMenu() (tea.Model, tea.Cmd) {
-	return a.openScopedMenu(extractBlockURLs, extractSessionURLs, "")
+	return a.openScopedMenu(extract.BlockURLs, extract.SessionURLs, "")
 }
 
 // openConvFilesMenu opens the file paths menu scoped by conversation context.
 func (a *App) openConvFilesMenu() (tea.Model, tea.Cmd) {
-	return a.openScopedMenu(extractFilePaths, extractSessionFilePaths, "files")
+	return a.openScopedMenu(extract.BlockFilePaths, extract.SessionFilePaths, "files")
 }
 
 // openMsgFullFilesMenu opens the file paths menu scoped by message-full context.
 func (a *App) openMsgFullFilesMenu() (tea.Model, tea.Cmd) {
-	return a.openScopedMenu(extractFilePaths, extractSessionFilePaths, "files")
+	return a.openScopedMenu(extract.BlockFilePaths, extract.SessionFilePaths, "files")
 }
 
 // openScopedMenu tries progressively wider scopes to extract items.
 // blockFn extracts from content blocks, sessionFn from a file path.
 // suffix is appended to scope labels (e.g. "files" → "message files").
 func (a *App) openScopedMenu(
-	blockFn func([]session.ContentBlock) []urlItem,
-	sessionFn func(string) []urlItem,
+	blockFn func([]session.ContentBlock) []extract.Item,
+	sessionFn func(string) []extract.Item,
 	suffix string,
 ) (tea.Model, tea.Cmd) {
 	scopeLabel := func(base string) string {
@@ -372,7 +116,7 @@ func (a *App) openScopedMenu(
 }
 
 // openURLMenuFromItems opens the URL menu with pre-extracted items and a scope label.
-func (a *App) openURLMenuFromItems(items []urlItem, scope string) (tea.Model, tea.Cmd) {
+func (a *App) openURLMenuFromItems(items []extract.Item, scope string) (tea.Model, tea.Cmd) {
 	if len(items) == 0 {
 		if strings.Contains(scope, "files") {
 			a.copiedMsg = "No files found"
@@ -478,7 +222,7 @@ func (a *App) handleURLMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		opened := 0
 		for _, u := range urls {
-			if err := openInBrowser(u); err == nil {
+			if err := extract.OpenInBrowser(u); err == nil {
 				opened++
 			}
 		}
@@ -529,7 +273,7 @@ func (a *App) filterURLItems() {
 		return
 	}
 	terms := strings.Fields(term)
-	var filtered []urlItem
+	var filtered []extract.Item
 	for _, item := range a.urlAllItems {
 		text := strings.ToLower(item.URL + " " + item.Label + " " + item.Category)
 		match := true

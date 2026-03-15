@@ -14,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/sendbird/ccx/internal/session"
+	"github.com/sendbird/ccx/internal/tmux"
 )
 
 // --- Config list item ---
@@ -789,14 +790,14 @@ func extractRelConfigPath(path, claudeDir string) string {
 
 // buildTestConfigDir creates a temp directory with symlinks to selected config files
 // in the correct structure for Claude Code to discover them.
-func buildConfigTestEnv(items []session.ConfigItem) (*isolatedEnv, error) {
+func buildConfigTestEnv(items []session.ConfigItem) (*tmux.IsolatedEnv, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("home dir: %w", err)
 	}
 	claudeDir := filepath.Join(home, ".claude")
 
-	env, err := newIsolatedEnv("ccx-cfgtest-")
+	env, err := tmux.NewIsolatedEnv("ccx-cfgtest-")
 	if err != nil {
 		return nil, err
 	}
@@ -872,7 +873,7 @@ func buildConfigTestEnv(items []session.ConfigItem) (*isolatedEnv, error) {
 }
 
 // ensureTestMemory handles memory file discovery in the test env.
-func ensureTestMemory(env *isolatedEnv, items []session.ConfigItem, claudeDir string) {
+func ensureTestMemory(env *tmux.IsolatedEnv, items []session.ConfigItem, claudeDir string) {
 	rootCLAUDE := filepath.Join(claudeDir, "CLAUDE.md")
 	claudeMdDst := filepath.Join(env.ConfigDir, "CLAUDE.md")
 
@@ -972,7 +973,7 @@ func (a *App) launchConfigTest() (tea.Model, tea.Cmd) {
 		a.copiedMsg = "No configs selected (space to select)"
 		return a, nil
 	}
-	if !inTmux() {
+	if !tmux.InTmux() {
 		a.copiedMsg = "Requires tmux"
 		return a, nil
 	}

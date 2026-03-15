@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sendbird/ccx/internal/session"
+	"github.com/sendbird/ccx/internal/tmux"
 	"github.com/sendbird/ccx/internal/tui"
 )
 
@@ -79,7 +80,7 @@ func main() {
 	// Full scan happens asynchronously inside the TUI.
 	initialSessions := session.LoadCachedSessions(claudeDir)
 	if len(initialSessions) == 0 {
-		livePaths := tui.DetectLiveProjectPaths()
+		livePaths := tmux.DetectLiveProjectPaths()
 		initialSessions, _ = session.ScanSessionsForPaths(claudeDir, livePaths)
 	}
 

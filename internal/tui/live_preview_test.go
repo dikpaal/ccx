@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sendbird/ccx/internal/session"
+	"github.com/sendbird/ccx/internal/tmux"
 )
 
 func newTestApp(sessions []session.Session) *App {
@@ -217,9 +218,9 @@ func TestTeaKeyToTmux(t *testing.T) {
 		{"unknown-key", "", false},
 	}
 	for _, tt := range tests {
-		key, literal := teaKeyToTmux(tt.input)
+		key, literal := tmux.TeaKeyToTmux(tt.input)
 		if key != tt.tmuxKey || literal != tt.literal {
-			t.Errorf("teaKeyToTmux(%q) = (%q, %v), want (%q, %v)", tt.input, key, literal, tt.tmuxKey, tt.literal)
+			t.Errorf("tmux.TeaKeyToTmux(%q) = (%q, %v), want (%q, %v)", tt.input, key, literal, tt.tmuxKey, tt.literal)
 		}
 	}
 }

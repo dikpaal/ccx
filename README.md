@@ -11,13 +11,13 @@ Browse sessions, read conversations, inspect tool calls, view agent hierarchies,
 ## Install
 
 ```bash
-go install github.com/keyolk/ccx@latest
+go install github.com/sendbird/ccx@latest
 ```
 
 Or build from source:
 
 ```bash
-git clone https://github.com/keyolk/ccx.git
+git clone https://github.com/sendbird/ccx.git
 cd ccx
 make build      # -> bin/ccx
 make install    # -> ~/.local/bin/ccx

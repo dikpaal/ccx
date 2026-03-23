@@ -198,16 +198,17 @@ func (a *App) renderSearchView() string {
 
 	// Title and input
 	sb.WriteString("\n")
-	sb.WriteString(titleStyle.Render("  SEARCH SESSIONS") + "\n")
+	sb.WriteString("  " + titleStyle.Render("SEARCH SESSIONS") + "\n")
 	sb.WriteString("  " + ruler + "\n\n")
 
 	inputStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("240")).
 		Padding(0, 1).
-		Width(min(a.width-6, 60))
+		Width(min(a.width-6, 60)).
+		MarginLeft(2)
 
-	sb.WriteString("  " + inputStyle.Render(a.searchInput.View()) + "\n\n")
+	sb.WriteString(inputStyle.Render(a.searchInput.View()) + "\n\n")
 
 	if a.searchLoading {
 		sb.WriteString("  " + dimStyle.Render("Searching...") + "\n")

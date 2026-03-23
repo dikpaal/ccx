@@ -179,11 +179,11 @@ func (a *App) renderSearchView() string {
 	titleStyle := statTitleStyle
 	ruler := dimStyle.Render(strings.Repeat("─", min(a.width-4, 60)))
 
+	// Title and input
 	sb.WriteString("\n")
 	sb.WriteString(titleStyle.Render("  SEARCH SESSIONS") + "\n")
 	sb.WriteString("  " + ruler + "\n\n")
 
-	// Search input
 	inputStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("240")).
@@ -226,11 +226,28 @@ func (a *App) renderSearchView() string {
 		sb.WriteString("\n")
 		sb.WriteString("  " + titleStyle.Render("Filters") + "\n")
 		sb.WriteString("  " + ruler + "\n")
-		sb.WriteString(fmt.Sprintf("  %s  %s\n", keyStyle.Render("tool:Edit      "), descStyle.Render("only Edit tool calls")))
-		sb.WriteString(fmt.Sprintf("  %s  %s\n", keyStyle.Render("tool:Bash      "), descStyle.Render("only Bash tool calls")))
 		sb.WriteString(fmt.Sprintf("  %s  %s\n", keyStyle.Render("user:          "), descStyle.Render("only user messages")))
 		sb.WriteString(fmt.Sprintf("  %s  %s\n", keyStyle.Render("assistant:     "), descStyle.Render("only assistant responses")))
 	}
+
+	// Help line at bottom
+	var help string
+	if a.searchInput.Focused() {
+		help = "  enter:search  esc:close"
+	} else if len(a.searchResults) > 0 {
+		help = "  ↑↓/jk:nav  enter:open  /:edit  esc:close"
+	} else {
+		help = "  esc:close"
+	}
+
+	// Add padding to push help to bottom
+	contentHeight := strings.Count(sb.String(), "\n")
+	neededPadding := a.height - contentHeight - 2
+	if neededPadding > 0 {
+		sb.WriteString(strings.Repeat("\n", neededPadding))
+	}
+
+	sb.WriteString("\n" + dimStyle.Render(help))
 
 	return sb.String()
 }

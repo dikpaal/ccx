@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sendbird/ccx/internal/session"
+	"github.com/keyolk/ccx/internal/session"
 )
 
 // --- filterSideQuestionContext ---

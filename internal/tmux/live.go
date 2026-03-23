@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sendbird/ccx/internal/session"
+	"github.com/keyolk/ccx/internal/session"
 )
 
 // MarkLiveSessions sets IsLive and IsResponding on sessions by matching

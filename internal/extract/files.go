@@ -1,7 +1,7 @@
 package extract
 
 import (
-	"github.com/sendbird/ccx/internal/session"
+	"github.com/keyolk/ccx/internal/session"
 )
 
 // FilePathTools maps tool names to their JSON field containing the file path.

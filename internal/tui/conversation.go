@@ -3,6 +3,7 @@ package tui
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -11,17 +12,21 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/sendbird/ccx/internal/session"
+	"github.com/keyolk/ccx/internal/session"
 )
 
 var debugLog *log.Logger
 
 func init() {
-	f, err := os.OpenFile("/tmp/ccx-debug.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		debugLog = log.New(os.Stderr, "", 0)
+	if os.Getenv("CCX_DEBUG") != "" {
+		f, err := os.OpenFile("/tmp/ccx-debug.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			debugLog = log.New(os.Stderr, "ccx: ", log.Ltime|log.Lmicroseconds)
+		} else {
+			debugLog = log.New(f, "", log.Ltime|log.Lmicroseconds)
+		}
 	} else {
-		debugLog = log.New(f, "", log.Ltime|log.Lmicroseconds)
+		debugLog = log.New(io.Discard, "", 0)
 	}
 }
 

@@ -4,16 +4,42 @@ A terminal UI for browsing, inspecting, and managing [Claude Code](https://docs.
 
 Browse sessions, read conversations, inspect tool calls, view agent hierarchies, explore configs/plugins, and get aggregated stats — all from your terminal.
 
+## Demo
+
+**Session browsing** — navigate sessions, preview conversations, cycle group modes
+
+![Session browsing](docs/gifs/01-browse.gif)
+
+**Conversation drill-down** — fold/unfold tool blocks, switch preview modes
+
+![Conversation](docs/gifs/02-conversation.gif)
+
+**Command mode** — vim-style `:` commands with context-aware suggestions
+
+![Command mode](docs/gifs/03-command.gif)
+
+**Views tour** — stats, config explorer, plugin browser
+
+![Views](docs/gifs/04-views.gif)
+
+**URL and file extraction** — search, multi-select, open in browser/editor
+
+![Actions](docs/gifs/05-actions.gif)
+
+**Config/plugin sandbox** — select configs and test in isolated Claude session
+
+![Sandbox](docs/gifs/06-sandbox.gif)
+
 ## Install
 
 ```bash
-go install github.com/sendbird/ccx@latest
+go install github.com/keyolk/ccx@latest
 ```
 
 Or build from source:
 
 ```bash
-git clone https://github.com/sendbird/ccx.git
+git clone https://github.com/keyolk/ccx.git
 cd ccx
 make build      # -> bin/ccx
 make install    # -> ~/.local/bin/ccx
@@ -221,7 +247,7 @@ Multi-select plugin components and press `t` to launch an isolated Claude sessio
 | `←` | Close/unfocus preview |
 | `[` / `]` | Adjust split ratio |
 | `Space` | Multi-select toggle |
-| `x` | Actions menu |
+| `x` | Actions menu (delete, move, resume, URLs, files, ...) |
 | `v` | Views menu (stats/config/plugins) |
 | `:` | Command mode |
 | `L` | Live preview (tmux) |
@@ -247,7 +273,9 @@ Multi-select plugin components and press `t` to launch an isolated Claude sessio
 | `L` | Toggle live tail |
 | `I` | Send input |
 | `J` | Jump to pane |
-| `e` | Open in editor |
+| `x` | Actions menu (URLs, files) |
+| `e` | Edit menu (session/agent JSONL, text export) |
+| `u` | URL extraction (scoped to message/session) |
 | `R` | Refresh |
 | `Esc` | Back to sessions / close preview |
 
@@ -261,28 +289,37 @@ Multi-select plugin components and press `t` to launch an isolated Claude sessio
 | `n` / `N` | Next/prev message |
 | `v` | Copy mode |
 | `y` | Copy to clipboard |
+| `x` | Actions menu (URLs, files) |
 | `o` | Open in pager |
 
 ### Command Mode (`:`)
 
-| Command | Action |
-|---------|--------|
-| `group:flat` | Switch to flat grouping |
-| `group:proj` | Switch to project grouping |
-| `group:tree` | Switch to tree grouping |
-| `group:chain` | Switch to chain grouping |
-| `group:fork` | Switch to fork grouping |
-| `preview:conv` | Conversation preview |
-| `preview:stats` | Stats preview |
-| `preview:mem` | Memory preview |
-| `preview:tasks` | Tasks preview |
-| `view:stats` | Open global stats |
-| `view:config` | Open config explorer |
-| `view:plugins` | Open plugin explorer |
-| `refresh` | Refresh sessions |
-| `keymap:edit` | Edit keymap config |
+Available from any view. Suggestions are context-aware — only relevant commands appear.
 
-Short aliases: `g:flat`, `p:conv`, `v:stats`, `R`, `km:edit`.
+| Command | View | Action |
+|---------|------|--------|
+| `view:sessions` | All | Switch to session browser |
+| `view:stats` | All | Open global stats |
+| `view:stats:tools` | All | Stats → tools detail |
+| `view:config` | All | Open config explorer |
+| `view:config:hooks` | All | Config → hooks filter |
+| `view:plugins` | All | Open plugin explorer |
+| `group:flat\|proj\|tree\|chain\|fork` | Sessions | Change grouping mode |
+| `preview:conv\|stats\|mem\|tasks\|live` | Sessions | Change preview mode |
+| `set:ratio N` | Sessions | Set split pane ratio (15-85) |
+| `page:memory\|hooks\|mcp\|skills\|...` | Config | Filter config category |
+| `page:tools\|errors\|overview` | Stats | Switch stats page |
+| `refresh` | Sessions | Reload sessions |
+| `keymap:edit` | All | Edit keymap config |
+
+Short aliases: `g:flat`, `v:stats`, `p:hooks`, `km:edit`. Multi-command: `view:config page:hooks`.
+
+### Conversation / Detail
+
+| Key | Action |
+|-----|--------|
+| `x` | Actions menu (URLs, files) |
+| `e` | Edit menu (session, agent, text export) |
 
 ### Global
 
@@ -310,6 +347,22 @@ make clean      # remove build artifacts
 ```
 
 Version is injected via `-ldflags` from `git describe --tags --always --dirty`.
+
+### Debug
+
+```bash
+CCX_DEBUG=1 ccx    # enables debug logging to /tmp/ccx-debug.log
+```
+
+### Recording Demo GIFs
+
+```bash
+# Prerequisites: brew install asciinema agg
+./docs/record-demos.sh all       # record all 6 demos
+./docs/record-demos.sh browse    # record just one
+```
+
+Uses tmux + asciinema + agg for fully automated terminal recording.
 
 ### Testing
 
@@ -377,4 +430,4 @@ The TUI is built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) a
 
 ## License
 
-MIT
+Apache License 2.0

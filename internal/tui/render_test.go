@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sendbird/ccx/internal/session"
+	"github.com/keyolk/ccx/internal/session"
 )
 
 // updateGolden returns true if golden files should be regenerated.

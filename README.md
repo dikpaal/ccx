@@ -93,6 +93,33 @@ Browse all Claude Code sessions across projects, sorted by recency.
 
 Plain text terms match against project path, name, branch, session ID, first prompt, and teammate name. Multiple terms are AND-matched.
 
+### Cross-Session Search
+
+Search inside conversation content across all sessions (`Ctrl+S` or `:search`).
+
+**Search syntax:**
+- `word1 word2` — AND match (all terms must appear)
+- `"exact phrase"` — Exact phrase matching
+- `-exclude` — Exclude terms from results
+- `user:` — Only search user messages
+- `assistant:` — Only search assistant responses
+- `tool:ToolName` — Only search specific tool calls
+
+**Features:**
+- Searches text, tool inputs/outputs, thinking blocks
+- Results stream in real-time as they're found
+- Matched terms are highlighted in snippets
+- Press `Enter` to jump directly to the matching message
+- Press `/` to edit the query
+
+**Example queries:**
+```
+database migration                    # Find both terms
+"how do I" API                        # Phrase + term
+user: error -test                     # User messages with "error", excluding "test"
+assistant: "I recommend" -deprecated  # Complex combination
+```
+
 ### Conversation View
 
 Drill into any session to read the full conversation.
@@ -228,6 +255,7 @@ Multi-select plugin components and press `t` to launch an isolated Claude sessio
 | `x` | Actions menu (delete, move, resume, URLs, files, ...) |
 | `v` | Views menu (stats/config/plugins) |
 | `:` | Command mode |
+| `Ctrl+S` | Cross-session search |
 | `L` | Live preview (tmux) |
 | `I` | Send input to live session |
 | `J` | Jump to tmux pane |
@@ -288,6 +316,7 @@ Available from any view. Suggestions are context-aware — only relevant command
 | `page:memory\|hooks\|mcp\|skills\|...` | Config | Filter config category |
 | `page:tools\|errors\|overview` | Stats | Switch stats page |
 | `refresh` | Sessions | Reload sessions |
+| `search` | All | Cross-session content search |
 | `keymap:edit` | All | Edit keymap config |
 
 Short aliases: `g:flat`, `v:stats`, `p:hooks`, `km:edit`. Multi-command: `view:config page:hooks`.

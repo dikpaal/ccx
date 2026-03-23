@@ -112,7 +112,7 @@ func SearchSessions(sessions []*Session, query SearchQuery, ctx context.Context)
 		}
 
 		var wg sync.WaitGroup
-		sem := make(chan struct{}, 50) // max 50 concurrent file scans
+		sem := make(chan struct{}, 20) // max 20 concurrent file scans
 
 		for _, sess := range sessions {
 			select {

@@ -155,9 +155,16 @@ func renderConversationPreview(msgs []mergedMsg, width, cursor int, expanded map
 		if filterTerm != "" && availW > 0 && preview != "" {
 			styledPreview = highlightSnippet(preview, filterTerm, availW, pStyle)
 		} else {
-			if availW > 3 && len(preview) > availW {
-				preview = preview[:availW-3] + "..."
-			} else if availW <= 3 {
+			if availW > 0 && len(preview) > availW {
+				// Wrap full text across multiple lines
+				wrapped := wrapText(preview, availW)
+				wrapLines := strings.Split(wrapped, "\n")
+				styledPreview = pStyle.Render(wrapLines[0])
+				pad := strings.Repeat(" ", prefixW)
+				for _, wl := range wrapLines[1:] {
+					styledPreview += "\n" + pad + pStyle.Render(wl)
+				}
+			} else if availW <= 0 {
 				preview = ""
 			}
 			styledPreview = pStyle.Render(preview)
@@ -193,6 +200,29 @@ func entryFullText(e session.Entry) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+// entryFilterText returns a searchable string for filtering conversation items.
+// Includes text content, tool names, and role for comprehensive matching.
+func entryFilterText(e session.Entry) string {
+	var parts []string
+	parts = append(parts, e.Role)
+	for _, b := range e.Content {
+		switch b.Type {
+		case "text":
+			text := strings.TrimSpace(session.StripXMLTags(b.Text))
+			if text != "" {
+				parts = append(parts, text)
+			}
+		case "tool_use":
+			parts = append(parts, b.ToolName, "tool:"+b.ToolName)
+		case "tool_result":
+			if b.IsError {
+				parts = append(parts, "is:error")
+			}
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // isAutoCompacted returns true if the entry is a context auto-compaction summary.
@@ -487,20 +517,30 @@ func renderFullMessageImpl(e session.Entry, width int, folds foldSet, formats fo
 				buf.WriteString(renderHookBadges(block.Hooks))
 			}
 			if folded {
-				summary := session.StripXMLTags(stripANSI(block.ToolInput))
-				if len(summary) > 60 {
-					summary = summary[:57] + "..."
+				// Use diff-aware folded summaries for Edit/Write
+				if summary := toolFoldedSummary(block); summary != "" {
+					buf.WriteString("  " + summary + "\n")
+				} else {
+					summary := session.StripXMLTags(stripANSI(block.ToolInput))
+					if len(summary) > 60 {
+						summary = summary[:57] + "..."
+					}
+					buf.WriteString("  " + dimStyle.Render(summary) + "\n")
 				}
-				buf.WriteString("  " + dimStyle.Render(summary) + "\n")
 			} else {
 				buf.WriteString("\n")
 				if block.ToolInput != "" {
-					input := session.StripXMLTags(stripANSI(block.ToolInput))
-					if formatted {
-						input = tryFormatJSON(input)
+					// Use diff rendering for Edit/Write tools
+					if diffOut := toolDiffOutput(block, w); diffOut != "" {
+						buf.WriteString(diffOut)
+					} else {
+						input := session.StripXMLTags(stripANSI(block.ToolInput))
+						if formatted {
+							input = tryFormatJSON(input)
+						}
+						wrapped := wrapText(input, w)
+						buf.WriteString(dimStyle.Render(wrapped) + "\n")
 					}
-					wrapped := wrapText(input, w)
-					buf.WriteString(dimStyle.Render(wrapped) + "\n")
 				}
 				// Show hook details when unfolded (unless hidden)
 				if len(block.Hooks) > 0 && !opts.hideHooks {

@@ -10,20 +10,23 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 	"github.com/sendbird/ccx/internal/session"
 )
 
 // Group mode constants
 const (
-	groupFlat    = 0
-	groupProject = 1
-	groupTree    = 2
-	groupChain   = 3
-	groupFork    = 4
+	groupFlat        = 0
+	groupProject     = 1
+	groupTree        = 2
+	groupChain       = 3
+	groupFork        = 4
+	groupBaseProject = 5
+	numGroupModes    = 6
 )
 
 // buildGroupedItems returns list items for the given group mode.
-func buildGroupedItems(sessions []session.Session, groupMode int) []list.Item {
+func buildGroupedItems(sessions []session.Session, groupMode int, worktreeDir ...string) []list.Item {
 	switch groupMode {
 	case groupProject:
 		return buildProjectGroupItems(sessions)
@@ -33,6 +36,8 @@ func buildGroupedItems(sessions []session.Session, groupMode int) []list.Item {
 		return buildChainGroupItems(sessions)
 	case groupFork:
 		return buildForkGroupItems(sessions)
+	case groupBaseProject:
+		return buildBaseProjectGroupItems(sessions, worktreeDir...)
 	default:
 		items := make([]list.Item, len(sessions))
 		for i, s := range sessions {
@@ -91,6 +96,9 @@ func (s sessionItem) FilterValue() string {
 		s.sess.ShortID,
 		s.sess.FirstPrompt,
 	}
+	if s.sess.ProjectName != "" {
+		parts = append(parts, "proj:"+s.sess.ProjectName)
+	}
 	if s.sess.TmuxWindowName != "" {
 		parts = append(parts, "win:"+s.sess.TmuxWindowName, s.sess.TmuxWindowName)
 	}
@@ -140,13 +148,17 @@ func (s sessionItem) FilterValue() string {
 	for _, badge := range s.sess.CustomBadges {
 		parts = append(parts, "tag:"+badge, badge)
 	}
+	if s.sess.IsRemote {
+		parts = append(parts, "is:remote", "remote", s.sess.RemotePodName, s.sess.RemoteStatus)
+	}
 	return strings.Join(parts, " ")
 }
 
 type sessionDelegate struct {
-	timeW       int             // max width of time-ago column
-	msgW        int             // max width of message count column
-	selectedSet map[string]bool // shared reference to App.selectedSet
+	timeW        int             // max width of time-ago column
+	msgW         int             // max width of message count column
+	selectedSet  map[string]bool // shared reference to App.selectedSet
+	hiddenBadges map[string]bool // shared reference to App.hiddenBadges
 }
 
 func (d sessionDelegate) Height() int                             { return 2 }
@@ -214,7 +226,8 @@ func (d sessionDelegate) Render(w io.Writer, m list.Model, index int, item list.
 	// Build badges first to know their width
 	badges := ""
 	badgesW := 0
-	if s.IsLive {
+	hide := d.hiddenBadges
+	if s.IsLive && !hide["LIVE"] {
 		if s.IsResponding {
 			badges += " " + busyBadge.Render("[BUSY]")
 		} else {
@@ -222,43 +235,43 @@ func (d sessionDelegate) Render(w io.Writer, m list.Model, index int, item list.
 		}
 		badgesW += 7
 	}
-	if s.HasMemory {
+	if s.HasMemory && !hide["M"] {
 		badges += " " + memoryBadge.Render("[M]")
 		badgesW += 4
 	}
-	if s.IsWorktree {
+	if s.IsWorktree && !hide["W"] {
 		badges += " " + worktreeBadge.Render("[W]")
 		badgesW += 4
 	}
-	if s.HasTodos {
+	if s.HasTodos && !hide["T"] {
 		badges += " " + todoBadge.Render("[T]")
 		badgesW += 4
 	}
-	if s.HasTasks {
+	if s.HasTasks && !hide["K"] {
 		badges += " " + taskBadge.Render("[K]")
 		badgesW += 4
 	}
-	if s.HasPlan {
+	if s.HasPlan && !hide["P"] {
 		badges += " " + planBadge.Render("[P]")
 		badgesW += 4
 	}
-	if s.HasAgents {
+	if s.HasAgents && !hide["A"] {
 		badges += " " + agentBadgeStyle.Render("[A]")
 		badgesW += 4
 	}
-	if s.HasCompaction {
+	if s.HasCompaction && !hide["C"] {
 		badges += " " + compactBadgeStyle.Render("[C]")
 		badgesW += 4
 	}
-	if s.HasSkills {
+	if s.HasSkills && !hide["S"] {
 		badges += " " + todoBadge.Render("[S]")
 		badgesW += 4
 	}
-	if s.HasMCP {
+	if s.HasMCP && !hide["X"] {
 		badges += " " + mcpBadgeStyle.Render("[X]")
 		badgesW += 4
 	}
-	if s.ParentSessionID != "" {
+	if s.ParentSessionID != "" && !hide["F"] {
 		badges += " " + forkBadge.Render("[F]")
 		badgesW += 4
 	}
@@ -267,6 +280,11 @@ func (d sessionDelegate) Render(w io.Writer, m list.Model, index int, item list.
 		badgeText := "[" + badge + "]"
 		badges += " " + customBadgeStyle.Render(badgeText)
 		badgesW += len(badgeText) + 1
+	}
+	if s.IsRemote {
+		remoteBadge := lipgloss.NewStyle().Foreground(lipgloss.Color("#7C3AED")).Bold(true)
+		badges += " " + remoteBadge.Render("[R·exp]")
+		badgesW += 8
 	}
 
 	// Calculate available width for project column
@@ -367,23 +385,95 @@ func computeSessionColWidths(sessions []session.Session) (timeW, msgW int) {
 	return
 }
 
-func newSessionList(sessions []session.Session, width, height int, groupMode int, selectedSet map[string]bool) list.Model {
-	items := buildGroupedItems(sessions, groupMode)
+func newSessionList(sessions []session.Session, width, height int, groupMode int, selectedSet map[string]bool, hiddenBadges map[string]bool, worktreeDir ...string) list.Model {
+	items := buildGroupedItems(sessions, groupMode, worktreeDir...)
 
 	timeW, msgW := computeSessionColWidths(sessions)
 
-	l := list.New(items, sessionDelegate{timeW: timeW, msgW: msgW, selectedSet: selectedSet}, width, height)
+	l := list.New(items, sessionDelegate{timeW: timeW, msgW: msgW, selectedSet: selectedSet, hiddenBadges: hiddenBadges}, width, height)
 	l.SetShowTitle(false)
 	l.SetShowStatusBar(false)
 	l.SetShowFilter(false)
 	l.SetShowPagination(false)
 	l.SetFilteringEnabled(true)
 	l.SetShowHelp(false)
-	l.Filter = substringFilter
+
+	// Use chain-aware filter for grouped modes so children stay visible
+	// when their parent matches (and vice versa).
+	if groupMode == groupChain || groupMode == groupFork || groupMode == groupTree || groupMode == groupBaseProject {
+		l.Filter = buildChainAwareFilter(items)
+	} else {
+		l.Filter = substringFilter
+	}
+
 	l.DisableQuitKeybindings()
 	configureListSearch(&l)
 	l.SetSize(width, height) // re-compute pagination after hiding bars
 	return l
+}
+
+// buildChainAwareFilter returns a filter function that preserves parent-child
+// relationships. When a depth=0 parent matches, all its depth=1 children stay
+// visible. When a depth=1 child matches, its parent also stays visible.
+func buildChainAwareFilter(items []list.Item) list.FilterFunc {
+	// Pre-compute parent-child relationships.
+	parentOf := make(map[int]int)   // child index → parent index
+	childrenOf := make(map[int][]int) // parent index → child indices
+	lastParent := -1
+	for i, item := range items {
+		si, ok := item.(sessionItem)
+		if !ok {
+			continue
+		}
+		if si.treeDepth == 0 {
+			lastParent = i
+		} else if lastParent >= 0 {
+			parentOf[i] = lastParent
+			childrenOf[lastParent] = append(childrenOf[lastParent], i)
+		}
+	}
+
+	return func(term string, targets []string) []list.Rank {
+		// Run normal substring match on all items.
+		baseRanks := substringFilter(term, targets)
+		if len(baseRanks) == 0 {
+			return baseRanks
+		}
+
+		matchSet := make(map[int]list.Rank, len(baseRanks))
+		for _, r := range baseRanks {
+			matchSet[r.Index] = r
+		}
+
+		// Expand: parent match includes children; child match includes parent.
+		expanded := make(map[int]bool)
+		for idx := range matchSet {
+			expanded[idx] = true
+			// If this is a parent, include all children
+			for _, childIdx := range childrenOf[idx] {
+				expanded[childIdx] = true
+			}
+			// If this is a child, include parent
+			if pIdx, ok := parentOf[idx]; ok {
+				expanded[pIdx] = true
+			}
+		}
+
+		// Build result preserving original order.
+		var result []list.Rank
+		for i := range items {
+			if !expanded[i] {
+				continue
+			}
+			if r, ok := matchSet[i]; ok {
+				result = append(result, r)
+			} else {
+				// Included by relationship, no highlight
+				result = append(result, list.Rank{Index: i})
+			}
+		}
+		return result
+	}
 }
 
 // buildTreeItems groups sessions by team, placing leaders at depth=0 and
@@ -751,6 +841,72 @@ func buildProjectGroupItems(sessions []session.Session) []list.Item {
 	return items
 }
 
+// buildBaseProjectGroupItems groups sessions by base repository, resolving
+// worktrees to their main repo using git info (.git file) or path patterns.
+// Sessions from the same base repo (main + worktrees) appear under one group.
+func buildBaseProjectGroupItems(sessions []session.Session, worktreeDirs ...string) []list.Item {
+	type baseGroup struct {
+		basePath string
+		sessions []session.Session
+		bestTime time.Time
+	}
+
+	groups := make(map[string]*baseGroup)
+	for i := range sessions {
+		s := &sessions[i]
+		basePath := session.ResolveBaseRepo(s.ProjectPath, worktreeDirs...)
+		g, ok := groups[basePath]
+		if !ok {
+			g = &baseGroup{basePath: basePath}
+			groups[basePath] = g
+		}
+		g.sessions = append(g.sessions, *s)
+		if s.ModTime.After(g.bestTime) {
+			g.bestTime = s.ModTime
+		}
+	}
+
+	// Sort each group: main-repo sessions first, then worktrees, both by ModTime desc
+	for _, g := range groups {
+		sort.Slice(g.sessions, func(i, j int) bool {
+			iIsWT := g.sessions[i].IsWorktree || g.sessions[i].ProjectPath != g.basePath
+			jIsWT := g.sessions[j].IsWorktree || g.sessions[j].ProjectPath != g.basePath
+			if iIsWT != jIsWT {
+				return !iIsWT // main repo sessions first
+			}
+			return g.sessions[i].ModTime.After(g.sessions[j].ModTime)
+		})
+	}
+
+	// Sort groups by bestTime desc
+	groupList := make([]*baseGroup, 0, len(groups))
+	for _, g := range groups {
+		groupList = append(groupList, g)
+	}
+	sort.Slice(groupList, func(i, j int) bool {
+		return groupList[i].bestTime.After(groupList[j].bestTime)
+	})
+
+	var items []list.Item
+	for _, g := range groupList {
+		if len(g.sessions) == 1 {
+			items = append(items, sessionItem{sess: g.sessions[0], treeDepth: 0})
+			continue
+		}
+		items = append(items, sessionItem{sess: g.sessions[0], treeDepth: 0})
+		children := g.sessions[1:]
+		for ci, ch := range children {
+			items = append(items, sessionItem{
+				sess:      ch,
+				treeDepth: 1,
+				treeLast:  ci == len(children)-1,
+			})
+		}
+	}
+
+	return items
+}
+
 func timeAgo(t time.Time) string {
 	if t.IsZero() {
 		return "unknown"
@@ -771,7 +927,7 @@ func timeAgo(t time.Time) string {
 }
 
 // renderHelpModal renders a centered bordered modal with help content overlaid on bg.
-func renderHelpModal(bg string, screenW, screenH int, km Keymap) string {
+func renderHelpModal(bg string, screenW, screenH int, km Keymap, shortcutHint string) string {
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
 	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
 	d := dimStyle
@@ -799,14 +955,15 @@ func renderHelpModal(bg string, screenW, screenH int, km Keymap) string {
 		{todoBadge, "[S]", "Used skills"},
 		{mcpBadgeStyle, "[X]", "Used MCP"},
 		{forkBadge, "[F]", "Forked session"},
+		{lipgloss.NewStyle().Foreground(lipgloss.Color("#7C3AED")).Bold(true), "[R·exp]", "Remote (experimental)"},
 	}
 	// Render badges in pairs (two per line)
 	for i := 0; i < len(allBadges); i += 2 {
 		b := allBadges[i]
-		left := fmt.Sprintf(" %s %s", b.style.Render(fmt.Sprintf("%-6s", b.badge)), d.Render(fmt.Sprintf("%-15s", b.desc)))
+		left := fmt.Sprintf(" %s %-16s", b.style.Render(fmt.Sprintf("%-6s", b.badge)), d.Render(b.desc))
 		if i+1 < len(allBadges) {
 			b2 := allBadges[i+1]
-			right := fmt.Sprintf(" %s %s", b2.style.Render(fmt.Sprintf("%-6s", b2.badge)), d.Render(b2.desc))
+			right := fmt.Sprintf("  %s %s", b2.style.Render(fmt.Sprintf("%-6s", b2.badge)), d.Render(b2.desc))
 			sb.WriteString(left + right + "\n")
 		} else {
 			sb.WriteString(left + "\n")
@@ -829,8 +986,10 @@ func renderHelpModal(bg string, screenW, screenH int, km Keymap) string {
 		{"has:compact", "With compaction"},
 		{"has:skill", "With skills"},
 		{"has:mcp", "With MCP tools"},
+		{"proj:<name>", "By project name"},
 		{"team:<name>", "By team name"},
 		{"is:fork", "Forked sessions"},
+		{"is:remote", "Remote sessions (exp)"},
 	}
 	for i := 0; i < len(allFilters); i += 2 {
 		f := allFilters[i]
@@ -866,11 +1025,17 @@ func renderHelpModal(bg string, screenW, screenH int, km Keymap) string {
 		sb.WriteString(fmt.Sprintf(" %-12s %s\n", k.key, d.Render(k.desc)))
 	}
 
+	// Number key shortcuts for current view
+	if shortcutHint != "" {
+		sb.WriteString("\n" + headerStyle.Render(" Shortcuts") + "\n")
+		sb.WriteString(" " + d.Render(shortcutHint) + "\n")
+	}
+
 	body := strings.TrimRight(sb.String(), "\n")
 	bodyLines := strings.Split(body, "\n")
 
 	// Modal dimensions: fit content with padding, capped to screen
-	modalW := 60
+	modalW := 72
 	if modalW > screenW-4 {
 		modalW = screenW - 4
 	}
@@ -894,6 +1059,30 @@ func renderHelpModal(bg string, screenW, screenH int, km Keymap) string {
 
 // renderFullTextModal renders a scrollable modal showing the full text of a
 // conversation entry, overlaid on bg.
+// renderConfirmModal shows a centered y/n confirmation dialog.
+func renderConfirmModal(bg, message string, screenW, screenH int) string {
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
+	hintStyle := lipgloss.NewStyle().Foreground(colorDim)
+
+	body := titleStyle.Render("  "+message) + "\n\n" +
+		"  " + lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Render("y") + hintStyle.Render(": confirm") +
+		"    " + hintStyle.Render("any other key: cancel")
+
+	modalW := min(len(message)+10, screenW-10)
+	if modalW < 30 {
+		modalW = 30
+	}
+
+	modal := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorPrimary).
+		Width(modalW).
+		Padding(1, 1).
+		Render(body)
+
+	return overlayCenter(bg, modal, screenW, screenH)
+}
+
 func renderFullTextModal(bg, text string, scroll, screenW, screenH int) string {
 	// Modal size: 80% of screen, capped
 	modalW := min(screenW*4/5, screenW-6)
@@ -1097,6 +1286,10 @@ func splitANSICells(s string) []string {
 		pending.WriteRune(r)
 		cells = append(cells, pending.String())
 		pending.Reset()
+		// Wide characters (CJK, etc.) take 2 columns — add a padding cell
+		if runewidth.RuneWidth(r) == 2 {
+			cells = append(cells, "")
+		}
 	}
 	// Trailing escapes (no printable after them) — attach to last cell or discard
 	if pending.Len() > 0 {

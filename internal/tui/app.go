@@ -17,6 +17,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/sendbird/ccx/internal/extract"
+	"github.com/sendbird/ccx/internal/remote"
 	"github.com/sendbird/ccx/internal/session"
 	"github.com/sendbird/ccx/internal/tmux"
 )
@@ -40,12 +41,12 @@ type liveCaptureMsg struct {
 
 // Conversation preview detail levels (cycled with tab).
 const (
-	previewText = 0 // text only — no tool blocks
-	previewTool = 1 // text + tool blocks (hooks hidden)
-	previewHook = 2 // text + tool blocks + hook details
+	previewText = 0 // compact — text only, no tool blocks
+	previewTool = 1 // standard — text + tool blocks (hooks hidden)
+	previewHook = 2 // verbose — text + tool blocks + hook details
 )
 
-var previewModeLabels = [3]string{"text", "tool", "hook"}
+var previewModeLabels = [3]string{"compact", "standard", "verbose"}
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
@@ -135,6 +136,15 @@ type App struct {
 
 	// Split pane ratio (list width as % of terminal width)
 	splitRatio int
+
+	// Number key shortcuts (view + focus scoped)
+	shortcuts Shortcuts
+
+	// Badge visibility
+	hiddenBadges map[string]bool
+
+	// Live input: prefer $EDITOR mode
+	editorInput bool
 
 	// Content for clipboard/pager
 	copiedMsg string
@@ -235,10 +245,41 @@ type App struct {
 	moveInput textinput.Model
 	moveSess  session.Session
 
-	// Worktree creation
-	worktreeMode  bool
-	worktreeInput textinput.Model
-	worktreeSess  session.Session
+	// Worktree creation (w = move session to worktree, n = new worktree + session)
+	worktreeMode    bool
+	worktreeInput   textinput.Model
+	worktreeSess    session.Session
+	worktreeNewMode bool // true = create new session, false = move existing
+
+	// Memory import from worktree
+	memImportActive bool
+	memImportSrc    string // worktree project path
+	memImportDst    string // main project path
+
+	// Memory removal
+	memRemoveActive bool
+	memRemoveSrc    string // project path to remove from
+
+	// Remote execution
+	remoteSession       *remote.Session
+	remoteContent       string                 // progress view content (during setup)
+	remoteSetupSteps    <-chan remote.SetupStep // setup progress channel (nil after setup)
+	remoteProgressSteps []string               // completed setup step messages
+	remoteConfirmCfg    *remote.Config         // pending confirmation (nil = no pending)
+	remoteDefaults      remote.Config          // defaults from config.yaml
+	remoteJSONLFile     *os.File               // temp file accumulating streamed JSONL
+	remoteStreaming     bool                   // true once Claude output is streaming
+	// Generic confirm modal
+	confirmMsg    string                      // message to show (empty = no modal)
+
+	// Conversation tooltip
+	convTooltipScroll int  // scroll offset in tooltip
+	convTooltipOn     bool // tooltip visible (toggle with t)
+	confirmAction func() (tea.Model, tea.Cmd) // action to run on "y"
+
+	// Worktree alignment
+	worktreeAlignActive bool
+	worktreeAlignRepo   string
 
 	// Live input modal (I key)
 	liveInputActive  bool
@@ -397,7 +438,8 @@ const (
 	sessPreviewMemory
 	sessPreviewTasksPlan
 	sessPreviewLive     // tmux pane capture
-	numSessPreviewModes = 5
+	sessPreviewRemote   // remote session status/stream
+	numSessPreviewModes = 6
 )
 
 // Config holds application configuration from CLI flags.
@@ -436,7 +478,18 @@ func NewApp(sessions []session.Session, cfg Config) *App {
 		keymap:          km,
 		splitRatio:      35,
 		selectedSet:     make(map[string]bool),
+		hiddenBadges:    make(map[string]bool),
 	}
+
+	// Restore persisted view state (CLI flags override in the apply block below)
+	_, prefs, sc, rc := LoadCCXConfig(configPath())
+	a.applyPreferences(prefs)
+	a.shortcuts = sc
+	a.remoteDefaults = rc
+
+	// Cleanup stale remote sessions, then restore remaining as virtual items
+	cleanupStaleRemoteSessions()
+	a.sessions = append(loadSavedRemoteSessions(), a.sessions...)
 	a.sessSplit = SplitPane{List: &a.sessionList, ItemHeight: 2}
 	a.conv.split = SplitPane{List: &a.convList, Show: true, Folds: &FoldState{}, ItemHeight: 1}
 	a.cfgSplit = SplitPane{List: &a.cfgList, ItemHeight: 1}
@@ -452,26 +505,26 @@ func NewApp(sessions []session.Session, cfg Config) *App {
 	a.tagInput.Placeholder = "badge-name"
 	a.tagInput.CharLimit = 20
 
-	// Apply CLI flags for initial group/preview mode
-	if cfg.GroupMode != "" {
-		modeMap := map[string]int{"flat": groupFlat, "proj": groupProject, "tree": groupTree, "chain": groupChain, "fork": groupFork}
-		if m, ok := modeMap[cfg.GroupMode]; ok {
+	// Apply group/preview/view mode from CLI flags or restored preferences
+	if a.config.GroupMode != "" {
+		modeMap := map[string]int{"flat": groupFlat, "proj": groupProject, "tree": groupTree, "chain": groupChain, "fork": groupFork, "repo": groupBaseProject}
+		if m, ok := modeMap[a.config.GroupMode]; ok {
 			a.sessGroupMode = m
 		}
 	}
-	if cfg.PreviewMode != "" {
-		modeMap := map[string]sessPreview{"conv": sessPreviewConversation, "stats": sessPreviewStats, "mem": sessPreviewMemory, "tasks": sessPreviewTasksPlan}
-		if m, ok := modeMap[cfg.PreviewMode]; ok {
+	if a.config.PreviewMode != "" {
+		modeMap := map[string]sessPreview{"conv": sessPreviewConversation, "stats": sessPreviewStats, "mem": sessPreviewMemory, "tasks": sessPreviewTasksPlan, "live": sessPreviewLive}
+		if m, ok := modeMap[a.config.PreviewMode]; ok {
 			a.sessPreviewMode = m
 			a.sessSplit.Show = true
 		}
 	}
-	if cfg.ViewMode != "" {
+	if a.config.ViewMode != "" {
 		modeMap := map[string]viewState{
 			"sessions": viewSessions, "config": viewConfig,
 			"plugins": viewPlugins, "stats": viewGlobalStats,
 		}
-		if m, ok := modeMap[cfg.ViewMode]; ok {
+		if m, ok := modeMap[a.config.ViewMode]; ok {
 			a.state = m
 		}
 	}
@@ -534,6 +587,28 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.refreshConfigExplorer()
 		}
 		return a, nil
+
+	case remoteSetupMsg:
+		return a.handleRemoteSetup(msg)
+
+	case remoteFetchMsg:
+		return a.handleRemoteFetch(msg)
+
+	case remoteExecDoneMsg:
+		return a.handleRemoteExecDone(msg)
+
+	case delayedRefreshMsg:
+		// Auto-refresh after spawning a new session; retry if session not found yet
+		oldCount := len(a.sessions)
+		cmd := a.doRefresh()
+		if len(a.sessions) == oldCount && msg.remaining > 0 {
+			// No new session found — retry after another delay
+			return a, tea.Batch(cmd, func() tea.Msg {
+				time.Sleep(3 * time.Second)
+				return delayedRefreshMsg{remaining: msg.remaining - 1}
+			})
+		}
+		return a, cmd
 
 	case configTestDoneMsg:
 		os.RemoveAll(msg.tmpDir)
@@ -643,12 +718,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			selectedID = sess.ID
 		}
 
-		a.sessions = msg.sessions
+		a.sessions = a.injectRemoteSessions(msg.sessions)
 		// Build/rebuild session list
 		if a.width > 0 && a.height > 0 {
 			contentH := a.height - 3
 			sessW := a.sessSplit.ListWidth(a.width, a.splitRatio)
-			a.sessionList = newSessionList(a.sessions, sessW, contentH, a.sessGroupMode, a.selectedSet)
+			a.sessionList = newSessionList(a.sessions, sessW, contentH, a.sessGroupMode, a.selectedSet, a.hiddenBadges, a.config.WorktreeDir)
 			a.sessSplit.CacheKey = ""
 			if a.config.SearchQuery != "" {
 				applyListFilter(&a.sessionList, a.config.SearchQuery)
@@ -691,12 +766,25 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, captureAfterKeyCmd(a.paneProxy.pane, "ctrl+c")
 		}
 		if msg.String() == "ctrl+c" {
-			return a, tea.Quit
+			return a.quit()
 		}
 
 		// Live input modal intercepts all keys
 		if a.liveInputActive {
 			return a.handleLiveInputKey(msg.String())
+		}
+
+		// Confirm modal (y/n)
+		if a.confirmMsg != "" {
+			action := a.confirmAction
+			a.confirmMsg = ""
+			a.confirmAction = nil
+			if msg.String() == "y" || msg.String() == "Y" {
+				if action != nil {
+					return action()
+				}
+			}
+			return a, nil
 		}
 
 		if a.isFiltering() {
@@ -731,6 +819,14 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !a.isInTextInput() {
 				a.startCmdMode()
 				return a, nil
+			}
+		}
+
+		// Number key shortcuts (1-9): view + focus scoped
+		if key := msg.String(); !a.isInTextInput() && !a.isInOverlay() &&
+			len(key) == 1 && key[0] >= '1' && key[0] <= '9' {
+			if m, cmd, handled := a.handleShortcutKey(key); handled {
+				return m, cmd
 			}
 		}
 
@@ -783,18 +879,25 @@ func (a *App) View() string {
 			break
 		}
 		content = a.renderSessionSplit()
-		if a.sessConvFullText != "" {
+		if a.confirmMsg != "" {
+			content = renderConfirmModal(content, a.confirmMsg, a.width, ContentHeight(a.height))
+			help = formatHelp("y:confirm  any:cancel")
+		} else if a.sessConvFullText != "" {
 			content = renderFullTextModal(content, a.sessConvFullText, a.sessConvFullScroll, a.width, ContentHeight(a.height))
 			help = formatHelp("↑↓:scroll pgup/pgdn:page esc/c:close")
 		} else if a.showHelp {
-			content = renderHelpModal(content, a.width, ContentHeight(a.height), a.keymap)
+			content = renderHelpModal(content, a.width, ContentHeight(a.height), a.keymap, a.shortcutHint())
 			help = formatHelp("press any key to close")
 		} else if a.tagMenu {
 			help = "" // Tag menu has its own help text inside the modal
 		} else if a.moveMode {
 			help = "  " + a.moveInput.View() + helpStyle.Render("  enter:move esc:cancel")
 		} else if a.worktreeMode {
-			help = "  " + a.worktreeInput.View() + helpStyle.Render("  enter:create esc:cancel")
+			hint := "  enter:create esc:cancel"
+			if a.worktreeNewMode {
+				hint = "  enter:new session (empty=main) esc:cancel"
+			}
+			help = "  " + a.worktreeInput.View() + helpStyle.Render(hint)
 		} else if a.sessConvSearching {
 			help = "  " + a.sessConvSearchInput.View() + helpStyle.Render("  enter:apply esc:cancel")
 		} else {
@@ -821,6 +924,10 @@ func (a *App) View() string {
 				}
 				if a.config.TmuxEnabled && tmux.InTmux() {
 					h += " " + fmtKey(sk.Live, "live")
+				}
+				scHint := a.shortcutHint()
+				if scHint != "" {
+					h += " " + dimStyle.Render(scHint)
 				}
 				help = formatHelp(h + " " + fmtKey(sk.Search, "search") + " " + fmtKey(sk.Help, "help") + " " + fmtKey(sk.Quit, "quit"))
 			}
@@ -1171,7 +1278,7 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// While loading with no sessions yet, only allow quit
 	if a.sessionsLoading && len(a.sessions) == 0 {
 		if msg.String() == "q" || msg.String() == "ctrl+c" {
-			return a, tea.Quit
+			return a.quit()
 		}
 		return a, nil
 	}
@@ -1255,6 +1362,8 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "ctrl+n":
 			// Send backslash + enter for multi-line input in Claude
 			return a, a.liveNewlineCmd()
+		case "left":
+			return a, captureAfterKeyCmd(a.paneProxy.pane, "left")
 		}
 		return a.handlePaneProxyKey(key)
 	}
@@ -1263,7 +1372,7 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	km := a.keymap
 	switch key {
 	case km.Session.Quit:
-		return a, tea.Quit
+		return a.quit()
 	case km.Session.Escape:
 		if a.hasMultiSelection() {
 			a.clearMultiSelection()
@@ -1288,6 +1397,10 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return a, nil
 	case km.Session.Open:
+		// Remote sessions: attach interactively
+		if sess, ok := a.selectedSession(); ok && sess.IsRemote {
+			return a.attachToRemoteSession(sess)
+		}
 		// If conversation preview is focused, jump to the selected message
 		if sp.Focus && sp.Show && a.sessPreviewMode == sessPreviewConversation && len(a.sessConvEntries) > 0 {
 			return a.jumpToConvMessage()
@@ -1327,6 +1440,10 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.actionsSess = sess
 		return a, nil
 	case km.Session.Live:
+		// Remote sessions: spawn kubectl exec in hidden tmux pane, use as live preview
+		if sess, ok := a.selectedSession(); ok && sess.IsRemote {
+			return a.openRemoteLivePreview(sess)
+		}
 		if !a.config.TmuxEnabled {
 			return a, nil
 		}
@@ -1342,7 +1459,7 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return a.openEditMenu(sess)
 	case km.Session.Group:
-		a.sessGroupMode = (a.sessGroupMode + 1) % 5
+		a.sessGroupMode = (a.sessGroupMode + 1) % numGroupModes
 		a.rebuildSessionList()
 		return a, nil
 	case km.Session.Refresh:
@@ -1364,7 +1481,7 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if sp.Focus && sp.Show {
 			a.cycleSessionPreviewMode()
 		} else {
-			a.sessGroupMode = (a.sessGroupMode + 1) % 5
+			a.sessGroupMode = (a.sessGroupMode + 1) % numGroupModes
 			a.rebuildSessionList()
 		}
 		return a, nil
@@ -1372,7 +1489,7 @@ func (a *App) handleSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if sp.Focus && sp.Show {
 			a.cycleSessionPreviewModeReverse()
 		} else {
-			a.sessGroupMode = (a.sessGroupMode - 1 + 5) % 5
+			a.sessGroupMode = (a.sessGroupMode - 1 + numGroupModes) % numGroupModes
 			a.rebuildSessionList()
 		}
 		return a, nil
@@ -1656,7 +1773,7 @@ func (a *App) handleGlobalStatsKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if a.statsDetail != statsDetailNone {
 		switch key {
 		case "q":
-			return a, tea.Quit
+			return a.quit()
 		case "esc":
 			a.statsDetail = statsDetailNone
 			return a, nil
@@ -1678,7 +1795,7 @@ func (a *App) handleGlobalStatsKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch key {
 	case "q":
-		return a, tea.Quit
+		return a.quit()
 	case "esc":
 		return a, nil
 	case a.keymap.Session.Views:
@@ -2041,7 +2158,10 @@ func (a *App) handleActionsMenu(key string) (tea.Model, tea.Cmd) {
 			a.copiedMsg = "Cannot delete live session"
 			return a, nil
 		}
-		return a.deleteSession(sess)
+		sessCopy := sess
+		a.confirmMsg = fmt.Sprintf("Delete session %s?", sess.ShortID)
+		a.confirmAction = func() (tea.Model, tea.Cmd) { return a.deleteSession(sessCopy) }
+		return a, nil
 	case akm.Resume:
 		return a.resumeSession(sess)
 	case akm.CopyPath:
@@ -2125,8 +2245,52 @@ func (a *App) handleActionsMenu(key string) (tea.Model, tea.Cmd) {
 		a.tagInput.SetValue("")
 		a.tagInput.Focus()
 		return a, a.tagInput.Cursor.BlinkCmd()
+	case akm.ImportMem:
+		return a.importWorktreeMemory(sess)
+	case akm.RemoveMem:
+		return a.removeSessionMemory(sess)
+	case akm.Fork:
+		return a.forkSession(sess)
+	case akm.New:
+		return a.startNewSessionInProject(sess)
+	case akm.Remote:
+		cfg := remote.Config{
+			LocalDir:    sess.ProjectPath,
+			SessionID:   sess.ID,
+			SessionFile: sess.FilePath,
+		}
+		return a.startRemoteSession(cfg)
 	}
 	return a, nil
+}
+
+// forkSession resumes a session in a new tmux window, creating a fork.
+func (a *App) forkSession(sess session.Session) (tea.Model, tea.Cmd) {
+	dir := sess.ProjectPath
+	if dir == "" {
+		dir, _ = os.UserHomeDir()
+	}
+
+	if tmux.InTmux() {
+		windowName := sess.ProjectName
+		if windowName == "" {
+			windowName = "claude"
+		}
+		windowName += "-fork"
+		if err := tmux.NewWindowClaude(windowName, dir, sess.ID); err != nil {
+			a.copiedMsg = "Fork failed: " + err.Error()
+		} else {
+			a.copiedMsg = "Forked → " + windowName
+		}
+		return a, nil
+	}
+
+	// Non-tmux: take over terminal
+	c := exec.Command("claude", "--resume", sess.ID)
+	c.Dir = dir
+	return a, tea.ExecProcess(c, func(err error) tea.Msg {
+		return editorDoneMsg{}
+	})
 }
 
 func (a *App) handleBulkActionsMenu(key string) (tea.Model, tea.Cmd) {
@@ -2393,14 +2557,7 @@ func (a *App) openInEditor(path string) (tea.Model, tea.Cmd) {
 type editorDoneMsg struct{}
 
 func (a *App) deleteSession(sess session.Session) (tea.Model, tea.Cmd) {
-	if err := os.Remove(sess.FilePath); err != nil && !os.IsNotExist(err) {
-		a.copiedMsg = "Delete failed: " + err.Error()
-		return a, nil
-	}
-	os.RemoveAll(filepath.Join(filepath.Dir(sess.FilePath), sess.ID))
-	os.RemoveAll(filepath.Join(a.config.ClaudeDir, "file-history", sess.ID))
-	os.RemoveAll(filepath.Join(a.config.ClaudeDir, "tasks", sess.ID))
-
+	// Remove from UI immediately
 	delete(a.selectedSet, sess.ID)
 
 	// Remove from in-memory list and update the list widget
@@ -2428,8 +2585,44 @@ func (a *App) deleteSession(sess session.Session) (tea.Model, tea.Cmd) {
 		a.sessionList.Select(idx)
 	}
 	a.sessSplit.CacheKey = ""
-	a.copiedMsg = "Session deleted"
-	return a, nil
+	a.copiedMsg = "Deleted"
+
+	// Async cleanup — file/pod deletion happens in background
+	if sess.IsRemote {
+		rs := a.remoteSession
+		podName := sess.RemotePodName
+		if rs != nil && rs.PodName == podName {
+			a.remoteSession = nil
+			a.remoteContent = ""
+			a.remoteProgressSteps = nil
+		}
+		return a, func() tea.Msg {
+			if rs != nil && rs.PodName == podName {
+				rs.Stop()
+			} else {
+				for _, saved := range remote.LoadSavedSessions() {
+					if saved.PodName == podName {
+						cfg := remote.Config{Context: saved.Context, Namespace: saved.Namespace}
+						remote.DeletePod(context.Background(), cfg, podName)
+						break
+					}
+				}
+			}
+			remote.RemoveSavedSession(podName)
+			return nil
+		}
+	}
+
+	claudeDir := a.config.ClaudeDir
+	filePath := sess.FilePath
+	sessID := sess.ID
+	return a, func() tea.Msg {
+		os.Remove(filePath)
+		os.RemoveAll(filepath.Join(filepath.Dir(filePath), sessID))
+		os.RemoveAll(filepath.Join(claudeDir, "file-history", sessID))
+		os.RemoveAll(filepath.Join(claudeDir, "tasks", sessID))
+		return nil
+	}
 }
 
 func (a *App) handleMoveInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -2485,22 +2678,132 @@ func (a *App) executeMove(sess session.Session, newPath string) (tea.Model, tea.
 	return a, nil
 }
 
+// startNewSessionInProject opens a new session in the same project.
+// For git repos: prompts for branch name (worktree-first workflow).
+// For non-git dirs: creates session directly.
+func (a *App) startNewSessionInProject(sess session.Session) (tea.Model, tea.Cmd) {
+	// Check if this is a git repo
+	dir := sess.ProjectPath
+	if dir == "" {
+		return a.newSessionInDir("", "")
+	}
+	gitPath := filepath.Join(dir, ".git")
+	if _, err := os.Stat(gitPath); err != nil {
+		// Not a git repo — create session directly
+		return a.newSessionInDir(dir, sess.ProjectName)
+	}
+
+	// Git repo — prompt for branch (worktree-first)
+	a.worktreeSess = sess
+	a.worktreeMode = true
+	a.worktreeNewMode = true
+	ti := textinput.New()
+	ti.Prompt = "Branch (empty=main): "
+	ti.Width = a.width - 20
+	ti.Focus()
+	a.worktreeInput = ti
+	return a, ti.Cursor.BlinkCmd()
+}
+
 func (a *App) handleWorktreeInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
 		name := strings.TrimSpace(a.worktreeInput.Value())
 		a.worktreeMode = false
+		isNew := a.worktreeNewMode
+		a.worktreeNewMode = false
+
+		if isNew {
+			// New session mode
+			if name == "" {
+				// No branch = new session in main project dir
+				return a.newSessionInDir(a.worktreeSess.ProjectPath, a.worktreeSess.ProjectName)
+			}
+			// Create worktree + new session
+			return a.executeNewWorktreeSession(a.worktreeSess, name)
+		}
+		// Move mode (original behavior)
 		if name == "" {
 			return a, nil
 		}
 		return a.executeWorktree(a.worktreeSess, name)
 	case "esc":
 		a.worktreeMode = false
+		a.worktreeNewMode = false
 		return a, nil
 	}
 	var cmd tea.Cmd
 	a.worktreeInput, cmd = a.worktreeInput.Update(msg)
 	return a, cmd
+}
+
+// newSessionInDir spawns a new Claude session in the given directory.
+func (a *App) newSessionInDir(dir, name string) (tea.Model, tea.Cmd) {
+	if dir == "" {
+		dir, _ = os.Getwd()
+	}
+	if name == "" {
+		name = filepath.Base(dir)
+	}
+	if tmux.InTmux() {
+		if err := tmux.NewWindowClaudeNew(name, dir); err != nil {
+			a.copiedMsg = "Spawn failed"
+			return a, nil
+		}
+		a.copiedMsg = "New session → " + name
+		return a, a.delayedRefreshCmd()
+	}
+	c := exec.Command("claude")
+	c.Dir = dir
+	return a, tea.ExecProcess(c, func(err error) tea.Msg {
+		return tea.QuitMsg{}
+	})
+}
+
+// delayedRefreshCmd returns a command that waits then triggers a refresh.
+// Retries a few times since Claude takes a moment to create its session file.
+func (a *App) delayedRefreshCmd() tea.Cmd {
+	return func() tea.Msg {
+		time.Sleep(2 * time.Second)
+		return delayedRefreshMsg{remaining: 3}
+	}
+}
+
+type delayedRefreshMsg struct{ remaining int }
+
+// executeNewWorktreeSession creates a git worktree and spawns a new Claude session in it.
+func (a *App) executeNewWorktreeSession(sess session.Session, branch string) (tea.Model, tea.Cmd) {
+	out, err := exec.Command("git", "-C", sess.ProjectPath, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		a.copiedMsg = "Not a git repo"
+		return a, nil
+	}
+	repoRoot := strings.TrimSpace(string(out))
+	wtPath := filepath.Join(repoRoot, a.config.WorktreeDir, branch)
+
+	// Try adding worktree
+	if err := exec.Command("git", "-C", repoRoot, "worktree", "add", wtPath, branch).Run(); err != nil {
+		if err2 := exec.Command("git", "-C", repoRoot, "worktree", "add", "-b", branch, wtPath).Run(); err2 != nil {
+			a.copiedMsg = "Worktree failed: " + err2.Error()
+			return a, nil
+		}
+	}
+
+	// Spawn new Claude session in the worktree
+	name := filepath.Base(repoRoot) + "/" + branch
+	if tmux.InTmux() {
+		if err := tmux.NewWindowClaudeNew(name, wtPath); err != nil {
+			a.copiedMsg = "Spawn failed"
+			return a, nil
+		}
+		a.copiedMsg = fmt.Sprintf("New session → %s/%s", a.config.WorktreeDir, branch)
+		return a, a.delayedRefreshCmd()
+	}
+	c := exec.Command("claude")
+	c.Dir = wtPath
+	return a, tea.ExecProcess(c, func(err error) tea.Msg {
+		return tea.QuitMsg{}
+	})
 }
 
 func (a *App) executeWorktree(sess session.Session, name string) (tea.Model, tea.Cmd) {
@@ -2561,6 +2864,124 @@ func (a *App) executeWorktree(sess session.Session, name string) (tea.Model, tea
 	return a, nil
 }
 
+// newSession opens a new Claude session (without --resume) in the selected
+// session's project directory, or CWD if no session is selected.
+func (a *App) newSession() (tea.Model, tea.Cmd) {
+	dir, _ := os.Getwd()
+	windowName := "claude"
+	if sess, ok := a.selectedSession(); ok {
+		if sess.ProjectPath != "" {
+			dir = sess.ProjectPath
+		}
+		if sess.ProjectName != "" {
+			windowName = sess.ProjectName
+		}
+	}
+
+	if tmux.InTmux() {
+		if err := tmux.NewWindowClaudeNew(windowName, dir); err != nil {
+			a.copiedMsg = "Spawn failed"
+		} else {
+			a.copiedMsg = "New session in new window"
+		}
+		return a, nil
+	}
+
+	// Non-tmux: take over terminal
+	c := exec.Command("claude")
+	c.Dir = dir
+	return a, tea.ExecProcess(c, func(err error) tea.Msg {
+		return tea.QuitMsg{}
+	})
+}
+
+// executeCmdNewSession handles "new <path>" — opens a new Claude session in the given directory.
+func (a *App) executeCmdNewSession(input string) (tea.Model, tea.Cmd) {
+	parts := strings.Fields(input)
+	if len(parts) < 2 {
+		return a.newSession() // no path, use selected session's project
+	}
+	dir := parts[len(parts)-1]
+	// Expand ~ to home
+	if strings.HasPrefix(dir, "~") {
+		home, _ := os.UserHomeDir()
+		dir = home + dir[1:]
+	}
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		a.copiedMsg = "Not a directory: " + dir
+		return a, nil
+	}
+	windowName := filepath.Base(dir)
+	if tmux.InTmux() {
+		if err := tmux.NewWindowClaudeNew(windowName, dir); err != nil {
+			a.copiedMsg = "Spawn failed"
+		} else {
+			a.copiedMsg = "New session → " + windowName
+		}
+		return a, nil
+	}
+	c := exec.Command("claude")
+	c.Dir = dir
+	return a, tea.ExecProcess(c, func(err error) tea.Msg {
+		return tea.QuitMsg{}
+	})
+}
+
+// executeCmdWorktreeNew handles "worktree:new <branch>" / "wt:new <branch>".
+// It creates a git worktree for the given branch and opens a new Claude session in it.
+func (a *App) executeCmdWorktreeNew(input string) (tea.Model, tea.Cmd) {
+	parts := strings.Fields(input)
+	if len(parts) < 2 {
+		a.copiedMsg = "Usage: worktree:new <branch>"
+		return a, nil
+	}
+	branch := parts[len(parts)-1]
+
+	sess, ok := a.selectedSession()
+	if !ok || sess.ProjectPath == "" {
+		a.copiedMsg = "No session with project selected"
+		return a, nil
+	}
+
+	// Get repo root
+	out, err := exec.Command("git", "-C", sess.ProjectPath, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		a.copiedMsg = "Not a git repo"
+		return a, nil
+	}
+	repoRoot := strings.TrimSpace(string(out))
+
+	wtPath := filepath.Join(repoRoot, a.config.WorktreeDir, branch)
+
+	// Try creating worktree: first on existing branch, then create new branch
+	if err := exec.Command("git", "-C", repoRoot, "worktree", "add", wtPath, branch).Run(); err != nil {
+		if err2 := exec.Command("git", "-C", repoRoot, "worktree", "add", "-b", branch, wtPath).Run(); err2 != nil {
+			a.copiedMsg = "Worktree failed: " + err2.Error()
+			return a, nil
+		}
+	}
+
+	// Open new Claude session in the worktree
+	windowName := branch
+	if tmux.InTmux() {
+		if err := tmux.NewWindowClaudeNew(windowName, wtPath); err != nil {
+			a.copiedMsg = "Worktree created but spawn failed"
+		} else {
+			a.copiedMsg = fmt.Sprintf("Worktree + session → %s/%s", a.config.WorktreeDir, branch)
+		}
+		return a, nil
+	}
+
+	// Non-tmux: take over terminal
+	c := exec.Command("claude")
+	c.Dir = wtPath
+	a.copiedMsg = fmt.Sprintf("Worktree created → %s/%s", a.config.WorktreeDir, branch)
+	return a, tea.ExecProcess(c, func(err error) tea.Msg {
+		return tea.QuitMsg{}
+	})
+}
+
 func (a *App) jumpToTmuxPane(projectPath string, sessionID ...string) (tea.Model, tea.Cmd) {
 	pane, found := tmux.FindPane(projectPath, sessionID...)
 	if !found {
@@ -2588,9 +3009,36 @@ func (a *App) openLiveInput(projectPath string, sessionID ...string) (tea.Model,
 		return a, nil
 	}
 	a.liveInputPane = pane
+	a.liveInputProjDir = projectPath
+
+	// If user prefers $EDITOR, skip inline modal and open editor directly
+	if a.editorInput {
+		return a, func() tea.Msg {
+			tmpFile, err := os.CreateTemp("", "ccx-input-*.md")
+			if err != nil {
+				return liveInputSentMsg{err: err}
+			}
+			tmpFile.Close()
+			defer os.Remove(tmpFile.Name())
+
+			editor := os.Getenv("EDITOR")
+			if editor == "" {
+				editor = "vim"
+			}
+			cmd := fmt.Sprintf("cd %s && %s %s", shellescape(projectPath), editor, tmpFile.Name())
+			exec.Command("tmux", "display-popup", "-E", "-w", "80%", "-h", "70%", cmd).Run()
+
+			content, readErr := os.ReadFile(tmpFile.Name())
+			if readErr != nil || len(strings.TrimSpace(string(content))) == 0 {
+				return liveInputSentMsg{err: fmt.Errorf("empty")}
+			}
+			sendText := strings.TrimRight(string(content), "\n")
+			return liveInputSentMsg{err: tmux.SendKeys(pane, sendText)}
+		}
+	}
+
 	a.liveInputModal = newInputModal()
 	a.liveInputActive = true
-	a.liveInputProjDir = projectPath
 	return a, nil
 }
 
@@ -2599,6 +3047,8 @@ func (a *App) handleLiveInputKey(key string) (tea.Model, tea.Cmd) {
 
 	switch action {
 	case "send":
+		// Remember inline preference
+		a.editorInput = false
 		text := strings.TrimRight(a.liveInputModal.Text(), "\n")
 		if strings.TrimSpace(text) == "" {
 			a.liveInputActive = false
@@ -2625,6 +3075,8 @@ func (a *App) handleLiveInputKey(key string) (tea.Model, tea.Cmd) {
 			return liveInputSentMsg{err: err}
 		}
 	case "editor":
+		// Remember editor preference for next time
+		a.editorInput = true
 		// Write current text to temp file, open $EDITOR in tmux popup
 		a.liveInputActive = false
 		panes := a.liveInputPanes
@@ -2741,7 +3193,7 @@ func (a *App) doRefresh() tea.Cmd {
 				selectedID = sess.ID
 			}
 
-			a.sessions = fresh
+			a.sessions = a.injectRemoteSessions(fresh)
 			a.globalStatsCache = nil // invalidate cached stats
 
 			if !a.isFiltering() && !a.hasFilterApplied() {
@@ -2945,19 +3397,30 @@ func (a *App) renderSessionSplit() string {
 		a.sessionList.Select(idx)
 	}
 
-	_ = a.updateSessionPreview() // cmd handled by liveTickMsg for live sessions
+	// Don't call updateSessionPreview for live mode from render path — the
+	// returned async cmd would be discarded. Live mode is initialized from
+	// Update paths (resizeAll, key handlers) where cmds are dispatched.
+	if a.sessPreviewMode != sessPreviewLive {
+		_ = a.updateSessionPreview()
+	}
 
 	if a.sessSplit.Preview.Width != previewW || a.sessSplit.Preview.Height != contentH {
 		oldOffset := a.sessSplit.Preview.YOffset
 		oldTotal := a.sessSplit.Preview.TotalLineCount()
 		a.sessSplit.Preview.Width = previewW
 		a.sessSplit.Preview.Height = max(contentH, 1)
+
 		// Re-render at new size without reloading data or resetting cursor
-		if a.sessPreviewMode == sessPreviewConversation && len(a.sessConvEntries) > 0 {
+		// Skip for live and non-streaming remote setup
+		isRemoteSetup := false
+		if selSess, selOk := a.selectedSession(); selOk && selSess.IsRemote && !a.remoteStreaming {
+			isRemoteSetup = true
+		}
+		if a.sessPreviewMode == sessPreviewConversation && len(a.sessConvEntries) > 0 && !isRemoteSetup {
 			a.refreshConvPreview()
-		} else {
+		} else if a.sessPreviewMode != sessPreviewLive && !isRemoteSetup {
 			a.sessSplit.CacheKey = ""
-			_ = a.updateSessionPreview() // cmd handled by liveTickMsg
+			_ = a.updateSessionPreview()
 			if a.sessPreviewMode == sessPreviewLive {
 				a.sessSplit.Preview.GotoBottom()
 			} else {
@@ -3020,7 +3483,8 @@ func (a *App) toggleSessionPreviewMode(mode sessPreview) {
 // Skips sessPreviewLive — it's only entered via the L key.
 func (a *App) cycleSessionPreviewMode() {
 	a.sessPreviewMode = (a.sessPreviewMode + 1) % numSessPreviewModes
-	if a.sessPreviewMode == sessPreviewLive {
+	// Skip live and remote — they're entered via dedicated keys
+	for a.sessPreviewMode == sessPreviewLive || a.sessPreviewMode == sessPreviewRemote {
 		a.sessPreviewMode = (a.sessPreviewMode + 1) % numSessPreviewModes
 	}
 	a.closePaneProxy()
@@ -3028,10 +3492,10 @@ func (a *App) cycleSessionPreviewMode() {
 }
 
 // cycleSessionPreviewModeReverse goes to the previous preview tab.
-// Skips sessPreviewLive — it's only entered via the L key.
+// Skips sessPreviewLive and sessPreviewRemote.
 func (a *App) cycleSessionPreviewModeReverse() {
 	a.sessPreviewMode = (a.sessPreviewMode + numSessPreviewModes - 1) % numSessPreviewModes
-	if a.sessPreviewMode == sessPreviewLive {
+	for a.sessPreviewMode == sessPreviewLive || a.sessPreviewMode == sessPreviewRemote {
 		a.sessPreviewMode = (a.sessPreviewMode + numSessPreviewModes - 1) % numSessPreviewModes
 	}
 	a.closePaneProxy()
@@ -3054,7 +3518,13 @@ func (a *App) updateSessionPreview() tea.Cmd {
 		return nil
 	}
 
-	cacheKey := fmt.Sprintf("%d:%s", a.sessPreviewMode, sess.ID)
+	// Force remote preview mode during setup (not yet streaming)
+	previewMode := a.sessPreviewMode
+	if sess.IsRemote && !a.remoteStreaming {
+		previewMode = sessPreviewRemote
+	}
+
+	cacheKey := fmt.Sprintf("%d:%s", previewMode, sess.ID)
 	if cacheKey == a.sessSplit.CacheKey {
 		return nil
 	}
@@ -3070,7 +3540,7 @@ func (a *App) updateSessionPreview() tea.Cmd {
 	a.sessSplit.CacheKey = cacheKey
 	a.sessPreviewPinned = false
 
-	switch a.sessPreviewMode {
+	switch previewMode {
 	case sessPreviewStats:
 		a.updateSessionStatsPreview(sess)
 	case sessPreviewMemory:
@@ -3090,6 +3560,12 @@ func (a *App) updateSessionPreview() tea.Cmd {
 		}
 		a.closePaneProxy()
 		a.sessSplit.Preview.SetContent(dimStyle.Render("(not a live session)"))
+	case sessPreviewRemote:
+		content := a.remoteContent
+		if content == "" {
+			content = dimStyle.Render(fmt.Sprintf("Remote session: %s [%s]", sess.RemotePodName, sess.RemoteStatus))
+		}
+		a.sessSplit.Preview.SetContent(content)
 	default:
 		a.updateSessionConvPreview(sess)
 	}
@@ -3523,16 +3999,30 @@ func (a *App) buildTasksPlanContent(sess session.Session) string {
 	home, _ := os.UserHomeDir()
 	var sb strings.Builder
 
-	// Tasks
-	if len(sess.Tasks) > 0 {
+	// Tasks — try file-based tasks first, fall back to JSONL parsing
+	tasks := sess.Tasks
+	fromConv := false
+	if len(tasks) == 0 && sess.HasTasks {
+		// Task files cleaned up — parse from conversation entries
+		entries, err := session.LoadMessages(sess.FilePath)
+		if err == nil {
+			tasks = session.LoadTasksFromEntries(entries)
+			fromConv = true
+		}
+	}
+	if len(tasks) > 0 {
 		completed := 0
-		for _, t := range sess.Tasks {
+		for _, t := range tasks {
 			if t.Status == "completed" {
 				completed++
 			}
 		}
-		sb.WriteString(dimStyle.Render(fmt.Sprintf("── Tasks [%d/%d] ──", completed, len(sess.Tasks))) + "\n\n")
-		for _, t := range sess.Tasks {
+		label := fmt.Sprintf("── Tasks [%d/%d] ──", completed, len(tasks))
+		if fromConv {
+			label += " (from conversation)"
+		}
+		sb.WriteString(dimStyle.Render(label) + "\n\n")
+		for _, t := range tasks {
 			icon := "○"
 			style := dimStyle
 			switch t.Status {
@@ -3781,7 +4271,17 @@ func (a *App) renderActionsHintBox() string {
 	} else {
 		sess := a.actionsSess
 		lines = append(lines, hl.Render(displayKey(akm.Delete))+d.Render(":delete")+sp+hl.Render(displayKey(akm.Move))+d.Render(":move")+sp+hl.Render(displayKey(akm.Resume))+d.Render(":resume")+sp+hl.Render(displayKey(akm.CopyPath))+d.Render(":copy-path"))
-		lines = append(lines, hl.Render(displayKey(akm.Worktree))+d.Render(":worktree")+sp+hl.Render(displayKey(akm.URLs))+d.Render(":urls")+sp+hl.Render(displayKey(akm.Files))+d.Render(":files")+sp+hl.Render(displayKey(akm.Tags))+d.Render(":tags"))
+		line2 := hl.Render(displayKey(akm.Worktree)) + d.Render(":worktree") + sp + hl.Render(displayKey(akm.URLs)) + d.Render(":urls") + sp + hl.Render(displayKey(akm.Files)) + d.Render(":files") + sp + hl.Render(displayKey(akm.Tags)) + d.Render(":tags")
+		if sess.HasMemory {
+			line2 += sp + hl.Render(displayKey(akm.RemoveMem)) + d.Render(":rm-mem")
+		}
+		if sess.IsWorktree {
+			line2 += sp + hl.Render(displayKey(akm.ImportMem)) + d.Render(":import-mem")
+		}
+		line2 += sp + hl.Render(displayKey(akm.Fork)) + d.Render(":fork")
+		line2 += sp + hl.Render(displayKey(akm.New)) + d.Render(":new")
+		line2 += sp + hl.Render(displayKey(akm.Remote)) + d.Render(":remote")
+		lines = append(lines, line2)
 		if sess.IsLive && a.config.TmuxEnabled {
 			lines = append(lines, hl.Render(displayKey(akm.Kill))+d.Render(":kill")+sp+hl.Render(displayKey(akm.Input))+d.Render(":input")+sp+hl.Render(displayKey(akm.Jump))+d.Render(":jump"))
 		}
@@ -3813,8 +4313,8 @@ func (a *App) renderSearchHintBox() string {
 		}
 	case viewConversation:
 		lines = []string{
-			h.Render("role=") + d.Render("user") + sp + h.Render("role=") + d.Render("asst"),
-			h.Render("tool=") + d.Render("Bash Read Edit Write"),
+			h.Render("role:") + d.Render("user") + sp + h.Render("role:") + d.Render("asst"),
+			h.Render("tool:") + d.Render("Bash Read Edit Write"),
 		}
 	case viewConfig:
 		lines = []string{
@@ -3846,11 +4346,12 @@ func (a *App) syncAllFilterVisibility() {
 }
 
 // isInTextInput returns true when the user is typing in any text input
-// (search, move, worktree, live input, etc.) where ':' should be literal.
+// (search, move, worktree, live input, block filter, etc.) where ':' should be literal.
 func (a *App) isInTextInput() bool {
 	return a.isFiltering() || a.moveMode || a.worktreeMode ||
 		a.sessConvSearching || a.liveInputActive || a.cfgSearching || a.cfgNaming ||
-		a.urlSearching
+		a.urlSearching || a.conv.blockFiltering || a.msgFull.blockFiltering ||
+		a.msgFull.searching
 }
 
 func (a *App) isFiltering() bool {
@@ -3904,9 +4405,32 @@ func (a *App) activeFilterValue() string {
 func (a *App) resetActiveFilter() {
 	switch a.state {
 	case viewSessions:
+		// Remember selected session before reset
+		var selID string
+		if sess, ok := a.selectedSession(); ok {
+			selID = sess.ID
+		}
 		a.sessionList.ResetFilter()
+		// Re-select the same session
+		if selID != "" {
+			for i, item := range a.sessionList.Items() {
+				if si, ok := item.(sessionItem); ok && si.sess.ID == selID {
+					a.sessionList.Select(i)
+					break
+				}
+			}
+		}
 	case viewConversation:
+		idx := a.convList.Index()
 		a.convList.ResetFilter()
+		// Re-select same index (clamped)
+		total := len(a.convList.Items())
+		if idx >= total {
+			idx = total - 1
+		}
+		if idx >= 0 {
+			a.convList.Select(idx)
+		}
 	case viewConfig:
 		a.clearCfgSearch()
 	case viewPlugins:
@@ -4100,12 +4624,18 @@ func (a *App) resizeAll() tea.Cmd {
 	sessW := a.sessSplit.ListWidth(a.width, a.splitRatio)
 	if a.sessionList.Width() == 0 {
 		if len(a.sessions) > 0 {
-			a.sessionList = newSessionList(a.sessions, sessW, contentH, a.sessGroupMode, a.selectedSet)
+			a.sessionList = newSessionList(a.sessions, sessW, contentH, a.sessGroupMode, a.selectedSet, a.hiddenBadges, a.config.WorktreeDir)
 			a.sessSplit.CacheKey = ""
 			if a.config.SearchQuery != "" {
 				applyListFilter(&a.sessionList, a.config.SearchQuery)
 			}
 			cmd = a.autoSelectSession()
+			// Trigger live preview lookup if restored from preferences
+			if a.sessSplit.Show && a.sessPreviewMode == sessPreviewLive {
+				if liveCmd := a.updateSessionPreview(); liveCmd != nil {
+					cmd = tea.Batch(cmd, liveCmd)
+				}
+			}
 		}
 	} else if a.state == viewSessions {
 		idx := a.sessionList.Index()
@@ -4189,10 +4719,21 @@ func (a *App) rebuildSessionList() {
 		selectedID = sess.ID
 	}
 
+	// Preserve active filter
+	var filterTerm string
+	if a.sessionList.FilterState() == list.FilterApplied {
+		filterTerm = a.sessionList.FilterInput.Value()
+	}
+
 	contentH := max(a.height-3, 1)
 	sessW := a.sessSplit.ListWidth(a.width, a.splitRatio)
-	a.sessionList = newSessionList(a.sessions, sessW, contentH, a.sessGroupMode, a.selectedSet)
+	a.sessionList = newSessionList(a.sessions, sessW, contentH, a.sessGroupMode, a.selectedSet, a.hiddenBadges, a.config.WorktreeDir)
 	a.sessSplit.CacheKey = ""
+
+	// Reapply filter
+	if filterTerm != "" {
+		applyListFilter(&a.sessionList, filterTerm)
+	}
 
 	// Restore cursor to previously selected session
 	if selectedID != "" {
@@ -4417,8 +4958,8 @@ func (a *App) breadcrumbRightStatus() string {
 
 	// Session group mode badge (styled)
 	if a.state == viewSessions {
-		modeLabels := []string{"FLAT", "PROJ", "TREE", "CHAIN", "FORK"}
-		modeColors := []lipgloss.Color{"#9CA3AF", "#3B82F6", "#10B981", "#F59E0B", "#EC4899"}
+		modeLabels := []string{"FLAT", "PROJ", "TREE", "CHAIN", "FORK", "REPO"}
+		modeColors := []lipgloss.Color{"#9CA3AF", "#3B82F6", "#10B981", "#F59E0B", "#EC4899", "#7C3AED"}
 		ml := modeLabels[a.sessGroupMode]
 		mc := modeColors[a.sessGroupMode]
 		modeStyle := lipgloss.NewStyle().Foreground(mc).Bold(true)

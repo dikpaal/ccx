@@ -172,9 +172,15 @@ func (a *App) handleURLMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		a.urlMenu = false
+		a.memImportActive = false
+		a.memRemoveActive = false
+		a.worktreeAlignActive = false
 		return a, nil
 	case "q":
 		a.urlMenu = false
+		a.memImportActive = false
+		a.memRemoveActive = false
+		a.worktreeAlignActive = false
 		return a, nil
 	case "up", "k":
 		if a.urlCursor > 0 {
@@ -216,6 +222,21 @@ func (a *App) handleURLMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		a.urlMenu = false
+		// Memory import: copy selected files instead of opening
+		if a.memImportActive {
+			a.commitMemoryImport()
+			return a, nil
+		}
+		// Memory remove: delete selected files
+		if a.memRemoveActive {
+			a.commitMemoryRemove()
+			return a, nil
+		}
+		// Worktree align: move selected worktrees
+		if a.worktreeAlignActive {
+			a.commitWorktreeAlign()
+			return a, nil
+		}
 		if a.isFileScope() {
 			// Open first selected file in editor
 			return a.openInEditor(urls[0])

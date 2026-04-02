@@ -67,7 +67,7 @@ func (a *App) openConversation(sess session.Session) tea.Cmd {
 	a.conv.split.Show = true
 	a.conv.split.Focus = false
 	a.conv.split.CacheKey = ""
-	a.conv.previewMode = previewText
+	// Keep the persisted detail level (don't reset to compact on every open)
 	a.convList = newConvList(a.conv.items, a.conv.split.ListWidth(a.width, a.splitRatio), contentH)
 	a.conv.split.List = &a.convList
 
@@ -121,7 +121,7 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch key {
 	case "q":
-		return a, tea.Quit
+		return a.quit()
 	case "esc":
 		// Clear block filter first
 		if sp.Folds != nil && sp.Folds.BlockFilter != "" {
@@ -198,6 +198,10 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, cmd
 	case "e":
 		return a.openEditMenu(a.currentSess)
+	case "t":
+		a.convTooltipOn = !a.convTooltipOn
+		a.convTooltipScroll = 0
+		return a, nil
 	case "i":
 		return a.openMessageImage()
 	case "I":
@@ -215,8 +219,9 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	// Tab/shift+tab cycles preview mode when preview is open: text → tool → hook
+	// Tab/shift+tab cycles detail level when preview is open: text → tool → hook
 	if (key == "tab" || key == "shift+tab") && sp.Show {
+
 		if key == "shift+tab" {
 			a.conv.previewMode = (a.conv.previewMode + 2) % 3
 		} else {
@@ -337,6 +342,7 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // updateConvPreview refreshes the right-pane preview for the selected conversation item.
 func (a *App) updateConvPreview() {
+	a.convTooltipScroll = 0 // reset tooltip scroll on selection change
 	sp := &a.conv.split
 	if !sp.Show {
 		return
@@ -840,8 +846,128 @@ func (a *App) scrollConvPreviewToTail() {
 // renderConvSplit renders the conversation split view.
 func (a *App) renderConvSplit() string {
 	sp := &a.conv.split
-	return sp.Render(a.width, a.height, a.splitRatio)
+	rendered := sp.Render(a.width, a.height, a.splitRatio)
+
+	// Show tooltip for selected item when list is focused and tooltip is on
+	if a.convTooltipOn && !sp.Focus && sp.Show && len(a.convList.Items()) > 0 {
+		if tooltip := a.convTooltip(); tooltip != "" {
+			contentH := ContentHeight(a.height)
+			rendered = overlayTooltip(rendered, tooltip, a.width, contentH, a.convList.Index(), a.convList.Paginator.PerPage, a.convTooltipScroll)
+		}
+	}
+
+	return rendered
 }
+
+// convTooltip returns the full text of the selected conversation item, or empty if it fits.
+func (a *App) convTooltip() string {
+	idx := a.convList.Index()
+	items := a.convList.VisibleItems()
+	if idx < 0 || idx >= len(items) {
+		return ""
+	}
+	ci, ok := items[idx].(convItem)
+	if !ok {
+		return ""
+	}
+
+	var text string
+	switch ci.kind {
+	case convMsg:
+		text = entryFullText(ci.merged.entry)
+	case convTask:
+		text = ci.task.Subject
+		if ci.task.Description != "" {
+			text += "\n" + ci.task.Description
+		}
+	case convAgent:
+		text = ci.agent.FirstPrompt
+	}
+
+	if text == "" {
+		return ""
+	}
+
+	// Only show tooltip if text is longer than list width (would be truncated)
+	listW := a.conv.split.ListWidth(a.width, a.splitRatio)
+	if len(text) <= listW-15 && !strings.Contains(text, "\n") {
+		return ""
+	}
+
+	return text
+}
+
+// overlayTooltip places a bordered tooltip near the selected item position.
+func overlayTooltip(bg, text string, screenW, screenH, cursorIdx, perPage, scroll int) string {
+	// Tooltip dimensions
+	maxW := screenW / 2
+	if maxW > 60 {
+		maxW = 60
+	}
+	if maxW < 20 {
+		maxW = screenW - 4
+	}
+
+	// Wrap text to fit
+	wrapped := wrapText(text, maxW-4)
+	allLines := strings.Split(wrapped, "\n")
+	maxVisible := screenH / 2
+	if maxVisible < 5 {
+		maxVisible = 5
+	}
+
+	// Apply scroll
+	total := len(allLines)
+	if scroll > total-maxVisible {
+		scroll = max(total-maxVisible, 0)
+	}
+	end := min(scroll+maxVisible, total)
+	lines := allLines[scroll:end]
+
+	// Scroll indicators
+	if scroll > 0 {
+		lines = append([]string{dimStyle.Render(fmt.Sprintf("↑ %d more above", scroll))}, lines...)
+	}
+	if end < total {
+		lines = append(lines, dimStyle.Render(fmt.Sprintf("↓ %d more below (scroll wheel)", total-end)))
+	}
+
+	body := strings.Join(lines, "\n")
+
+	tooltipStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#7DD3FC")).
+		Width(maxW).
+		Padding(0, 1)
+
+	tooltip := tooltipStyle.Render(body)
+
+	// Position: right of the list, near the selected item
+	tooltipLines := strings.Split(tooltip, "\n")
+	tooltipH := len(tooltipLines)
+
+	// Y position: relative to cursor in the visible page
+	visibleIdx := cursorIdx % max(perPage, 1)
+	y := visibleIdx + 1 // +1 for title bar
+	if y+tooltipH > screenH {
+		y = max(screenH-tooltipH, 1)
+	}
+
+	// Overlay onto bg
+	bgLines := strings.Split(bg, "\n")
+	for i, tl := range tooltipLines {
+		row := y + i
+		if row >= 0 && row < len(bgLines) {
+			bgLine := bgLines[row]
+			// Place tooltip starting at column 2
+			bgLines[row] = overlayLine(bgLine, tl, 2, screenW)
+		}
+	}
+
+	return strings.Join(bgLines, "\n")
+}
+
+// overlayLine is defined in sessions.go
 
 // extractTaskEntries returns entries related to a specific task.
 // It finds ranges where the task was in_progress and collects all entries

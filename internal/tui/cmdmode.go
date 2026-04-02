@@ -53,6 +53,16 @@ func buildCmdRegistry() []cmdEntry {
 			action: func(a *App) (tea.Model, tea.Cmd) { a.sessGroupMode = groupChain; a.rebuildSessionList(); return a, nil }},
 		{name: "group:fork", aliases: []string{"g:fork"}, desc: "fork groups", views: cmdSessions,
 			action: func(a *App) (tea.Model, tea.Cmd) { a.sessGroupMode = groupFork; a.rebuildSessionList(); return a, nil }},
+		{name: "group:repo", aliases: []string{"g:repo"}, desc: "base repo groups", views: cmdSessions,
+			action: func(a *App) (tea.Model, tea.Cmd) { a.sessGroupMode = groupBaseProject; a.rebuildSessionList(); return a, nil }},
+
+		// Conversation detail levels
+		{name: "detail:compact", aliases: []string{"d:compact"}, desc: "text only", views: cmdConv,
+			action: func(a *App) (tea.Model, tea.Cmd) { a.setConvDetailLevel(previewText); return a, nil }},
+		{name: "detail:standard", aliases: []string{"d:standard"}, desc: "text + tools", views: cmdConv,
+			action: func(a *App) (tea.Model, tea.Cmd) { a.setConvDetailLevel(previewTool); return a, nil }},
+		{name: "detail:verbose", aliases: []string{"d:verbose"}, desc: "text + tools + hooks", views: cmdConv,
+			action: func(a *App) (tea.Model, tea.Cmd) { a.setConvDetailLevel(previewHook); return a, nil }},
 
 		// Preview modes (sessions only)
 		{name: "preview:conv", aliases: []string{"p:conv"}, desc: "conversation preview", views: cmdSessions,
@@ -179,6 +189,10 @@ func buildCmdRegistry() []cmdEntry {
 			action: func(a *App) (tea.Model, tea.Cmd) { a.cfgFilterCat = int(session.ConfigMCP); a.rebuildCfgList(); return a, nil }},
 		{name: "page:hooks", aliases: []string{"p:hooks"}, desc: "filter to hooks", views: cmdConfig,
 			action: func(a *App) (tea.Model, tea.Cmd) { a.cfgFilterCat = int(session.ConfigHook); a.rebuildCfgList(); return a, nil }},
+		{name: "page:keymaps", aliases: []string{"p:keymaps", "p:km"}, desc: "filter to keymaps", views: cmdConfig,
+			action: func(a *App) (tea.Model, tea.Cmd) { a.cfgFilterCat = int(session.ConfigKeymap); a.rebuildCfgList(); return a, nil }},
+		{name: "page:shortcuts", aliases: []string{"p:shortcuts", "p:sc"}, desc: "filter to shortcuts", views: cmdConfig,
+			action: func(a *App) (tea.Model, tea.Cmd) { a.cfgFilterCat = int(session.ConfigShortcut); a.rebuildCfgList(); return a, nil }},
 
 		// Stats page filters
 		{name: "page:tools", aliases: []string{"p:tools"}, desc: "stats → tools", views: cmdStats,
@@ -209,8 +223,22 @@ func buildCmdRegistry() []cmdEntry {
 			action: func(a *App) (tea.Model, tea.Cmd) { cmd := a.doRefresh(); a.copiedMsg = "Refreshed"; return a, cmd }},
 
 		// Global
-		{name: "keymap:edit", aliases: []string{"km:edit"}, desc: "edit keymap config",
-			action: func(a *App) (tea.Model, tea.Cmd) { return a.bootstrapAndEditKeymap() }},
+		{name: "config:edit", aliases: []string{"cfg:edit", "keymap:edit", "km:edit"}, desc: "edit config",
+			action: func(a *App) (tea.Model, tea.Cmd) { return a.bootstrapAndEditConfig() }},
+
+		// Badges
+		{name: "badge:toggle", aliases: []string{"bt"}, desc: "toggle badge (M,W,T,K,P,A,C,S,X,F,LIVE)",
+			action: func(a *App) (tea.Model, tea.Cmd) {
+				a.copiedMsg = "Usage: badge:toggle <KEY> (M,W,T,K,P,A,C,S,X,F,LIVE)"
+				return a, nil
+			}},
+
+		// Worktree
+		{name: "set:worktree-dir", aliases: []string{"wt:dir"}, desc: "set worktree directory name",
+			action: func(a *App) (tea.Model, tea.Cmd) {
+				a.copiedMsg = fmt.Sprintf("Usage: set:worktree-dir <name> (current: %s)", a.config.WorktreeDir)
+				return a, nil
+			}},
 
 		// Search
 		{name: "search", aliases: []string{"find", "grep"}, desc: "search across all sessions",
@@ -223,6 +251,29 @@ func buildCmdRegistry() []cmdEntry {
 				a.copiedMsg = "Usage: badge:rm NAME"
 				return a, nil
 			}},
+
+		// New session
+		{name: "new", aliases: []string{"n"}, desc: "new Claude session", views: cmdSessions,
+			action: func(a *App) (tea.Model, tea.Cmd) { return a.newSession() }},
+
+		// Worktree + new session
+		{name: "worktree:new", aliases: []string{"wt:new"}, desc: "new worktree + session",
+			action: func(a *App) (tea.Model, tea.Cmd) {
+				a.copiedMsg = "Usage: worktree:new <branch>"
+				return a, nil
+			}},
+
+		// Worktree align
+		{name: "worktree:align", aliases: []string{"wt:align"}, desc: "align worktree paths", views: cmdSessions,
+			action: func(a *App) (tea.Model, tea.Cmd) { return a.startWorktreeAlign() }},
+
+		// Remote execution
+		{name: "remote:start", aliases: []string{"r:start"}, desc: "resume session remotely",
+			action: func(a *App) (tea.Model, tea.Cmd) { return a.executeCmdRemoteStart("remote:start") }},
+		{name: "remote:stop", aliases: []string{"r:stop"}, desc: "stop remote + delete pod",
+			action: func(a *App) (tea.Model, tea.Cmd) { return a.stopRemoteSession() }},
+		{name: "remote:attach", aliases: []string{"r:attach"}, desc: "reattach to remote Claude",
+			action: func(a *App) (tea.Model, tea.Cmd) { return a.reconnectRemoteSession() }},
 	}
 }
 
@@ -239,6 +290,17 @@ func (a *App) setSessPreviewMode(mode sessPreview) {
 		a.sessionList.SetSize(a.sessSplit.ListWidth(a.width, a.splitRatio), contentH)
 		a.sessionList.Select(idx)
 	}
+}
+
+// setConvDetailLevel sets the conversation preview detail level and re-renders.
+func (a *App) setConvDetailLevel(level int) {
+	a.conv.previewMode = level
+	sp := &a.conv.split
+	if sp.Folds != nil {
+		sp.Folds.HideHooks = level == previewTool
+	}
+	sp.CacheKey = ""
+	a.updateConvPreview()
 }
 
 // startCmdMode initializes command mode with an empty text input.
@@ -349,7 +411,7 @@ func (a *App) updateCmdSuggestions() {
 		switch a.state {
 		case viewSessions:
 			a.cmdSuggestions = append(a.cmdSuggestions,
-				cmdEntry{name: "group:", desc: "flat proj tree chain fork"},
+				cmdEntry{name: "group:", desc: "flat proj tree chain fork repo"},
 				cmdEntry{name: "preview:", desc: "conv stats mem tasks live"},
 				cmdEntry{name: "set:ratio", desc: "N  (15-85)"},
 				cmdEntry{name: "refresh", desc: "reload sessions"})
@@ -361,7 +423,7 @@ func (a *App) updateCmdSuggestions() {
 				cmdEntry{name: "page:", desc: "tools errors overview"})
 		}
 		a.cmdSuggestions = append(a.cmdSuggestions,
-			cmdEntry{name: "keymap:edit", desc: "edit keymap config"})
+			cmdEntry{name: "config:edit", desc: "edit config"})
 		return
 	}
 
@@ -415,6 +477,31 @@ func (a *App) executeCommand(input string) (tea.Model, tea.Cmd) {
 	// Check badge:rm NAME (consumes the whole input)
 	if strings.HasPrefix(lower, "badge:rm") || strings.HasPrefix(lower, "badge:remove") {
 		return a.executeCmdBadgeRm(input)
+	}
+
+	// Check badge:toggle <KEY>
+	if strings.HasPrefix(lower, "badge:toggle") || strings.HasPrefix(lower, "bt ") {
+		return a.executeCmdBadgeToggle(input)
+	}
+
+	// Check set:worktree-dir <name>
+	if strings.HasPrefix(lower, "set:worktree-dir") || strings.HasPrefix(lower, "wt:dir") {
+		return a.executeCmdSetWorktreeDir(input)
+	}
+
+	// Check new <path> (optional path argument)
+	if strings.HasPrefix(lower, "new ") || strings.HasPrefix(lower, "n ") {
+		return a.executeCmdNewSession(input)
+	}
+
+	// Check worktree:new <branch>
+	if strings.HasPrefix(lower, "worktree:new") || strings.HasPrefix(lower, "wt:new") {
+		return a.executeCmdWorktreeNew(input)
+	}
+
+	// Check remote:start <context> <repo> [branch] [prompt]
+	if strings.HasPrefix(lower, "remote:start") || strings.HasPrefix(lower, "r:start") {
+		return a.executeCmdRemoteStart(input)
 	}
 
 	// Split into parts for multi-command support
@@ -527,6 +614,48 @@ func (a *App) executeCmdBadgeRm(input string) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
+// executeCmdBadgeToggle handles "badge:toggle <KEY>" commands.
+func (a *App) executeCmdBadgeToggle(input string) (tea.Model, tea.Cmd) {
+	parts := strings.Fields(input)
+	if len(parts) < 2 {
+		a.copiedMsg = "Usage: badge:toggle <KEY> (M,W,T,K,P,A,C,S,X,F,LIVE)"
+		return a, nil
+	}
+	key := strings.ToUpper(parts[len(parts)-1])
+	valid := map[string]bool{"M": true, "W": true, "T": true, "K": true, "P": true, "A": true, "C": true, "S": true, "X": true, "F": true, "LIVE": true}
+	if !valid[key] {
+		a.copiedMsg = "Unknown badge: " + key
+		return a, nil
+	}
+	if a.hiddenBadges[key] {
+		delete(a.hiddenBadges, key)
+		a.copiedMsg = fmt.Sprintf("Badge [%s] shown", key)
+	} else {
+		a.hiddenBadges[key] = true
+		a.copiedMsg = fmt.Sprintf("Badge [%s] hidden", key)
+	}
+	a.rebuildSessionList()
+	return a, nil
+}
+
+// executeCmdSetWorktreeDir handles "set:worktree-dir <name>" commands.
+func (a *App) executeCmdSetWorktreeDir(input string) (tea.Model, tea.Cmd) {
+	parts := strings.Fields(input)
+	if len(parts) < 2 {
+		a.copiedMsg = fmt.Sprintf("Usage: set:worktree-dir <name> (current: %s)", a.config.WorktreeDir)
+		return a, nil
+	}
+	name := parts[len(parts)-1]
+	// Basic validation
+	if strings.Contains(name, "/") || strings.Contains(name, "..") {
+		a.copiedMsg = "Invalid directory name"
+		return a, nil
+	}
+	a.config.WorktreeDir = name
+	a.copiedMsg = fmt.Sprintf("Worktree dir: %s", name)
+	return a, nil
+}
+
 // renderCmdHintBox renders the floating suggestion box for command mode.
 func (a *App) renderCmdHintBox() string {
 	if len(a.cmdSuggestions) == 0 {
@@ -556,36 +685,37 @@ func (a *App) renderCmdHintBox() string {
 	return boxStyle.Render(body)
 }
 
-// parseCmdSetRatioValue extracts the integer value from a "set:ratio N" command.
-// bootstrapAndEditKeymap creates the config file with defaults if it doesn't
-// exist, then opens it in $EDITOR.
-func (a *App) bootstrapAndEditKeymap() (tea.Model, tea.Cmd) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		a.copiedMsg = "Cannot find home dir"
-		return a, nil
-	}
-	configPath := filepath.Join(home, ".config", "ccx", "config.yaml")
+// bootstrapAndEditConfig creates the unified config file with defaults if it
+// doesn't exist, then opens it in $EDITOR.
+func (a *App) bootstrapAndEditConfig() (tea.Model, tea.Cmd) {
+	path := configPath()
 
 	// Create file with defaults if missing
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
-			a.copiedMsg = "mkdir failed: " + err.Error()
-			return a, nil
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		os.MkdirAll(filepath.Dir(path), 0755)
+		km := DefaultKeymap()
+		cfg := CCXConfig{
+			Keymaps: KeymapsConfig{
+				Session:    km.Session,
+				Actions:    km.Actions,
+				Views:      km.Views,
+				Navigation: km.Navigation,
+			},
+			Preferences: a.capturePreferences(),
 		}
-		data, err := yaml.Marshal(DefaultKeymap())
+		data, err := yaml.Marshal(cfg)
 		if err != nil {
 			a.copiedMsg = "marshal failed: " + err.Error()
 			return a, nil
 		}
-		header := "# ccx keymap configuration\n# Uncomment and change values to customize keybindings.\n# Restart ccx after editing.\n\n"
-		if err := os.WriteFile(configPath, []byte(header+string(data)), 0644); err != nil {
+		header := "# ccx configuration\n# Keybindings: session, actions, views, navigation\n# Preferences: preferences section (auto-saved on quit)\n# Restart ccx after editing keybindings.\n\n"
+		if err := os.WriteFile(path, []byte(header+string(data)), 0644); err != nil {
 			a.copiedMsg = "write failed: " + err.Error()
 			return a, nil
 		}
 	}
 
-	return a.openInEditor(configPath)
+	return a.openInEditor(path)
 }
 
 // Exported for testing.

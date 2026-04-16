@@ -212,7 +212,7 @@ func entryFilterText(e session.Entry) string {
 	} else if e.Role == "assistant" {
 		parts = append(parts, "role:asst")
 	}
-	hasImage, hasTask, hasBg, hasAgent, hasThinking := false, false, false, false, false
+	hasImage, hasTask, hasBg, hasAgent, hasThinking, hasCron := false, false, false, false, false, false
 	for _, b := range e.Content {
 		switch b.Type {
 		case "text":
@@ -227,6 +227,9 @@ func entryFilterText(e session.Entry) string {
 			}
 			if isTaskTool(b.ToolName) {
 				hasTask = true
+			}
+			if isCronTool(b.ToolName) {
+				hasCron = true
 			}
 		case "tool_result":
 			if b.IsError {
@@ -255,6 +258,9 @@ func entryFilterText(e session.Entry) string {
 	}
 	if hasThinking {
 		parts = append(parts, "has:thinking")
+	}
+	if hasCron {
+		parts = append(parts, "has:cron")
 	}
 	return strings.Join(parts, " ")
 }
@@ -524,6 +530,29 @@ func renderFullMessageImpl(e session.Entry, width int, folds foldSet, formats fo
 		switch block.Type {
 		case "text":
 			text := strings.TrimSpace(session.StripXMLTags(block.Text))
+			if text == "[separator]" || strings.HasPrefix(text, "[separator]\n\n") {
+				buf.WriteString(cursorPrefix)
+				buf.WriteString(dimStyle.Render(strings.Repeat("-", max(w-3, 10))) + "\n\n")
+				if strings.HasPrefix(text, "[separator]\n\n") {
+					text = strings.TrimPrefix(text, "[separator]\n\n")
+					text = strings.TrimSpace(text)
+					if text != "" {
+						if formatted {
+							text = tryFormatJSON(text)
+						}
+						text = formatMarkdownTables(text)
+						wrapped := wrapText(text, max(w-2, 10))
+						for i, line := range strings.Split(wrapped, "\n") {
+							if i > 0 {
+								buf.WriteString(cursorPrefix)
+							}
+							buf.WriteString(line + "\n")
+						}
+						buf.WriteString("\n")
+					}
+				}
+				break
+			}
 			if text != "" && !isSystemText(text) {
 				buf.WriteString(cursorPrefix)
 				if formatted {
@@ -639,7 +668,7 @@ func renderFullMessageImpl(e session.Entry, width int, folds foldSet, formats fo
 			buf.WriteString(cursorPrefix)
 			label := block.Text
 			if block.ImagePasteID > 0 {
-				label = fmt.Sprintf("🖼 %s  (paste #%d — Enter to open)", block.Text, block.ImagePasteID)
+				label = fmt.Sprintf("▣ %s  (paste #%d — Enter to open)", block.Text, block.ImagePasteID)
 			}
 			buf.WriteString(dimStyle.Render(label) + "\n\n")
 		}

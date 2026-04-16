@@ -391,12 +391,8 @@ func newSessionList(sessions []session.Session, width, height int, groupMode int
 	timeW, msgW := computeSessionColWidths(sessions)
 
 	l := list.New(items, sessionDelegate{timeW: timeW, msgW: msgW, selectedSet: selectedSet, hiddenBadges: hiddenBadges}, width, height)
-	l.SetShowTitle(false)
-	l.SetShowStatusBar(false)
-	l.SetShowFilter(false)
-	l.SetShowPagination(false)
+	initListBase(&l)
 	l.SetFilteringEnabled(true)
-	l.SetShowHelp(false)
 
 	// Use chain-aware filter for grouped modes so children stay visible
 	// when their parent matches (and vice versa).
@@ -405,8 +401,6 @@ func newSessionList(sessions []session.Session, width, height int, groupMode int
 	} else {
 		l.Filter = substringFilter
 	}
-
-	l.DisableQuitKeybindings()
 	configureListSearch(&l)
 	l.SetSize(width, height) // re-compute pagination after hiding bars
 	return l
@@ -949,6 +943,7 @@ func renderHelpModal(bg string, screenW, screenH int, km Keymap, shortcutHint st
 		{worktreeBadge, "[W]", "Git worktree"},
 		{todoBadge, "[T]", "Has todos"},
 		{taskBadge, "[K]", "Has tasks"},
+		{cronBadge, "[R]", "Has cron jobs"},
 		{planBadge, "[P]", "Has plan"},
 		{agentBadgeStyle, "[A]", "Has subagents"},
 		{compactBadgeStyle, "[C]", "Compacted"},

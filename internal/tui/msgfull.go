@@ -22,6 +22,7 @@ type navFrame struct {
 	listIdx  int // cursor position to restore
 	agent    session.Subagent
 	task     session.TaskItem
+	cron     session.CronItem
 	fromView viewState // which view pushed this frame
 }
 
@@ -217,18 +218,29 @@ func (a *App) handleMessageFullKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a.openMessageImage()
 	}
 
-	// Fold navigation
-	fs := &a.msgFull.folds
-	fr := fs.HandleKey(key)
-	if fr == foldCursorMoved || fr == foldHandled {
+	// Fold navigation (with snap + boundary crossing)
+	switch HandleFoldNav(&a.msgFull.folds, &a.msgFull.vp, key) {
+	case NavCursorMoved, NavFoldChanged:
 		a.refreshMsgFullPreview()
 		return a, nil
-	}
-
-	// Scroll viewport
-	switch key {
-	case "up", "down", "pgup", "pgdown", "home", "end":
-		scrollPreview(&a.msgFull.vp, key)
+	case NavBoundaryDown:
+		if a.msgFull.idx < len(a.msgFull.merged)-1 {
+			a.navToMsgFull(a.msgFull.idx + 1)
+			a.refreshMsgFullPreview()
+		}
+		return a, nil
+	case NavBoundaryUp:
+		if a.msgFull.idx > 0 {
+			a.navToMsgFull(a.msgFull.idx - 1)
+			// Position cursor at last block
+			fs := &a.msgFull.folds
+			if last := fs.lastVisibleBlock(); last >= 0 {
+				fs.BlockCursor = last
+			}
+			a.refreshMsgFullPreview()
+		}
+		return a, nil
+	case NavScrolled:
 		return a, nil
 	}
 
@@ -430,6 +442,7 @@ func (a *App) pushNavFrame() {
 		listIdx:  a.convList.Index(),
 		agent:    a.conv.agent,
 		task:     a.conv.task,
+		cron:     a.conv.cron,
 		fromView: a.state,
 	}
 	a.navStack = append(a.navStack, frame)
@@ -459,8 +472,10 @@ func (a *App) popNavFrame() (tea.Model, tea.Cmd) {
 			a.updateConvPreview()
 			return a, nil
 		}
-		// viewConversation with agent → back to sessions
+		// viewConversation with agent/task/cron drilldown → back to sessions
 		a.conv.agent = session.Subagent{}
+		a.conv.task = session.TaskItem{}
+		a.conv.cron = session.CronItem{}
 		a.state = viewSessions
 		return a, nil
 	}
@@ -477,6 +492,7 @@ func (a *App) popNavFrame() (tea.Model, tea.Cmd) {
 		a.conv.items = frame.items
 		a.conv.agent = frame.agent
 		a.conv.task = frame.task
+		a.conv.cron = frame.cron
 		a.msgFull.allMessages = false
 
 		contentH := ContentHeight(a.height)

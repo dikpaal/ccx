@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sendbird/ccx/internal/cli"
+	"github.com/sendbird/ccx/internal/kitty"
 	"github.com/sendbird/ccx/internal/session"
 	"github.com/sendbird/ccx/internal/tmux"
 	"github.com/sendbird/ccx/internal/tui"
@@ -33,7 +34,7 @@ func main() {
 	// Handle subcommands before global flag parsing
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "urls", "files", "images", "help":
+		case "urls", "files", "changes", "images", "conversation", "help":
 			subcmd := os.Args[1]
 			fs := flag.NewFlagSet(subcmd, flag.ExitOnError)
 			plain := fs.Bool("plain", false, "force plain text output (no interactive picker)")
@@ -119,6 +120,10 @@ func main() {
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
+	}
+	// Clear any Kitty inline images before exiting
+	if kitty.Supported() {
+		fmt.Print(kitty.ClearImages())
 	}
 }
 

@@ -121,7 +121,7 @@ func setupConvApp(t *testing.T, entries []session.Entry, width, height int) *App
 	app.conv.sess = sess
 	app.conv.messages = entries
 	app.conv.merged = filterConversation(mergeConversationTurns(entries))
-	app.conv.items = buildConvItems(app.conv.merged, nil, nil)
+	app.conv.items = buildConvItems(app.conv.merged, nil, nil, nil)
 
 	contentH := ContentHeight(height)
 	app.conv.split.Focus = false
@@ -142,7 +142,7 @@ func setupTreeConvApp(t *testing.T, entries []session.Entry, tasks []session.Tas
 	app.currentSess.Tasks = tasks
 	app.conv.sess.Tasks = tasks
 	app.conv.agents = agents
-	app.conv.items = buildConvItems(app.conv.merged, agents, tasks)
+	app.conv.items = buildConvItems(app.conv.merged, agents, tasks, nil)
 	app.conv.leftPaneMode = convPaneTree
 	app.rebuildConversationList(0)
 	app.updateConvPreview()
@@ -176,6 +176,14 @@ func pressKey(app *App, key string) *App {
 		msg = tea.KeyMsg{Type: tea.KeyTab}
 	case "shift+tab":
 		msg = tea.KeyMsg{Type: tea.KeyShiftTab}
+	case "pgup":
+		msg = tea.KeyMsg{Type: tea.KeyPgUp}
+	case "pgdown":
+		msg = tea.KeyMsg{Type: tea.KeyPgDown}
+	case "home":
+		msg = tea.KeyMsg{Type: tea.KeyHome}
+	case "end":
+		msg = tea.KeyMsg{Type: tea.KeyEnd}
 	case "esc":
 		msg = tea.KeyMsg{Type: tea.KeyEscape}
 	default:
@@ -277,7 +285,7 @@ func TestConvPreviewGrowBlocksOnSameEntry(t *testing.T) {
 	// Simulate growing: add more blocks to the same entry
 	grown := makeGrowingEntry(base.Add(time.Second), 6)
 	app.conv.merged[1] = mergedMsg{entry: grown, startIdx: 1, endIdx: 1}
-	app.conv.items = buildConvItems(app.conv.merged, nil, nil)
+	app.conv.items = buildConvItems(app.conv.merged, nil, nil, nil)
 
 	// Update preview — should use GrowBlocks, preserving existing folds
 	app.conv.split.CacheKey = fmt.Sprintf("%d:%d", 1, 3) // old block count
@@ -339,7 +347,7 @@ func TestLiveTailTracksNewMessages(t *testing.T) {
 	entries = append(entries, newEntry)
 	app.conv.messages = entries
 	app.conv.merged = filterConversation(mergeConversationTurns(entries))
-	app.conv.items = buildConvItems(app.conv.merged, nil, nil)
+	app.conv.items = buildConvItems(app.conv.merged, nil, nil, nil)
 
 	contentH := ContentHeight(app.height)
 	app.convList = newConvList(app.conv.items, app.conv.split.ListWidth(app.width, app.splitRatio), contentH)
@@ -377,7 +385,7 @@ func TestLiveTailGrowingContent(t *testing.T) {
 	// Grow the entry
 	grown := makeGrowingEntry(base.Add(time.Second), 8)
 	app.conv.merged[len(app.conv.merged)-1] = mergedMsg{entry: grown, startIdx: 1, endIdx: 1}
-	app.conv.items = buildConvItems(app.conv.merged, nil, nil)
+	app.conv.items = buildConvItems(app.conv.merged, nil, nil, nil)
 	app.conv.split.CacheKey = fmt.Sprintf("%d:%d", 1, 2) // old count
 
 	app.updateConvPreview()
@@ -393,6 +401,85 @@ func TestLiveTailGrowingContent(t *testing.T) {
 	}
 }
 
+func TestLiveTailPausesOnManualPreviewUp(t *testing.T) {
+	app := setupConvApp(t, testEntries(), 160, 50)
+	app.liveTail = true
+	app.conv.split.BottomAlign = true
+	app.conv.split.Focus = true
+
+	items := app.convList.Items()
+	app.convList.Select(len(items) - 1)
+	app.updateConvPreview()
+	app.scrollConvPreviewToTail()
+
+	selectedBefore := app.convList.Index()
+	app = pressKey(app, "up")
+
+	if app.liveTail {
+		t.Fatal("live tail should pause after manual preview up navigation")
+	}
+	if app.conv.split.BottomAlign {
+		t.Fatal("bottom align should be cleared when live tail pauses")
+	}
+	if app.convList.Index() != selectedBefore {
+		t.Fatalf("manual preview navigation should not change list selection: got %d want %d", app.convList.Index(), selectedBefore)
+	}
+}
+
+func TestLiveTailPausesOnPreviewPageUp(t *testing.T) {
+	app := setupConvApp(t, testEntries(), 160, 50)
+	app.liveTail = true
+	app.conv.split.BottomAlign = true
+	app.conv.split.Focus = true
+
+	items := app.convList.Items()
+	app.convList.Select(len(items) - 1)
+	app.updateConvPreview()
+	app.scrollConvPreviewToTail()
+
+	app = pressKey(app, "pgup")
+
+	if app.liveTail {
+		t.Fatal("live tail should pause after manual preview pgup")
+	}
+}
+
+func TestLiveTailPausedDoesNotJumpBackOnTick(t *testing.T) {
+	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	entries := []session.Entry{
+		makeTextEntry("user", base, "Hello"),
+		makeTextEntry("assistant", base.Add(time.Second), strings.Repeat("Long reply line.\n", 30)),
+		makeTextEntry("user", base.Add(2*time.Second), "Inspect older content"),
+		makeTextEntry("assistant", base.Add(3*time.Second), strings.Repeat("Newest line.\n", 30)),
+	}
+	app := setupConvApp(t, entries, 160, 30)
+	app.liveTail = true
+	app.conv.split.BottomAlign = true
+	app.conv.split.Focus = true
+
+	items := app.convList.Items()
+	app.convList.Select(len(items) - 1)
+	app.updateConvPreview()
+	app.scrollConvPreviewToTail()
+
+	app = pressKey(app, "up")
+	selectedBefore := app.convList.Index()
+	offsetBefore := app.conv.split.Preview.YOffset
+
+	m, cmd := app.Update(liveTickMsg{})
+	app = m.(*App)
+
+	if cmd != nil {
+		t.Fatal("paused live tail should not schedule another live tick")
+	}
+	if app.convList.Index() != selectedBefore {
+		t.Fatalf("selection should stay put when live tail is paused: got %d want %d", app.convList.Index(), selectedBefore)
+	}
+	if app.conv.split.Preview.YOffset != offsetBefore {
+		t.Fatalf("preview offset should stay put when live tail is paused: got %d want %d", app.conv.split.Preview.YOffset, offsetBefore)
+	}
+}
+
 func TestLiveTailAlwaysSelectsLastItem(t *testing.T) {
 	entries := testEntries()
 	app := setupConvApp(t, entries, 160, 50)
@@ -405,7 +492,7 @@ func TestLiveTailAlwaysSelectsLastItem(t *testing.T) {
 
 	// Simulate handleLiveTail inline (refreshConversation needs file I/O,
 	// so rebuild manually)
-	app.conv.items = buildConvItems(app.conv.merged, nil, nil)
+	app.conv.items = buildConvItems(app.conv.merged, nil, nil, nil)
 	contentH := ContentHeight(app.height)
 	app.convList = newConvList(app.conv.items, app.conv.split.ListWidth(app.width, app.splitRatio), contentH)
 	app.conv.split.List = &app.convList
@@ -470,7 +557,7 @@ func TestLiveTailRefreshNoCachePoisoning(t *testing.T) {
 	grown := makeGrowingEntry(base.Add(time.Second), 8)
 	app.conv.messages = []session.Entry{entries[0], grown}
 	app.conv.merged = filterConversation(mergeConversationTurns(app.conv.messages))
-	app.conv.items = buildConvItems(app.conv.merged, nil, nil)
+	app.conv.items = buildConvItems(app.conv.merged, nil, nil, nil)
 
 	// Simulate what refreshConversation does (minus LoadMessages I/O)
 	oldIdx := app.convList.Index()
@@ -705,7 +792,7 @@ func TestBuildEntityTreeUsesCompactLabels(t *testing.T) {
 		Status:  "in_progress",
 	}}
 
-	items := buildEntityTree(merged, agents, tasks, map[string]string{"agent-1": "running"})
+	items := buildEntityTree(merged, agents, tasks, nil, map[string]string{"agent-1": "running"})
 
 	var agentLabel, bgLabel, taskLabel string
 	for _, item := range items {
@@ -993,6 +1080,125 @@ func TestDefaultFoldsCollapseTools(t *testing.T) {
 // TestLiveTickMsgReachesHandleLiveTailInConvView verifies that liveTickMsg
 // dispatches to handleLiveTail (not refreshLivePreview) when app.state == viewConversation,
 // even if sessPreviewLive and livePreviewSessID are set from a prior session view.
+func TestConversationPageMenuOpensWithP(t *testing.T) {
+	app := setupConvApp(t, testEntries(), 160, 40)
+	app = pressKey(app, "p")
+	if !app.convPageMenu {
+		t.Fatal("expected conversation page menu to open")
+	}
+}
+
+func TestConversationPageMenuConsumesSecondKey(t *testing.T) {
+	app := setupConvApp(t, testEntries(), 160, 40)
+	app.convPageMenu = true
+	app = pressKey(app, "o")
+	if app.convPageMenu {
+		t.Fatal("expected conversation page menu to close after selection")
+	}
+}
+
+func TestConversationPageMenuImagesPage(t *testing.T) {
+	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	entries := []session.Entry{{
+		Role:      "assistant",
+		Timestamp: base,
+		Content: []session.ContentBlock{{
+			Type:         "image",
+			Text:         "[Image: image/png]",
+			ImagePasteID: 42,
+		}},
+	}}
+	app := setupConvApp(t, entries, 160, 40)
+	app.conv.merged = filterConversation(mergeConversationTurns(entries))
+	m, _ := app.openConvImagesPage()
+	app = m.(*App)
+	if app.convPage != convPageImages {
+		t.Fatal("expected images page to open")
+	}
+	if len(app.convPageItems) != 1 {
+		t.Fatalf("expected 1 image artifact item, got %d", len(app.convPageItems))
+	}
+}
+
+func TestBuildStandardEntryIncludesArtifactRows(t *testing.T) {
+	entry := session.Entry{
+		Role: "assistant",
+		Content: []session.ContentBlock{
+			{Type: "text", Text: "Here is the result"},
+			{Type: "tool_use", ToolName: "Read", ToolInput: `{"file_path":"/tmp/x.go"}`},
+		},
+	}
+	preview := buildStandardEntry(entry)
+	found := false
+	for _, b := range preview.Content {
+		if b.Type == "text" && strings.Contains(b.Text, "[file] /tmp/x.go") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected file artifact block, got %#v", preview.Content)
+	}
+}
+
+func TestRenderStandardPreviewShowsArtifactSummary(t *testing.T) {
+	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	entries := []session.Entry{
+		makeTextEntry("user", base, "hello"),
+		{
+			Role:      "assistant",
+			Timestamp: base.Add(time.Second),
+			Content: []session.ContentBlock{
+				{Type: "text", Text: "Here is the result"},
+				{Type: "tool_use", ToolName: "Read", ToolInput: `{"file_path":"/tmp/x.go"}`},
+			},
+		},
+	}
+	app := setupConvApp(t, entries, 160, 40)
+	app.conv.rightPaneMode = previewTool
+	app.conv.split.CacheKey = ""
+	selectConvItemBy(t, app, func(ci convItem) bool {
+		return ci.kind == convMsg && ci.merged.entry.Role == "assistant"
+	})
+	app.updateConvPreview()
+	if app.conv.split.Folds == nil || len(app.conv.split.Folds.Entry.Content) == 0 {
+		t.Fatal("expected fold-aware standard preview entry")
+	}
+	foundArtifacts := false
+	foundFile := false
+	for _, b := range app.conv.split.Folds.Entry.Content {
+		if b.Type == "text" && b.Text == "Artifacts" {
+			foundArtifacts = true
+		}
+		if b.Type == "text" && strings.Contains(b.Text, "[file] /tmp/x.go") {
+			foundFile = true
+		}
+	}
+	if !foundArtifacts {
+		t.Fatalf("standard preview should include Artifacts header block")
+	}
+	if !foundFile {
+		t.Fatalf("standard preview should include file artifact block")
+	}
+}
+
+func TestFocusedArtifactTooltipForChangeBlock(t *testing.T) {
+	sp := &SplitPane{}
+	sp.Folds = &FoldState{
+		Entry: session.Entry{Content: []session.ContentBlock{{
+			Type:      "tool_use",
+			ToolName:  "Edit",
+			ToolInput: `{"file_path":"/tmp/x.go","old_string":"a","new_string":"b"}`,
+		}}},
+		BlockCursor: 0,
+	}
+	app := &App{currentSess: session.Session{ID: "test-sess"}}
+	tooltip := app.focusedArtifactTooltip(sp, 120)
+	if !strings.Contains(tooltip, "/tmp/x.go") {
+		t.Fatalf("expected change tooltip to include file path, got %q", tooltip)
+	}
+}
+
 func TestLiveTickMsgReachesHandleLiveTailInConvView(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 	entries := []session.Entry{

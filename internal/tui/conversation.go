@@ -13,6 +13,8 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/sendbird/ccx/internal/extract"
+	"github.com/sendbird/ccx/internal/kitty"
 	"github.com/sendbird/ccx/internal/session"
 )
 
@@ -44,21 +46,27 @@ func (a *App) openConversation(sess session.Session) tea.Cmd {
 	a.conv.merged = filterConversation(mergeConversationTurns(entries))
 	a.conv.agent = session.Subagent{}
 	a.conv.task = session.TaskItem{}
+	a.conv.cron = session.CronItem{}
 	a.conv.toolUseToAgent = buildToolUseToAgentMap(entries)
 
 	// Load agents
 	agents, _ := session.FindSubagents(sess.FilePath)
 	a.conv.agents = agents
 
-	// Build conversation items — use file-based tasks, or extract from JSONL
+	// Build conversation items — use file-based tasks/crons, or extract from JSONL
 	tasks := sess.Tasks
 	if len(tasks) == 0 {
 		tasks = extractInlineTasks(entries)
 		sess.Tasks = tasks
-		a.conv.sess = sess
-		a.currentSess = sess
 	}
-	a.conv.items = buildConvItems(a.conv.merged, agents, tasks)
+	crons := sess.Crons
+	if len(crons) == 0 && sess.HasCrons {
+		crons = session.LoadCronsFromEntries(entries)
+		sess.Crons = crons
+	}
+	a.conv.sess = sess
+	a.currentSess = sess
+	a.conv.items = buildConvItems(a.conv.merged, agents, tasks, crons)
 
 	if info, err := os.Stat(sess.FilePath); err == nil {
 		a.lastMsgLoadTime = info.ModTime()
@@ -92,10 +100,175 @@ func (a *App) openConversation(sess session.Session) tea.Cmd {
 	return nil
 }
 
+func (a *App) pauseLiveTail() {
+	if a.liveTail {
+		a.liveTail = false
+		a.conv.split.BottomAlign = false
+	}
+}
+
 // handleConversationKeys handles keyboard input for the conversation split view.
+func (a *App) convPageSelectedItem() *convPageItem {
+	if a.convPageCursor < 0 || a.convPageCursor >= len(a.convPageItems) {
+		return nil
+	}
+	return &a.convPageItems[a.convPageCursor]
+}
+
+func (a *App) convPageItemResolvedTarget(item convPageItem) string {
+	if a.convPage == convPageImages {
+		if item.URL != "" && !strings.HasPrefix(item.URL, "paste:") {
+			return item.URL
+		}
+		if item.imagePasteID > 0 {
+			return a.resolveImagePath(item.imagePasteID)
+		}
+	}
+	return item.URL
+}
+
+func (a *App) convPageOpenSelected() (tea.Model, tea.Cmd) {
+	item := a.convPageSelectedItem()
+	if item == nil {
+		return a, nil
+	}
+	switch a.convPage {
+	case convPageImages:
+		if item.imagePasteID > 0 {
+			return a.openCachedImage(item.imagePasteID)
+		}
+	case convPageFiles, convPageChanges:
+		target := a.convPageItemResolvedTarget(*item)
+		if target != "" {
+			return a.openInEditor(target)
+		}
+	case convPageURLs:
+		if item.URL != "" {
+			if err := extract.OpenInBrowser(item.URL); err == nil {
+				a.copiedMsg = "Opened URL"
+			}
+		}
+	}
+	return a, nil
+}
+
+func (a *App) convPageEditSelected() (tea.Model, tea.Cmd) {
+	item := a.convPageSelectedItem()
+	if item == nil {
+		return a, nil
+	}
+	if a.convPage == convPageFiles || a.convPage == convPageChanges || a.convPage == convPageImages {
+		target := a.convPageItemResolvedTarget(*item)
+		if target != "" {
+			return a.openInEditor(target)
+		}
+	}
+	return a, nil
+}
+
+func (a *App) convPageCopySelected() (tea.Model, tea.Cmd) {
+	item := a.convPageSelectedItem()
+	if item == nil {
+		return a, nil
+	}
+	target := item.URL
+	if a.convPage == convPageFiles || a.convPage == convPageChanges || a.convPage == convPageImages {
+		target = a.convPageItemResolvedTarget(*item)
+	}
+	if target != "" {
+		copyToClipboard(target)
+		a.copiedMsg = "Copied path"
+	}
+	return a, nil
+}
+
 func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	sp := &a.conv.split
 	key := msg.String()
+
+	// Artifact page actions menu
+	if a.convPageActionsMenu {
+		a.convPageActionsMenu = false
+		switch key {
+		case "enter":
+			return a.convPageOpenSelected()
+		case "e":
+			return a.convPageEditSelected()
+		case "o":
+			if a.convPage == convPageURLs {
+				return a.convPageOpenSelected()
+			}
+			return a, nil
+		case "y":
+			return a.convPageCopySelected()
+		case "x":
+			a.convPageActionsMenu = true
+			return a, nil
+		}
+		return a, nil
+	}
+
+	// Page jump menu: second key picks the page
+	if a.convPageMenu {
+		a.convPageMenu = false
+		return a.handleConvPageMenu(key)
+	}
+
+	// Dedicated conversation artifact page browser
+	if a.convPage != convPageOverview {
+		switch key {
+		case "p":
+			a.convPageMenu = true
+			return a, nil
+		case "esc":
+			a.convPage = convPageOverview
+			a.convPageItems = nil
+			a.convPageChangeMap = nil
+			a.conv.split.CacheKey = ""
+			return a, nil
+		case "up", "k":
+			if a.convPageCursor > 0 {
+				a.convPageCursor--
+			}
+			return a, nil
+		case "down", "j":
+			if a.convPageCursor < len(a.convPageItems)-1 {
+				a.convPageCursor++
+			}
+			return a, nil
+		case "enter":
+			if a.convPageCursor >= 0 && a.convPageCursor < len(a.convPageItems) {
+				item := a.convPageItems[a.convPageCursor]
+				switch a.convPage {
+				case convPageImages:
+					id := strings.TrimPrefix(item.URL, "paste:")
+					var pasteID int
+					fmt.Sscanf(id, "%d", &pasteID)
+					if pasteID > 0 {
+						return a.openCachedImage(pasteID)
+					}
+				case convPageFiles, convPageChanges:
+					return a.openInEditor(item.URL)
+				case convPageURLs:
+					if err := extract.OpenInBrowser(item.URL); err == nil {
+						a.copiedMsg = "Opened URL"
+					}
+				}
+			}
+			return a, nil
+		case "e":
+			if a.convPageCursor >= 0 && a.convPageCursor < len(a.convPageItems) {
+				item := a.convPageItems[a.convPageCursor]
+				if a.convPage == convPageFiles || a.convPage == convPageChanges {
+					return a.openInEditor(item.URL)
+				}
+			}
+			return a, nil
+		case "x":
+			a.convPageActionsMenu = true
+			return a, nil
+		}
+	}
 
 	// Block filter input intercepts all keys
 	if a.conv.blockFiltering {
@@ -130,7 +303,7 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !sp.Show {
 			a.liveTail = false
 			a.conv.split.BottomAlign = false
-			if a.conv.task.ID != "" || a.conv.agent.ShortID != "" {
+			if a.conv.task.ID != "" || a.conv.agent.ShortID != "" || a.conv.cron.ID != "" {
 				return a.popNavFrame()
 			}
 			a.state = viewSessions
@@ -219,18 +392,13 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return a.openMsgFullForEntry(item.merged)
 		}
 		return a, nil
-	case "L":
+	case a.keymap.Conversation.LiveToggle:
 		return a.toggleConvLiveTail()
-	default:
-		// Jump to entity tree with selected item
-		if key == a.keymap.Conversation.JumpToTree && a.conv.leftPaneMode != convPaneTree {
-			return a.jumpToEntityTree()
-		}
 	case a.keymap.Session.Refresh:
 		cmd := a.refreshConversation()
 		a.copiedMsg = "Refreshed"
 		return a, cmd
-	case "e":
+	case a.keymap.Conversation.Edit:
 		return a.openEditMenu(a.currentSess)
 	case "t":
 		a.convTooltipOn = !a.convTooltipOn
@@ -238,46 +406,51 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	case "i":
 		return a.openMessageImage()
-	case "I":
+	case a.keymap.Conversation.Input:
 		if !a.config.TmuxEnabled {
 			return a, nil
 		}
 		return a.openLiveInput(a.currentSess.ProjectPath, a.currentSess.ID)
-	case "J":
-		if !a.config.TmuxEnabled {
-			return a, nil
+	case a.keymap.Conversation.JumpToTree:
+		// In tree mode: jump to origin message in flat view
+		if a.conv.leftPaneMode == convPaneTree {
+			return a.jumpToOriginMessage()
 		}
-		return a.jumpToTmuxPane(a.currentSess.ProjectPath, a.currentSess.ID)
-	case "x":
+		// In flat mode with tmux: jump to tmux pane
+		if a.config.TmuxEnabled {
+			return a.jumpToTmuxPane(a.currentSess.ProjectPath, a.currentSess.ID)
+		}
+		// In flat mode without tmux: jump to tree
+		return a.jumpToEntityTree()
+	case a.keymap.Conversation.Actions:
 		a.convActionsMenu = true
+		return a, nil
+	case "p":
+		a.convPageMenu = true
 		return a, nil
 	}
 
 	// Tab/shift+tab act on the focused pane: left toggles flat/tree, right cycles compact/standard/verbose.
-	if (key == "tab" || key == "shift+tab") && sp.Show {
+	if key == "tab" || key == "shift+tab" {
+		if !sp.Show {
+			sp.Show = true
+			sp.Focus = false
+			a.updateConvPreview()
+			return a, nil
+		}
 		if sp.Focus {
 			if key == "shift+tab" {
-				a.conv.rightPaneMode = (a.conv.rightPaneMode + len(previewModeLabels) - 1) % len(previewModeLabels)
+				a.setConvDetailLevel((a.conv.rightPaneMode + len(previewModeLabels) - 1) % len(previewModeLabels))
 			} else {
-				a.conv.rightPaneMode = (a.conv.rightPaneMode + 1) % len(previewModeLabels)
-			}
-			if sp.Folds != nil {
-				sp.Folds.HideHooks = a.conv.rightPaneMode == previewTool
+				a.setConvDetailLevel((a.conv.rightPaneMode + 1) % len(previewModeLabels))
 			}
 		} else {
 			if a.conv.leftPaneMode == convPaneFlat {
-				a.conv.leftPaneMode = convPaneTree
+				a.setConvLeftPaneMode(convPaneTree)
 			} else {
-				a.conv.leftPaneMode = convPaneFlat
+				a.setConvLeftPaneMode(convPaneFlat)
 			}
-			if a.conv.leftPaneMode == convPaneTree && a.liveTail {
-				a.liveTail = false
-				a.conv.split.BottomAlign = false
-			}
-			a.rebuildConversationList(0)
 		}
-		sp.CacheKey = "" // force re-render
-		a.updateConvPreview()
 		return a, nil
 	}
 
@@ -300,7 +473,7 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if key == "left" {
 			a.liveTail = false
 			a.conv.split.BottomAlign = false
-			if a.conv.task.ID != "" || a.conv.agent.ShortID != "" {
+			if a.conv.task.ID != "" || a.conv.agent.ShortID != "" || a.conv.cron.ID != "" {
 				return a.popNavFrame()
 			}
 			a.state = viewSessions
@@ -310,6 +483,9 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Focused preview keys
 	if sp.Focus && sp.Show {
+		if key == "up" || key == "pgup" || key == "home" {
+			a.pauseLiveTail()
+		}
 		if key == "up" || key == "down" {
 			if a.conv.rightPaneMode == previewText {
 				// Text mode: scroll viewport directly
@@ -317,15 +493,16 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return a, nil
 			}
 			if sp.Folds != nil {
-				fr := sp.Folds.HandleKey(key)
-				if fr == foldCursorMoved {
+				switch HandleFoldNav(sp.Folds, &sp.Preview, key) {
+				case NavCursorMoved:
 					sp.RefreshFoldCursor(a.width, a.splitRatio)
 					sp.ScrollToBlock()
-					return a, nil
-				}
-				if fr == foldHandled {
+				case NavFoldChanged:
 					sp.RefreshFoldCursor(a.width, a.splitRatio)
-					return a, nil
+				case NavBoundaryDown:
+					return a.convPreviewBoundaryCross("down")
+				case NavBoundaryUp:
+					return a.convPreviewBoundaryCross("up")
 				}
 				return a, nil
 			}
@@ -339,6 +516,9 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return a, startListSearch(&a.convList)
 		case splitKeyCursorMoved:
+			if key == "up" {
+				a.pauseLiveTail()
+			}
 			sp.RefreshFoldCursor(a.width, a.splitRatio)
 			sp.ScrollToBlock()
 			return a, nil
@@ -346,18 +526,23 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			sp.RefreshFoldPreview(a.width, a.splitRatio)
 			return a, nil
 		case splitKeyScrolled:
+			if key == "pgup" || key == "home" {
+				a.pauseLiveTail()
+			}
 			return a, nil
 		case splitKeyUnfocused:
 			return a, nil
+		case splitKeyBoundaryDown:
+			return a.convPreviewBoundaryCross("down")
+		case splitKeyBoundaryUp:
+			a.pauseLiveTail()
+			return a.convPreviewBoundaryCross("up")
 		}
 	}
 
 	// List boundary
 	if !sp.Focus && sp.HandleListBoundary(key) {
-		if a.liveTail {
-			a.liveTail = false
-			a.conv.split.BottomAlign = false
-		}
+		a.pauseLiveTail()
 		if sp.Show {
 			a.updateConvPreview()
 		}
@@ -370,8 +555,7 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	a.convList = m
 	newIdx := a.convList.Index()
 	if oldIdx != newIdx && a.liveTail {
-		a.liveTail = false
-		a.conv.split.BottomAlign = false
+		a.pauseLiveTail()
 	}
 	if sp.Show {
 		if oldIdx == newIdx {
@@ -386,6 +570,55 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return a, cmd
 }
 
+// convPreviewBoundaryCross advances to the next/prev list item when the block
+// cursor hits the top or bottom boundary of the current preview.
+func (a *App) convPreviewBoundaryCross(key string) (tea.Model, tea.Cmd) {
+	sp := &a.conv.split
+	idx := a.convList.Index()
+	items := a.convList.Items()
+	n := len(items)
+
+	switch key {
+	case "down":
+		// Find next convMsg item after current index
+		for i := idx + 1; i < n; i++ {
+			if ci, ok := items[i].(convItem); ok && ci.kind == convMsg {
+				a.convList.Select(i)
+				sp.CacheKey = ""
+				a.updateConvPreview()
+				// Position cursor at first block
+				if sp.Folds != nil {
+					if first := sp.Folds.firstVisibleBlock(); first >= 0 {
+						sp.Folds.BlockCursor = first
+					}
+				}
+				sp.RefreshFoldCursor(a.width, a.splitRatio)
+				sp.ScrollToBlock()
+				return a, nil
+			}
+		}
+	case "up":
+		// Find prev convMsg item before current index
+		for i := idx - 1; i >= 0; i-- {
+			if ci, ok := items[i].(convItem); ok && ci.kind == convMsg {
+				a.convList.Select(i)
+				sp.CacheKey = ""
+				a.updateConvPreview()
+				// Position cursor at last block
+				if sp.Folds != nil {
+					if last := sp.Folds.lastVisibleBlock(); last >= 0 {
+						sp.Folds.BlockCursor = last
+					}
+				}
+				sp.RefreshFoldCursor(a.width, a.splitRatio)
+				sp.ScrollToBlock()
+				return a, nil
+			}
+		}
+	}
+	return a, nil
+}
+
 // updateConvPreview refreshes the right-pane preview for the selected conversation item.
 func (a *App) updateConvPreview() {
 	a.convTooltipScroll = 0 // reset tooltip scroll on selection change
@@ -396,6 +629,13 @@ func (a *App) updateConvPreview() {
 
 	item, ok := a.convList.SelectedItem().(convItem)
 	if !ok {
+		return
+	}
+
+	baseKey := convPreviewBaseKey(item)
+	oldCacheKey := sp.CacheKey
+	if item.kind == convAgent && oldCacheKey != "" && strings.HasPrefix(oldCacheKey, baseKey+":") {
+		debugLog.Printf("updateConvPreview: CACHE HIT key=%q (agent)", oldCacheKey)
 		return
 	}
 
@@ -438,22 +678,25 @@ func (a *App) updateConvPreview() {
 		}
 	}
 
-	// Text-only preview mode: show clean conversation text (no tool calls).
-	// Exception: in tree mode, always show full content with tool blocks
-	// since the whole point of tree view is to inspect entity details.
-	if a.conv.rightPaneMode == previewText && a.conv.leftPaneMode != convPaneTree {
-		a.renderTextOnlyPreview(item, entry)
-		return
+	// Compact preview: text only.
+	// Standard preview: conversation text + artifacts only.
+	// Verbose preview: full structured blocks + hooks.
+	if a.conv.leftPaneMode != convPaneTree {
+		if a.conv.rightPaneMode == previewText {
+			a.renderTextOnlyPreview(item, entry)
+			return
+		}
+		if a.conv.rightPaneMode == previewTool {
+			entry = buildStandardEntry(entry)
+		}
 	}
 
-	baseKey := convPreviewBaseKey(item)
 	cacheKey := fmt.Sprintf("%s:%d", baseKey, len(entry.Content))
 	if cacheKey == sp.CacheKey {
 		debugLog.Printf("updateConvPreview: CACHE HIT key=%q", cacheKey)
 		return
 	}
 
-	oldCacheKey := sp.CacheKey
 	isNewEntry := oldCacheKey == "" || !strings.HasPrefix(oldCacheKey, baseKey+":")
 
 	if isNewEntry {
@@ -492,18 +735,22 @@ func (a *App) updateConvPreview() {
 	}
 }
 
-// renderTextOnlyPreview renders a clean text-only view of the entry (no tool calls).
-func (a *App) renderTextOnlyPreview(item convItem, entry session.Entry) {
-	sp := &a.conv.split
-	pw := sp.PreviewWidth(a.width, a.splitRatio)
-	textW := max(pw-2, 10)
-
-	cacheKey := fmt.Sprintf("text:%s:%d", convPreviewBaseKey(item), len(entry.Content))
-	if cacheKey == sp.CacheKey {
-		return
+func previewTextChunks(e session.Entry) []string {
+	var chunks []string
+	for _, b := range e.Content {
+		if b.Type != "text" {
+			continue
+		}
+		text := strings.TrimSpace(session.StripXMLTags(b.Text))
+		if text == "" {
+			continue
+		}
+		chunks = append(chunks, text)
 	}
+	return chunks
+}
 
-	// Header
+func renderPreviewHeader(entry session.Entry, textW int) string {
 	roleStyle := lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
 	dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 
@@ -521,23 +768,339 @@ func (a *App) renderTextOnlyPreview(item convItem, entry session.Entry) {
 	}
 	sb.WriteString("\n")
 	sb.WriteString(dimStyle.Render(strings.Repeat("─", min(textW, 60))) + "\n\n")
+	return sb.String()
+}
 
-	// Extract text blocks only
-	text := entryFullText(entry)
-	if text == "" {
+// renderTextOnlyPreview renders a clean text-only view of the entry (no tool calls).
+func (a *App) renderTextOnlyPreview(item convItem, entry session.Entry) {
+	sp := &a.conv.split
+	pw := sp.PreviewWidth(a.width, a.splitRatio)
+	textW := max(pw-2, 10)
+
+	cacheKey := fmt.Sprintf("text:%s:%d", convPreviewBaseKey(item), len(entry.Content))
+	if cacheKey == sp.CacheKey {
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(renderPreviewHeader(entry, textW))
+
+	chunks := previewTextChunks(entry)
+	if len(chunks) == 0 {
 		sb.WriteString(dimStyle.Render("(no text content)"))
 	} else {
-		sb.WriteString(wrapText(text, textW))
+		for i, chunk := range chunks {
+			if i > 0 {
+				sb.WriteString("\n\n" + dimStyle.Render(strings.Repeat("=", max(textW, 1))) + "\n\n")
+			}
+			sb.WriteString(wrapText(chunk, textW))
+		}
 	}
 
 	sp.CacheKey = cacheKey
-	sp.Preview.SetContent(sb.String())
+	sp.SetPreviewContent(sb.String(), a.width, a.height, a.splitRatio)
 	sp.Preview.YOffset = 0
 	// Clear fold state to prevent fold keys from acting on stale data
 	if sp.Folds != nil {
 		sp.Folds.Entry = session.Entry{}
 		sp.Folds.BlockStarts = nil
 	}
+}
+
+func buildStandardEntry(entry session.Entry) session.Entry {
+	blocks := make([]session.ContentBlock, 0, len(entry.Content)+8)
+
+	// Group text chunks with their artifacts per turn
+	chunks := previewTextChunks(entry)
+	for i, chunk := range chunks {
+		if i > 0 {
+			chunk = "[separator]\n\n" + chunk
+		}
+		blocks = append(blocks, session.ContentBlock{Type: "text", Text: chunk})
+	}
+
+	// Collect artifacts from the entire entry and place them after the text
+	var artifacts []session.ContentBlock
+	for _, b := range entry.Content {
+		if b.Type == "image" {
+			artifacts = append(artifacts, b)
+		}
+	}
+	for _, item := range extract.BlockFilePaths(entry.Content) {
+		artifacts = append(artifacts, session.ContentBlock{Type: "text", Text: "[file] " + item.URL})
+	}
+	for _, ch := range extract.BlockChanges(entry.Content) {
+		// Keep the original tool_use block so the tooltip can render diffs
+		if len(ch.ToolInputs) > 0 {
+			artifacts = append(artifacts, session.ContentBlock{
+				Type:      "tool_use",
+				ToolName:  ch.ToolNames[0],
+				ToolInput: ch.ToolInputs[0],
+			})
+		} else {
+			artifacts = append(artifacts, session.ContentBlock{Type: "text", Text: "[change] " + ch.Item.URL})
+		}
+	}
+	for _, item := range extract.BlockURLs(entry.Content) {
+		artifacts = append(artifacts, session.ContentBlock{Type: "text", Text: "[url] " + item.URL})
+	}
+
+	if len(artifacts) > 0 {
+		blocks = append(blocks, session.ContentBlock{Type: "text", Text: "Artifacts"})
+		blocks = append(blocks, artifacts...)
+	}
+
+	if len(blocks) == 0 {
+		blocks = append(blocks, session.ContentBlock{Type: "text", Text: "(no content)"})
+	}
+
+	entry.Content = blocks
+	return entry
+}
+
+func makeConvPageItem(item extract.Item, ts time.Time, turnPreview, userPrompt string, imagePasteID int) convPageItem {
+	return convPageItem{
+		Item:         item,
+		timestamp:    ts,
+		turnPreview:  turnPreview,
+		userPrompt:   userPrompt,
+		imagePasteID: imagePasteID,
+	}
+}
+
+func convPageItemContext(item convPageItem, width int) string {
+	var sections []string
+	if !item.timestamp.IsZero() {
+		sections = append(sections, dimStyle.Render("Timestamp")+"\n"+item.timestamp.Format("2006-01-02 15:04:05"))
+	}
+	if item.turnPreview != "" {
+		sections = append(sections, dimStyle.Render("Turn")+"\n"+wrapText(item.turnPreview, width))
+	}
+	if item.userPrompt != "" {
+		sections = append(sections, dimStyle.Render("Related user prompt")+"\n"+wrapText(item.userPrompt, width))
+	}
+	return strings.Join(sections, "\n\n")
+}
+
+func renderFilePreview(path string, width int) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return dimStyle.Render("(file preview unavailable)")
+	}
+	const maxBytes = 4000
+	text := string(data)
+	truncated := false
+	if len(text) > maxBytes {
+		text = text[:maxBytes]
+		truncated = true
+	}
+	out := wrapText(text, width)
+	if truncated {
+		out += "\n\n" + dimStyle.Render("(truncated)")
+	}
+	return out
+}
+
+func convPageTitle(kind convPageKind) string {
+	switch kind {
+	case convPageOverview:
+		return "Overview"
+	case convPageURLs:
+		return "URLs"
+	case convPageImages:
+		return "Images"
+	case convPageChanges:
+		return "Changes"
+	case convPageFiles:
+		return "Files"
+	default:
+		return "Conversation"
+	}
+}
+
+func (a *App) renderConvPageBrowser() string {
+	if a.convPage == convPageOverview {
+		return ""
+	}
+	contentH := ContentHeight(a.height)
+	listW := a.conv.split.ListWidth(a.width, a.splitRatio)
+	previewW := a.conv.split.PreviewWidth(a.width, a.splitRatio)
+
+	if a.convPage == convPageOverview {
+		left := dimStyle.Render("── Overview ──\n\nUse `p` to jump to urls / images / changes / files.")
+		right := dimStyle.Render("Overview\n\nArtifact browser pages let you inspect URLs, images, changes, and files from the current conversation.\n\nPress `p` to switch pages.")
+		leftBox := lipgloss.NewStyle().Width(listW).Height(contentH).Render(left)
+		rightBox := lipgloss.NewStyle().
+			Width(previewW).Height(contentH).
+			BorderLeft(true).
+			BorderStyle(lipgloss.NormalBorder()).
+			BorderForeground(colorDim).
+			PaddingLeft(1).
+			Render(right)
+		return lipgloss.JoinHorizontal(lipgloss.Top, leftBox, rightBox)
+	}
+
+	var left strings.Builder
+	left.WriteString(dimStyle.Render("── "+convPageTitle(a.convPage)+" ──") + "\n\n")
+	if len(a.convPageItems) == 0 {
+		left.WriteString(dimStyle.Render("(no items)"))
+	} else {
+		for i, item := range a.convPageItems {
+			cursor := " "
+			style := dimStyle
+			if i == a.convPageCursor {
+				cursor = ">"
+				style = selectedStyle
+			}
+			label := item.Label
+			if label == "" {
+				label = item.URL
+			}
+			if lipgloss.Width(label) > listW-4 {
+				label = truncate(label, max(listW-7, 1))
+			}
+			left.WriteString(cursor + " " + style.Render(label) + "\n")
+		}
+	}
+
+	rightContent := dimStyle.Render("(no selection)")
+	if a.convPageCursor >= 0 && a.convPageCursor < len(a.convPageItems) {
+		item := a.convPageItems[a.convPageCursor]
+		header := dimStyle.Render("── "+convPageTitle(a.convPage)+" detail ──") + "\n\n"
+		context := convPageItemContext(item, max(previewW-2, 10))
+		switch a.convPage {
+		case convPageChanges:
+			if a.convPageChangeMap != nil {
+				if ch, ok := a.convPageChangeMap[item.URL]; ok && len(ch.ToolInputs) > 0 {
+					block := session.ContentBlock{Type: "tool_use", ToolName: ch.ToolNames[0], ToolInput: ch.ToolInputs[0]}
+					if diff := toolDiffOutput(block, max(previewW-2, 10)); diff != "" {
+						rightContent = header + diff + "\n\n" + context
+						break
+					}
+				}
+			}
+			rightContent = header + wrapText(item.URL, max(previewW-2, 10)) + "\n\n" + context
+		case convPageImages:
+			id := strings.TrimPrefix(item.URL, "paste:")
+			var pasteID int
+			fmt.Sscanf(id, "%d", &pasteID)
+			cachePath := ""
+			if pasteID > 0 {
+				cachePath = session.ImageCachePath(homeDir(), a.currentSess.ID, pasteID)
+			}
+			rightContent = header + "Image\n\n" + item.Label
+			if pasteID > 0 {
+				rightContent += fmt.Sprintf("\n\npaste #%d", pasteID)
+			}
+			if cachePath != "" {
+				rightContent += "\n\n" + wrapText(cachePath, max(previewW-2, 10))
+			}
+			rightContent += "\n\n" + context
+		case convPageFiles:
+			rightContent = header + "File\n\n" + renderFilePreview(item.URL, max(previewW-2, 10)) + "\n\n" + context
+		case convPageURLs:
+			rightContent = header + "URL\n\n" + wrapText(item.URL, max(previewW-2, 10)) + "\n\n" + context
+		default:
+			rightContent = header + wrapText(item.URL, max(previewW-2, 10)) + "\n\n" + context
+		}
+	}
+
+	leftBox := lipgloss.NewStyle().Width(listW).Height(contentH).Render(left.String())
+	rightBox := lipgloss.NewStyle().
+		Width(previewW).Height(contentH).
+		BorderLeft(true).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(colorDim).
+		PaddingLeft(1).
+		Render(rightContent)
+	return lipgloss.JoinHorizontal(lipgloss.Top, leftBox, rightBox)
+}
+
+func relatedUserPrompt(messages []session.Entry, idx int) string {
+	for i := idx - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			text := entryFullText(messages[i])
+			if text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func (a *App) openConvImagesPage() (tea.Model, tea.Cmd) {
+	a.convPage = convPageImages
+	a.convPageItems = nil
+	for idx, e := range a.conv.messages {
+		for _, b := range e.Content {
+			if b.Type == "image" && b.ImagePasteID > 0 {
+				label := b.Text
+				if label == "" {
+					label = "[Image]"
+				}
+				a.convPageItems = append(a.convPageItems, makeConvPageItem(
+					extract.Item{URL: fmt.Sprintf("paste:%d", b.ImagePasteID), Label: fmt.Sprintf("[%s] paste #%d", label, b.ImagePasteID), Category: "image"},
+					e.Timestamp,
+					label,
+					relatedUserPrompt(a.conv.messages, idx),
+					b.ImagePasteID,
+				))
+			}
+		}
+	}
+	a.convPageCursor = 0
+	return a, nil
+}
+
+func (a *App) openConvURLsPage() (tea.Model, tea.Cmd) {
+	a.convPage = convPageURLs
+	a.convPageItems = nil
+	seen := make(map[string]bool)
+	for idx, m := range a.conv.merged {
+		for _, item := range extract.BlockURLs(m.entry.Content) {
+			if !seen[item.URL] {
+				seen[item.URL] = true
+				a.convPageItems = append(a.convPageItems, makeConvPageItem(item, m.entry.Timestamp, convMsgPreview(m.entry, 80), relatedUserPrompt(a.conv.messages, idx), 0))
+			}
+		}
+	}
+	a.convPageCursor = 0
+	return a, nil
+}
+
+func (a *App) openConvFilesPage() (tea.Model, tea.Cmd) {
+	a.convPage = convPageFiles
+	a.convPageItems = nil
+	seen := make(map[string]bool)
+	for idx, m := range a.conv.merged {
+		for _, item := range extract.BlockFilePaths(m.entry.Content) {
+			if !seen[item.URL] {
+				seen[item.URL] = true
+				a.convPageItems = append(a.convPageItems, makeConvPageItem(item, m.entry.Timestamp, convMsgPreview(m.entry, 80), relatedUserPrompt(a.conv.messages, idx), 0))
+			}
+		}
+	}
+	a.convPageCursor = 0
+	return a, nil
+}
+
+func (a *App) openConvChangesPage() (tea.Model, tea.Cmd) {
+	a.convPage = convPageChanges
+	a.convPageItems = nil
+	a.convPageChangeMap = make(map[string]extract.ChangeItem)
+	seen := make(map[string]bool)
+	for idx, m := range a.conv.merged {
+		for _, ch := range extract.BlockChanges(m.entry.Content) {
+			if !seen[ch.Item.URL] {
+				seen[ch.Item.URL] = true
+				item := extract.Item{URL: ch.Item.URL, Label: ch.Item.URL, Category: "change"}
+				a.convPageItems = append(a.convPageItems, makeConvPageItem(item, m.entry.Timestamp, convMsgPreview(m.entry, 80), relatedUserPrompt(a.conv.messages, idx), 0))
+				a.convPageChangeMap[ch.Item.URL] = ch
+			}
+		}
+	}
+	a.convPageCursor = 0
+	return a, nil
 }
 
 func (a *App) setConvPreviewText(content string) {
@@ -581,6 +1144,8 @@ func convPreviewBaseKey(item convItem) string {
 		return "agent:" + item.agent.ShortID
 	case item.bgTaskID != "":
 		return "bg:" + item.bgTaskID
+	case item.cron.ID != "":
+		return "cron:" + item.cron.ID
 	case item.kind == convTask && item.task.ID != "":
 		return "task:" + item.task.ID
 	case item.groupTag != "":
@@ -597,7 +1162,10 @@ func buildConversationPreviewEntry(header string, fallbackTS time.Time, entries 
 		blocks = append(blocks, session.ContentBlock{Type: "text", Text: header})
 	}
 
-	for _, e := range entries {
+	for idx, e := range entries {
+		if idx > 0 {
+			blocks = append(blocks, session.ContentBlock{Type: "text", Text: strings.Repeat("─", 24)})
+		}
 		if ts.IsZero() && !e.Timestamp.IsZero() {
 			ts = e.Timestamp
 		}
@@ -745,6 +1313,87 @@ func (a *App) buildTaskPreviewEntry(task session.TaskItem) session.Entry {
 		header += "\n\n" + task.Description
 	}
 	return buildConversationPreviewEntry(header, time.Time{}, extractTaskEntries(a.conv.messages, task.ID))
+}
+
+func extractCronEntries(entries []session.Entry, cron session.CronItem) []session.Entry {
+	if cron.ID == "" && cron.Cron == "" {
+		return nil
+	}
+	var result []session.Entry
+	for _, e := range entries {
+		for _, b := range e.Content {
+			match := false
+			if b.Type == "tool_use" && isCronTool(b.ToolName) {
+				if cron.ID != "" && strings.Contains(b.ToolInput, cron.ID) {
+					match = true
+				}
+				if cron.Cron != "" && strings.Contains(b.ToolInput, cron.Cron) {
+					match = true
+				}
+			}
+			if b.Type == "tool_result" {
+				if cron.ID != "" && strings.Contains(b.Text, cron.ID) {
+					match = true
+				}
+				if cron.Cron != "" && strings.Contains(b.Text, cron.Cron) {
+					match = true
+				}
+			}
+			if match {
+				result = append(result, e)
+				break
+			}
+		}
+	}
+	return result
+}
+
+func (a *App) buildCronPreviewEntry(cron session.CronItem) session.Entry {
+	header := "Cron"
+	if cron.ID != "" {
+		header += ": " + cron.ID
+	}
+	if cron.Cron != "" {
+		header += "\nSchedule: " + cron.Cron
+	}
+	if cron.Status != "" {
+		header += "\nStatus: " + cron.Status
+	}
+	if cron.Recurring {
+		header += "\nMode: recurring"
+	} else {
+		header += "\nMode: once"
+	}
+	if cron.Prompt != "" {
+		header += "\n\n" + cron.Prompt
+	}
+	return buildConversationPreviewEntry(header, cron.CreatedAt, extractCronEntries(a.conv.messages, cron))
+}
+
+func renderCronSummary(cron session.CronItem, width int) string {
+	var sb strings.Builder
+	status := "◉ active"
+	if cron.Status == "deleted" {
+		status = "⏹ deleted"
+	}
+	name := cron.ID
+	if name == "" {
+		name = "(unknown)"
+	}
+	sb.WriteString(taskBadgeStyle.Render("Cron: "+name) + "  " + status + "\n")
+	if cron.Cron != "" {
+		sb.WriteString("\nSchedule: " + cron.Cron + "\n")
+	}
+	mode := "once"
+	if cron.Recurring {
+		mode = "recurring"
+	}
+	sb.WriteString("Mode: " + mode + "\n")
+	if cron.Prompt != "" {
+		sb.WriteString("\n" + dimStyle.Render("Prompt:") + "\n")
+		sb.WriteString(wrapText(cron.Prompt, width-2) + "\n")
+	}
+	return sb.String()
 }
 
 // renderTaskMarkerPreview renders the preview for a task marker header (non-expandable).
@@ -1007,12 +1656,77 @@ func (a *App) jumpToEntityTree() (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
+// jumpToOriginMessage switches from tree mode to flat mode, jumping to the
+// parent message that spawned the currently selected agent or task.
+func (a *App) jumpToOriginMessage() (tea.Model, tea.Cmd) {
+	item, ok := a.convList.SelectedItem().(convItem)
+	if !ok {
+		return a, nil
+	}
+
+	// Find the parent message's UUID from the tree items
+	var targetUUID string
+	switch item.kind {
+	case convAgent:
+		// parentIdx points to the parent convMsg in the current items slice
+		if item.parentIdx >= 0 && item.parentIdx < len(a.convList.Items()) {
+			if parent, ok := a.convList.Items()[item.parentIdx].(convItem); ok && parent.kind == convMsg {
+				targetUUID = parent.merged.entry.UUID
+			}
+		}
+		// Fallback: search by agent timestamp — find assistant message just before agent
+		if targetUUID == "" {
+			for _, ci := range a.conv.items {
+				if ci.kind == convMsg && ci.merged.entry.Role == "assistant" {
+					for _, b := range ci.merged.entry.Content {
+						if b.ToolName == "Agent" {
+							targetUUID = ci.merged.entry.UUID
+						}
+					}
+				}
+			}
+		}
+	case convTask:
+		if item.parentIdx >= 0 && item.parentIdx < len(a.convList.Items()) {
+			if parent, ok := a.convList.Items()[item.parentIdx].(convItem); ok && parent.kind == convMsg {
+				targetUUID = parent.merged.entry.UUID
+			}
+		}
+	case convMsg:
+		// Already a message, just switch to flat at this position
+		targetUUID = item.merged.entry.UUID
+	}
+
+	if targetUUID == "" {
+		a.copiedMsg = "no parent message found"
+		return a, nil
+	}
+
+	// Switch to flat mode
+	a.setConvLeftPaneMode(convPaneFlat)
+
+	// Find the matching message in flat items and select it
+	for i, li := range a.convList.Items() {
+		ci, ok := li.(convItem)
+		if !ok {
+			continue
+		}
+		if ci.kind == convMsg && ci.merged.entry.UUID == targetUUID {
+			a.convList.Select(i)
+			break
+		}
+	}
+
+	a.updateConvPreview()
+	return a, nil
+}
+
 // rebuildConversationList rebuilds the left-pane list based on the active flat/tree mode.
 func (a *App) rebuildConversationList(selectIdx int) {
 	contentH := ContentHeight(a.height)
 	items := a.conv.items
 	if a.conv.leftPaneMode == convPaneTree {
-		a.conv.treeItems = buildEntityTree(a.conv.merged, a.conv.agents, a.conv.sess.Tasks, inferAgentStatuses(a.conv.merged))
+		a.conv.treeItems = buildEntityTree(a.conv.merged, a.conv.agents, a.conv.sess.Tasks, a.conv.sess.Crons, inferAgentStatuses(a.conv.merged))
 		items = a.conv.treeItems
 	}
 	a.convList = newConvList(items, a.conv.split.ListWidth(a.width, a.splitRatio), contentH)
@@ -1046,7 +1760,12 @@ func (a *App) refreshConversation() tea.Cmd {
 		tasks = extractInlineTasks(entries)
 		a.conv.sess.Tasks = tasks
 	}
-	a.conv.items = buildConvItems(a.conv.merged, agents, tasks)
+	crons := a.conv.sess.Crons
+	if len(crons) == 0 && a.conv.sess.HasCrons {
+		crons = session.LoadCronsFromEntries(entries)
+		a.conv.sess.Crons = crons
+	}
+	a.conv.items = buildConvItems(a.conv.merged, agents, tasks, crons)
 	a.conv.sess.Tasks = tasks
 
 	// Preserve cursor position
@@ -1104,6 +1823,25 @@ func (a *App) renderConvTaskBoard(width int) string {
 			sb.WriteString(dimStyle.Render(wrapText("    "+t.Description, descW)) + "\n")
 		}
 		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+func (a *App) renderConvCronBoard(width int) string {
+	crons := a.conv.sess.Crons
+	if len(crons) == 0 {
+		return dimStyle.Render("No cron jobs")
+	}
+	active := 0
+	for _, c := range crons {
+		if c.Status != "deleted" {
+			active++
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString(dimStyle.Render(fmt.Sprintf("── Cron Jobs [%d/%d active] ──", active, len(crons))) + "\n\n")
+	for _, c := range crons {
+		sb.WriteString(renderCronSummary(c, width) + "\n")
 	}
 	return sb.String()
 }
@@ -1254,13 +1992,142 @@ func (a *App) scrollConvPreviewToTail() {
 	sp.Preview.YOffset = maxOffset
 }
 
+func (a *App) focusedArtifactTooltip(sp *SplitPane, width int) string {
+	if sp == nil || sp.Folds == nil {
+		return ""
+	}
+	entry := sp.Folds.Entry
+	bc := sp.Folds.BlockCursor
+	if bc < 0 || bc >= len(entry.Content) {
+		return ""
+	}
+	block := entry.Content[bc]
+	switch {
+	case block.Type == "image" && block.ImagePasteID > 0:
+		cachePath := session.ImageCachePath(homeDir(), a.currentSess.ID, block.ImagePasteID)
+		if cachePath == "" {
+			// Extract on focus — this is an intentional user action
+			cachePath = a.resolveImagePath(block.ImagePasteID)
+		}
+		label := block.Text
+		if label == "" {
+			label = "[Image]"
+		}
+		if cachePath != "" {
+			return fmt.Sprintf("Image\n\n%s\n\npaste #%d\n%s", label, block.ImagePasteID, cachePath)
+		}
+		return fmt.Sprintf("Image\n\n%s\n\npaste #%d\n(image not available)", label, block.ImagePasteID)
+	case len(extract.BlockChanges([]session.ContentBlock{block})) > 0:
+		if diff := toolDiffOutput(block, max(width/2, 20)); diff != "" {
+			return diff
+		}
+		return "Change artifact"
+	case len(extract.BlockFilePaths([]session.ContentBlock{block})) > 0:
+		items := extract.BlockFilePaths([]session.ContentBlock{block})
+		if len(items) > 0 {
+			return "File\n\n" + items[0].URL
+		}
+	case len(extract.BlockURLs([]session.ContentBlock{block})) > 0:
+		items := extract.BlockURLs([]session.ContentBlock{block})
+		if len(items) > 0 {
+			return "URL\n\n" + items[0].URL
+		}
+	}
+	return ""
+}
+
+// kittyImageActive returns true if the focused block is a renderable image.
+func (a *App) kittyImageActive() bool {
+	if a.state != viewConversation || !kitty.Supported() || !a.termFocused {
+		return false
+	}
+	sp := &a.conv.split
+	if !sp.Focus || !sp.Show || sp.Folds == nil {
+		return false
+	}
+	bc := sp.Folds.BlockCursor
+	if bc < 0 || bc >= len(sp.Folds.Entry.Content) {
+		return false
+	}
+	block := sp.Folds.Entry.Content[bc]
+	return block.Type == "image" && block.ImagePasteID > 0
+}
+
+// kittyImageLayer returns Kitty graphics escape sequences to draw an inline
+// image covering the full left pane area when a focused image artifact has
+// a cached file. Returns a clear command if no image should be drawn.
+func (a *App) kittyImageLayer() string {
+	if !kitty.Supported() || !a.termFocused || a.state != viewConversation {
+		return kitty.ClearImages()
+	}
+
+	// Images page: render into the right detail pane
+	if a.convPage == convPageImages && a.convPageCursor >= 0 && a.convPageCursor < len(a.convPageItems) {
+		item := a.convPageItems[a.convPageCursor]
+		id := strings.TrimPrefix(item.URL, "paste:")
+		var pasteID int
+		fmt.Sscanf(id, "%d", &pasteID)
+		if pasteID > 0 {
+			cachePath := session.ImageCachePath(homeDir(), a.currentSess.ID, pasteID)
+			if cachePath == "" {
+				cachePath = a.resolveImagePath(pasteID)
+			}
+			if cachePath != "" {
+				sp := &a.conv.split
+				listW := sp.ListWidth(a.width, a.splitRatio)
+				previewW := sp.PreviewWidth(a.width, a.splitRatio)
+				contentH := ContentHeight(a.height)
+				maxCols := max(previewW-2, 10)
+				maxRows := max(contentH-1, 4)
+				imgW, imgH := kitty.ImageSize(cachePath)
+				cols, rows := kitty.FitSize(imgW, imgH, maxCols, maxRows)
+				imageY := 2 + (maxRows-rows)/2
+				imageX := listW + 2 // after split border + padding
+				return kitty.ClearImages() + kitty.PlaceImage(cachePath, imageY, imageX, cols, rows)
+			}
+		}
+		return kitty.ClearImages()
+	}
+
+	// Default: focused image artifact in normal conversation view → left pane
+	if !a.kittyImageActive() {
+		return kitty.ClearImages()
+	}
+	sp := &a.conv.split
+	block := sp.Folds.Entry.Content[sp.Folds.BlockCursor]
+	cachePath := session.ImageCachePath(homeDir(), a.currentSess.ID, block.ImagePasteID)
+	if cachePath == "" {
+		cachePath = a.resolveImagePath(block.ImagePasteID)
+	}
+	if cachePath == "" {
+		return kitty.ClearImages()
+	}
+
+	listW := sp.ListWidth(a.width, a.splitRatio)
+	contentH := ContentHeight(a.height)
+	maxCols := max(listW-1, 10)
+	maxRows := max(contentH-1, 4)
+	imgW, imgH := kitty.ImageSize(cachePath)
+	cols, rows := kitty.FitSize(imgW, imgH, maxCols, maxRows)
+	imageY := 2 + (maxRows-rows)/2
+	imageX := 1
+	return kitty.ClearImages() + kitty.PlaceImage(cachePath, imageY, imageX, cols, rows)
+}
+
 // renderConvSplit renders the conversation split view.
 func (a *App) renderConvSplit() string {
 	sp := &a.conv.split
 	rendered := sp.Render(a.width, a.height, a.splitRatio)
 
-	// Show tooltip for selected item when list is focused and tooltip is on
-	if a.convTooltipOn && !sp.Focus && sp.Show && len(a.convList.Items()) > 0 {
+	// Show tooltip for selected item when list is focused and tooltip is on.
+	// When preview is focused, prefer a tooltip for the focused artifact/block.
+	// Skip text tooltip for image blocks when Kitty rendering is active.
+	if sp.Focus && sp.Show && !a.kittyImageActive() {
+		if tooltip := a.focusedArtifactTooltip(sp, a.width); tooltip != "" {
+			contentH := ContentHeight(a.height)
+			rendered = overlayTooltip(rendered, tooltip, a.width, contentH, a.convList.Index(), a.convList.Paginator.PerPage, a.convTooltipScroll)
+		}
+	} else if a.convTooltipOn && sp.Show && len(a.convList.Items()) > 0 {
 		if tooltip := a.convTooltip(); tooltip != "" {
 			contentH := ContentHeight(a.height)
 			rendered = overlayTooltip(rendered, tooltip, a.width, contentH, a.convList.Index(), a.convList.Paginator.PerPage, a.convTooltipScroll)
@@ -1450,6 +2317,35 @@ func extractTaskEntries(entries []session.Entry, taskID string) []session.Entry 
 	return result
 }
 
+func (a *App) openCronConversation(cron session.CronItem) (tea.Model, tea.Cmd) {
+	cronEntries := extractCronEntries(a.conv.messages, cron)
+	if len(cronEntries) == 0 {
+		a.copiedMsg = "No entries for cron " + cron.ID
+		return a, nil
+	}
+
+	merged := filterConversation(mergeConversationTurns(cronEntries))
+	agents, _ := session.FindSubagents(a.conv.sess.FilePath)
+	items := buildConvItems(merged, agents, nil, nil)
+
+	a.conv.sess = a.currentSess
+	a.conv.messages = cronEntries
+	a.conv.merged = merged
+	a.conv.agents = agents
+	a.conv.items = items
+	a.conv.agent = session.Subagent{}
+	a.conv.task = session.TaskItem{}
+	a.conv.cron = cron
+
+	a.conv.split.Focus = false
+	a.conv.split.CacheKey = ""
+	a.rebuildConversationList(0)
+
+	a.state = viewConversation
+	a.updateConvPreview()
+	return a, nil
+}
+
 // openTaskConversation opens a conversation view filtered to entries related to a task.
 func (a *App) openTaskConversation(task session.TaskItem) (tea.Model, tea.Cmd) {
 	taskEntries := extractTaskEntries(a.conv.messages, task.ID)
@@ -1460,7 +2356,7 @@ func (a *App) openTaskConversation(task session.TaskItem) (tea.Model, tea.Cmd) {
 
 	merged := filterConversation(mergeConversationTurns(taskEntries))
 	agents, _ := session.FindSubagents(a.conv.sess.FilePath)
-	items := buildConvItems(merged, agents, nil)
+	items := buildConvItems(merged, agents, nil, nil)
 
 	a.conv.sess = a.currentSess
 	a.conv.messages = taskEntries
@@ -1469,6 +2365,7 @@ func (a *App) openTaskConversation(task session.TaskItem) (tea.Model, tea.Cmd) {
 	a.conv.items = items
 	a.conv.agent = session.Subagent{}
 	a.conv.task = task
+	a.conv.cron = session.CronItem{}
 
 	a.conv.split.Focus = false
 	a.conv.split.CacheKey = ""
@@ -1498,7 +2395,7 @@ func (a *App) openAgentConversation(agent session.Subagent) (tea.Model, tea.Cmd)
 
 	merged := filterConversation(mergeConversationTurns(entries))
 	agents, _ := session.FindSubagents(agent.FilePath)
-	items := buildConvItems(merged, agents, nil)
+	items := buildConvItems(merged, agents, nil, nil)
 
 	a.conv.sess = a.currentSess
 	a.conv.messages = entries
@@ -1507,6 +2404,7 @@ func (a *App) openAgentConversation(agent session.Subagent) (tea.Model, tea.Cmd)
 	a.conv.items = items
 	a.conv.agent = agent
 	a.conv.task = session.TaskItem{}
+	a.conv.cron = session.CronItem{}
 
 	a.conv.split.Focus = false
 	a.conv.split.CacheKey = ""

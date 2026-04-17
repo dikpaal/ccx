@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	ansi "github.com/charmbracelet/x/ansi"
 	"github.com/sendbird/ccx/internal/extract"
 	"github.com/sendbird/ccx/internal/kitty"
 	"github.com/sendbird/ccx/internal/session"
@@ -67,6 +69,15 @@ func (a *App) openConversation(sess session.Session) tea.Cmd {
 	a.conv.sess = sess
 	a.currentSess = sess
 	a.conv.items = buildConvItems(a.conv.merged, agents, tasks, crons)
+
+	// Reset artifact page browser state on fresh conversation open.
+	a.convPageActive = false
+	a.convPageMenu = false
+	a.convPageActionsMenu = false
+	a.convPage = convPageURLs
+	a.convPageItems = nil
+	a.convPageChangeMap = nil
+	a.convPageCursor = 0
 
 	if info, err := os.Stat(sess.FilePath); err == nil {
 		a.lastMsgLoadTime = info.ModTime()
@@ -190,15 +201,10 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if a.convPageActionsMenu {
 		a.convPageActionsMenu = false
 		switch key {
-		case "enter":
+		case "enter", "o":
 			return a.convPageOpenSelected()
 		case "e":
 			return a.convPageEditSelected()
-		case "o":
-			if a.convPage == convPageURLs {
-				return a.convPageOpenSelected()
-			}
-			return a, nil
 		case "y":
 			return a.convPageCopySelected()
 		case "x":
@@ -215,16 +221,114 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Dedicated conversation artifact page browser
-	if a.convPage != convPageOverview {
+	if a.convPageActive {
+		// Search input active: intercept all keys
+		if a.convPageSearching {
+			switch key {
+			case "enter":
+				a.convPageSearching = false
+				a.convPageSearchTerm = a.convPageSearchTI.Value()
+				a.applyConvPageFilter()
+				return a, nil
+			case "esc":
+				a.convPageSearching = false
+				a.convPageSearchTI.SetValue("")
+				// Restore unfiltered items
+				if a.convPageAllItems != nil {
+					a.convPageItems = a.convPageAllItems
+					a.convPageAllItems = nil
+					a.convPageSearchTerm = ""
+					a.convPageCursor = 0
+				}
+				return a, nil
+			default:
+				var cmd tea.Cmd
+				a.convPageSearchTI, cmd = a.convPageSearchTI.Update(msg)
+				// Live filter as user types
+				a.convPageSearchTerm = a.convPageSearchTI.Value()
+				a.applyConvPageFilter()
+				return a, cmd
+			}
+		}
+
+		// Right pane focused: scroll keys move viewport
+		if a.convPageFocus {
+			switch key {
+			case "esc", "left", "h":
+				a.convPageFocus = false
+				return a, nil
+			case "up", "k":
+				a.convPageVP.LineUp(1)
+				return a, nil
+			case "down", "j":
+				a.convPageVP.LineDown(1)
+				return a, nil
+			case "pgup":
+				a.convPageVP.ViewUp()
+				return a, nil
+			case "pgdown":
+				a.convPageVP.ViewDown()
+				return a, nil
+			case "g", "home":
+				a.convPageVP.GotoTop()
+				return a, nil
+			case "G", "end":
+				a.convPageVP.GotoBottom()
+				return a, nil
+			case "p":
+				a.convPageMenu = true
+				return a, nil
+			case "x":
+				a.convPageActionsMenu = true
+				return a, nil
+			case "i":
+				a.convPageKitty = !a.convPageKitty
+				return a, nil
+			case "/":
+				a.convPageFocus = false
+				a.startConvPageSearch()
+				return a, nil
+			case "[":
+				a.adjustSplitRatio(-5)
+				return a, nil
+			case "]":
+				a.adjustSplitRatio(5)
+				return a, nil
+			default:
+				return a, nil
+			}
+		}
+
+		// Left pane (list) focused
 		switch key {
 		case "p":
 			a.convPageMenu = true
 			return a, nil
 		case "esc":
-			a.convPage = convPageOverview
+			// First esc clears filter, second esc closes browser
+			if a.convPageSearchTerm != "" {
+				a.convPageSearchTerm = ""
+				a.convPageSearchTI.SetValue("")
+				if a.convPageAllItems != nil {
+					a.convPageItems = a.convPageAllItems
+					a.convPageAllItems = nil
+					a.convPageCursor = 0
+					a.convPageLastCursor = -1
+				}
+				return a, nil
+			}
+			a.convPageActive = false
+			a.convPageFocus = false
+			a.convPageActionsMenu = false
 			a.convPageItems = nil
+			a.convPageAllItems = nil
 			a.convPageChangeMap = nil
+			a.convPageSearchTerm = ""
 			a.conv.split.CacheKey = ""
+			a.updateConvPreview()
+			return a, nil
+		case "right", "l", "tab":
+			a.convPageFocus = true
 			return a, nil
 		case "up", "k":
 			if a.convPageCursor > 0 {
@@ -236,36 +340,44 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				a.convPageCursor++
 			}
 			return a, nil
-		case "enter":
-			if a.convPageCursor >= 0 && a.convPageCursor < len(a.convPageItems) {
-				item := a.convPageItems[a.convPageCursor]
-				switch a.convPage {
-				case convPageImages:
-					id := strings.TrimPrefix(item.URL, "paste:")
-					var pasteID int
-					fmt.Sscanf(id, "%d", &pasteID)
-					if pasteID > 0 {
-						return a.openCachedImage(pasteID)
-					}
-				case convPageFiles, convPageChanges:
-					return a.openInEditor(item.URL)
-				case convPageURLs:
-					if err := extract.OpenInBrowser(item.URL); err == nil {
-						a.copiedMsg = "Opened URL"
-					}
-				}
+		case "g", "home":
+			if len(a.convPageItems) > 0 {
+				a.convPageCursor = 0
 			}
 			return a, nil
-		case "e":
-			if a.convPageCursor >= 0 && a.convPageCursor < len(a.convPageItems) {
-				item := a.convPageItems[a.convPageCursor]
-				if a.convPage == convPageFiles || a.convPage == convPageChanges {
-					return a.openInEditor(item.URL)
-				}
+		case "G", "end":
+			if len(a.convPageItems) > 0 {
+				a.convPageCursor = len(a.convPageItems) - 1
+			}
+			return a, nil
+		case "pgdown":
+			if len(a.convPageItems) > 0 {
+				page := max(ContentHeight(a.height)-3, 1)
+				a.convPageCursor = min(a.convPageCursor+page, len(a.convPageItems)-1)
+			}
+			return a, nil
+		case "pgup":
+			if len(a.convPageItems) > 0 {
+				page := max(ContentHeight(a.height)-3, 1)
+				a.convPageCursor = max(a.convPageCursor-page, 0)
 			}
 			return a, nil
 		case "x":
 			a.convPageActionsMenu = true
+			return a, nil
+		case "i":
+			a.convPageKitty = !a.convPageKitty
+			return a, nil
+		case "/":
+			a.startConvPageSearch()
+			return a, nil
+		case "[":
+			a.adjustSplitRatio(-5)
+			return a, nil
+		case "]":
+			a.adjustSplitRatio(5)
+			return a, nil
+		default:
 			return a, nil
 		}
 	}
@@ -565,7 +677,8 @@ func (a *App) handleConversationKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return a, nil
 			}
 		}
-		a.updateConvPreview()
+		debounceCmd := a.schedulePreviewUpdate()
+		return a, tea.Batch(cmd, debounceCmd)
 	}
 	return a, cmd
 }
@@ -868,6 +981,22 @@ func makeConvPageItem(item extract.Item, ts time.Time, turnPreview, userPrompt s
 	}
 }
 
+func sortConvPageItemsByTime(items []convPageItem) {
+	sort.SliceStable(items, func(i, j int) bool {
+		ti, tj := items[i].timestamp, items[j].timestamp
+		if ti.Equal(tj) {
+			return i < j
+		}
+		if ti.IsZero() {
+			return false
+		}
+		if tj.IsZero() {
+			return true
+		}
+		return ti.After(tj)
+	})
+}
+
 func convPageItemContext(item convPageItem, width int) string {
 	var sections []string
 	if !item.timestamp.IsZero() {
@@ -901,10 +1030,58 @@ func renderFilePreview(path string, width int) string {
 	return out
 }
 
+// windowRange returns start/end indices to display around cursor within visibleRows.
+func windowRange(total, cursor, visibleRows int) (int, int) {
+	if total <= visibleRows {
+		return 0, total
+	}
+	half := visibleRows / 2
+	start := cursor - half
+	if start < 0 {
+		start = 0
+	}
+	end := start + visibleRows
+	if end > total {
+		end = total
+		start = max(end-visibleRows, 0)
+	}
+	return start, end
+}
+
+func (a *App) startConvPageSearch() {
+	a.convPageSearching = true
+	a.convPageSearchTI = textinput.New()
+	a.convPageSearchTI.Prompt = "Search: "
+	a.convPageSearchTI.Focus()
+	// Save unfiltered items on first search
+	if a.convPageAllItems == nil {
+		a.convPageAllItems = a.convPageItems
+	}
+}
+
+func (a *App) applyConvPageFilter() {
+	if a.convPageAllItems == nil {
+		return
+	}
+	term := strings.ToLower(a.convPageSearchTerm)
+	if term == "" {
+		a.convPageItems = a.convPageAllItems
+	} else {
+		var filtered []convPageItem
+		for _, item := range a.convPageAllItems {
+			text := strings.ToLower(item.Label + " " + item.URL + " " + item.userPrompt)
+			if strings.Contains(text, term) {
+				filtered = append(filtered, item)
+			}
+		}
+		a.convPageItems = filtered
+	}
+	a.convPageCursor = 0
+	a.convPageLastCursor = -1
+}
+
 func convPageTitle(kind convPageKind) string {
 	switch kind {
-	case convPageOverview:
-		return "Overview"
 	case convPageURLs:
 		return "URLs"
 	case convPageImages:
@@ -919,33 +1096,56 @@ func convPageTitle(kind convPageKind) string {
 }
 
 func (a *App) renderConvPageBrowser() string {
-	if a.convPage == convPageOverview {
-		return ""
-	}
 	contentH := ContentHeight(a.height)
-	listW := a.conv.split.ListWidth(a.width, a.splitRatio)
-	previewW := a.conv.split.PreviewWidth(a.width, a.splitRatio)
-
-	if a.convPage == convPageOverview {
-		left := dimStyle.Render("── Overview ──\n\nUse `p` to jump to urls / images / changes / files.")
-		right := dimStyle.Render("Overview\n\nArtifact browser pages let you inspect URLs, images, changes, and files from the current conversation.\n\nPress `p` to switch pages.")
-		leftBox := lipgloss.NewStyle().Width(listW).Height(contentH).Render(left)
-		rightBox := lipgloss.NewStyle().
-			Width(previewW).Height(contentH).
-			BorderLeft(true).
-			BorderStyle(lipgloss.NormalBorder()).
-			BorderForeground(colorDim).
-			PaddingLeft(1).
-			Render(right)
-		return lipgloss.JoinHorizontal(lipgloss.Top, leftBox, rightBox)
-	}
+	browserRatio := a.splitRatio
+	// Calculate widths directly — don't use sp.ListWidth/PreviewWidth which
+	// return full width when sp.Show is false. The browser always needs a split.
+	listW := max(a.width*browserRatio/100, 30)
+	previewW := max(a.width-listW-1, 1)
 
 	var left strings.Builder
-	left.WriteString(dimStyle.Render("── "+convPageTitle(a.convPage)+" ──") + "\n\n")
-	if len(a.convPageItems) == 0 {
+	title := convPageTitle(a.convPage)
+	n := len(a.convPageItems)
+	left.WriteString(dimStyle.Render(fmt.Sprintf("── %s (%d) ──", title, n)) + "\n\n")
+	if n == 0 {
 		left.WriteString(dimStyle.Render("(no items)"))
 	} else {
-		for i, item := range a.convPageItems {
+		// Window the list so the cursor is always visible.
+		// Header takes 2 lines, leaving visibleRows for items.
+		// Reserve rows for ↑/↓ indicators before computing the window
+		// so the cursor never falls outside the visible range.
+		visibleRows := max(contentH-2, 1)
+		start, end := windowRange(n, a.convPageCursor, visibleRows)
+		needTop := start > 0
+		needBottom := end < n
+		if needTop || needBottom {
+			// Recompute with reduced rows to leave room for indicators
+			reserved := 0
+			if needTop {
+				reserved++
+			}
+			if needBottom {
+				reserved++
+			}
+			itemRows := max(visibleRows-reserved, 1)
+			start, end = windowRange(n, a.convPageCursor, itemRows)
+			needTop = start > 0
+			needBottom = end < n
+		}
+		if needTop {
+			left.WriteString(dimStyle.Render(fmt.Sprintf("  ↑ %d more", start)) + "\n")
+		}
+		prevPrompt := ""
+		if start > 0 {
+			prevPrompt = a.convPageItems[start-1].userPrompt
+		}
+		for i := start; i < end; i++ {
+			item := a.convPageItems[i]
+			// Show separator when user prompt changes between items
+			if i > start && item.userPrompt != prevPrompt {
+				left.WriteString(dimStyle.Render("  ─") + "\n")
+			}
+			prevPrompt = item.userPrompt
 			cursor := " "
 			style := dimStyle
 			if i == a.convPageCursor {
@@ -961,59 +1161,82 @@ func (a *App) renderConvPageBrowser() string {
 			}
 			left.WriteString(cursor + " " + style.Render(label) + "\n")
 		}
+		if needBottom {
+			left.WriteString(dimStyle.Render(fmt.Sprintf("  ↓ %d more", n-end)) + "\n")
+		}
 	}
 
 	rightContent := dimStyle.Render("(no selection)")
 	if a.convPageCursor >= 0 && a.convPageCursor < len(a.convPageItems) {
 		item := a.convPageItems[a.convPageCursor]
-		header := dimStyle.Render("── "+convPageTitle(a.convPage)+" detail ──") + "\n\n"
-		context := convPageItemContext(item, max(previewW-2, 10))
+		pw := max(previewW, 10)
+		// Metadata first, then page-specific content below
+		context := convPageItemContext(item, pw)
+		var detail string
 		switch a.convPage {
 		case convPageChanges:
 			if a.convPageChangeMap != nil {
 				if ch, ok := a.convPageChangeMap[item.URL]; ok && len(ch.ToolInputs) > 0 {
 					block := session.ContentBlock{Type: "tool_use", ToolName: ch.ToolNames[0], ToolInput: ch.ToolInputs[0]}
-					if diff := toolDiffOutput(block, max(previewW-2, 10)); diff != "" {
-						rightContent = header + diff + "\n\n" + context
-						break
+					if diff := toolDiffOutput(block, pw); diff != "" {
+						detail = diff
+						goto done
 					}
 				}
 			}
-			rightContent = header + wrapText(item.URL, max(previewW-2, 10)) + "\n\n" + context
+			detail = wrapText(item.URL, pw)
 		case convPageImages:
 			id := strings.TrimPrefix(item.URL, "paste:")
 			var pasteID int
 			fmt.Sscanf(id, "%d", &pasteID)
-			cachePath := ""
+			parts := []string{wrapText(item.Label, pw)}
 			if pasteID > 0 {
-				cachePath = session.ImageCachePath(homeDir(), a.currentSess.ID, pasteID)
+				parts = append(parts, fmt.Sprintf("paste #%d", pasteID))
 			}
-			rightContent = header + "Image\n\n" + item.Label
-			if pasteID > 0 {
-				rightContent += fmt.Sprintf("\n\npaste #%d", pasteID)
+			if cachePath := session.ImageCachePath(homeDir(), a.currentSess.ID, pasteID); cachePath != "" {
+				parts = append(parts, wrapText(cachePath, pw))
 			}
-			if cachePath != "" {
-				rightContent += "\n\n" + wrapText(cachePath, max(previewW-2, 10))
-			}
-			rightContent += "\n\n" + context
+			detail = strings.Join(parts, "\n")
 		case convPageFiles:
-			rightContent = header + "File\n\n" + renderFilePreview(item.URL, max(previewW-2, 10)) + "\n\n" + context
+			detail = dimStyle.Render("["+item.Category+"]") + " " + wrapText(item.URL, pw)
 		case convPageURLs:
-			rightContent = header + "URL\n\n" + wrapText(item.URL, max(previewW-2, 10)) + "\n\n" + context
+			detail = wrapText(item.URL, pw)
 		default:
-			rightContent = header + wrapText(item.URL, max(previewW-2, 10)) + "\n\n" + context
+			detail = wrapText(item.URL, pw)
 		}
+	done:
+		rightContent = context + "\n\n" + dimStyle.Render("────") + "\n\n" + detail
 	}
 
-	leftBox := lipgloss.NewStyle().Width(listW).Height(contentH).Render(left.String())
-	rightBox := lipgloss.NewStyle().
-		Width(previewW).Height(contentH).
-		BorderLeft(true).
-		BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(colorDim).
-		PaddingLeft(1).
-		Render(rightContent)
-	return lipgloss.JoinHorizontal(lipgloss.Top, leftBox, rightBox)
+	rightContent = clampLines(rightContent, max(previewW, 1))
+
+	// Update viewport when cursor changes or viewport size differs
+	if a.convPageCursor != a.convPageLastCursor ||
+		a.convPageVP.Width != previewW || a.convPageVP.Height != contentH {
+		a.convPageVP = viewport.New(previewW, contentH)
+		a.convPageVP.SetContent(rightContent)
+		a.convPageLastCursor = a.convPageCursor
+	}
+
+	borderColor := colorBorderDim
+	if a.convPageFocus {
+		borderColor = colorBorderFocused
+	}
+	return renderFixedSplit(left.String(), a.convPageVP.View(), listW, previewW, contentH, borderColor)
+}
+
+// clampLines truncates each line to maxW display width, preserving ANSI escapes.
+func clampLines(s string, maxW int) string {
+	if maxW <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if ansi.StringWidth(line) > maxW {
+			lines[i] = ansi.Truncate(line, maxW, "")
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func relatedUserPrompt(messages []session.Entry, idx int) string {
@@ -1029,6 +1252,10 @@ func relatedUserPrompt(messages []session.Entry, idx int) string {
 }
 
 func (a *App) openConvImagesPage() (tea.Model, tea.Cmd) {
+	a.convPageActive = true
+	a.convPageFocus = false
+	a.convPageLastCursor = -1
+	a.convPageKitty = true
 	a.convPage = convPageImages
 	a.convPageItems = nil
 	for idx, e := range a.conv.messages {
@@ -1049,56 +1276,82 @@ func (a *App) openConvImagesPage() (tea.Model, tea.Cmd) {
 		}
 	}
 	a.convPageCursor = 0
+	sortConvPageItemsByTime(a.convPageItems)
 	return a, nil
 }
 
 func (a *App) openConvURLsPage() (tea.Model, tea.Cmd) {
+	a.convPageActive = true
+	a.convPageFocus = false
+	a.convPageLastCursor = -1
 	a.convPage = convPageURLs
 	a.convPageItems = nil
-	seen := make(map[string]bool)
+	seen := make(map[string]int)
 	for idx, m := range a.conv.merged {
 		for _, item := range extract.BlockURLs(m.entry.Content) {
-			if !seen[item.URL] {
-				seen[item.URL] = true
-				a.convPageItems = append(a.convPageItems, makeConvPageItem(item, m.entry.Timestamp, convMsgPreview(m.entry, 80), relatedUserPrompt(a.conv.messages, idx), 0))
+			if existing, ok := seen[item.URL]; ok {
+				a.convPageItems[existing].timestamp = m.entry.Timestamp
+				a.convPageItems[existing].turnPreview = convMsgPreview(m.entry, 80)
+				a.convPageItems[existing].userPrompt = relatedUserPrompt(a.conv.messages, idx)
+				continue
 			}
+			seen[item.URL] = len(a.convPageItems)
+			a.convPageItems = append(a.convPageItems, makeConvPageItem(item, m.entry.Timestamp, convMsgPreview(m.entry, 80), relatedUserPrompt(a.conv.messages, idx), 0))
 		}
 	}
+	sortConvPageItemsByTime(a.convPageItems)
 	a.convPageCursor = 0
 	return a, nil
 }
 
 func (a *App) openConvFilesPage() (tea.Model, tea.Cmd) {
+	a.convPageActive = true
+	a.convPageFocus = false
+	a.convPageLastCursor = -1
 	a.convPage = convPageFiles
 	a.convPageItems = nil
-	seen := make(map[string]bool)
+	seen := make(map[string]int)
 	for idx, m := range a.conv.merged {
-		for _, item := range extract.BlockFilePaths(m.entry.Content) {
-			if !seen[item.URL] {
-				seen[item.URL] = true
-				a.convPageItems = append(a.convPageItems, makeConvPageItem(item, m.entry.Timestamp, convMsgPreview(m.entry, 80), relatedUserPrompt(a.conv.messages, idx), 0))
+		for _, item := range extract.BlockModifiedFiles(m.entry.Content) {
+			if existing, ok := seen[item.URL]; ok {
+				a.convPageItems[existing].timestamp = m.entry.Timestamp
+				a.convPageItems[existing].turnPreview = convMsgPreview(m.entry, 80)
+				a.convPageItems[existing].userPrompt = relatedUserPrompt(a.conv.messages, idx)
+				continue
 			}
+			seen[item.URL] = len(a.convPageItems)
+			a.convPageItems = append(a.convPageItems, makeConvPageItem(item, m.entry.Timestamp, convMsgPreview(m.entry, 80), relatedUserPrompt(a.conv.messages, idx), 0))
 		}
 	}
+	sortConvPageItemsByTime(a.convPageItems)
 	a.convPageCursor = 0
 	return a, nil
 }
 
 func (a *App) openConvChangesPage() (tea.Model, tea.Cmd) {
+	a.convPageActive = true
+	a.convPageFocus = false
+	a.convPageLastCursor = -1
 	a.convPage = convPageChanges
 	a.convPageItems = nil
 	a.convPageChangeMap = make(map[string]extract.ChangeItem)
-	seen := make(map[string]bool)
+	seen := make(map[string]int)
 	for idx, m := range a.conv.merged {
 		for _, ch := range extract.BlockChanges(m.entry.Content) {
-			if !seen[ch.Item.URL] {
-				seen[ch.Item.URL] = true
-				item := extract.Item{URL: ch.Item.URL, Label: ch.Item.URL, Category: "change"}
-				a.convPageItems = append(a.convPageItems, makeConvPageItem(item, m.entry.Timestamp, convMsgPreview(m.entry, 80), relatedUserPrompt(a.conv.messages, idx), 0))
+			if existing, ok := seen[ch.Item.URL]; ok {
+				a.convPageItems[existing].timestamp = m.entry.Timestamp
+				a.convPageItems[existing].turnPreview = convMsgPreview(m.entry, 80)
+				a.convPageItems[existing].userPrompt = relatedUserPrompt(a.conv.messages, idx)
 				a.convPageChangeMap[ch.Item.URL] = ch
+				continue
 			}
+			seen[ch.Item.URL] = len(a.convPageItems)
+			item := extract.Item{URL: ch.Item.URL, Label: ch.Item.URL, Category: "change"}
+			a.convPageItems = append(a.convPageItems, makeConvPageItem(item, m.entry.Timestamp, convMsgPreview(m.entry, 80), relatedUserPrompt(a.conv.messages, idx), 0))
+			a.convPageChangeMap[ch.Item.URL] = ch
 		}
 	}
+	sortConvPageItemsByTime(a.convPageItems)
 	a.convPageCursor = 0
 	return a, nil
 }
@@ -2061,8 +2314,9 @@ func (a *App) kittyImageLayer() string {
 		return kitty.ClearImages()
 	}
 
-	// Images page: render into the right detail pane
-	if a.convPage == convPageImages && a.convPageCursor >= 0 && a.convPageCursor < len(a.convPageItems) {
+	// Images page: render into the right detail pane of the artifact browser
+	// (only when kitty preview is enabled via `i` toggle)
+	if a.convPageActive && a.convPage == convPageImages && a.convPageKitty && a.convPageCursor >= 0 && a.convPageCursor < len(a.convPageItems) {
 		item := a.convPageItems[a.convPageCursor]
 		id := strings.TrimPrefix(item.URL, "paste:")
 		var pasteID int
@@ -2073,16 +2327,16 @@ func (a *App) kittyImageLayer() string {
 				cachePath = a.resolveImagePath(pasteID)
 			}
 			if cachePath != "" {
-				sp := &a.conv.split
-				listW := sp.ListWidth(a.width, a.splitRatio)
-				previewW := sp.PreviewWidth(a.width, a.splitRatio)
+				browserRatio := a.splitRatio
+				listW := max(a.width*browserRatio/100, 30)
+				previewW := max(a.width-listW-1, 1)
 				contentH := ContentHeight(a.height)
 				maxCols := max(previewW-2, 10)
-				maxRows := max(contentH-1, 4)
+				maxRows := max(contentH-2, 4)
 				imgW, imgH := kitty.ImageSize(cachePath)
 				cols, rows := kitty.FitSize(imgW, imgH, maxCols, maxRows)
-				imageY := 2 + (maxRows-rows)/2
-				imageX := listW + 2 // after split border + padding
+				imageY := 2 + max((maxRows-rows)/2, 0)
+				imageX := listW + 2
 				return kitty.ClearImages() + kitty.PlaceImage(cachePath, imageY, imageX, cols, rows)
 			}
 		}
@@ -2125,12 +2379,12 @@ func (a *App) renderConvSplit() string {
 	if sp.Focus && sp.Show && !a.kittyImageActive() {
 		if tooltip := a.focusedArtifactTooltip(sp, a.width); tooltip != "" {
 			contentH := ContentHeight(a.height)
-			rendered = overlayTooltip(rendered, tooltip, a.width, contentH, a.convList.Index(), a.convList.Paginator.PerPage, a.convTooltipScroll)
+			rendered = overlayTooltip(rendered, tooltip, a.width, contentH, a.convList.Index(), a.convList.Paginator.PerPage, a.convTooltipScroll, a.activeDividerCol())
 		}
 	} else if a.convTooltipOn && sp.Show && len(a.convList.Items()) > 0 {
 		if tooltip := a.convTooltip(); tooltip != "" {
 			contentH := ContentHeight(a.height)
-			rendered = overlayTooltip(rendered, tooltip, a.width, contentH, a.convList.Index(), a.convList.Paginator.PerPage, a.convTooltipScroll)
+			rendered = overlayTooltip(rendered, tooltip, a.width, contentH, a.convList.Index(), a.convList.Paginator.PerPage, a.convTooltipScroll, a.activeDividerCol())
 		}
 	}
 
@@ -2176,7 +2430,7 @@ func (a *App) convTooltip() string {
 }
 
 // overlayTooltip places a bordered tooltip near the selected item position.
-func overlayTooltip(bg, text string, screenW, screenH, cursorIdx, perPage, scroll int) string {
+func overlayTooltip(bg, text string, screenW, screenH, cursorIdx, perPage, scroll, dividerCol int) string {
 	// Tooltip dimensions
 	maxW := screenW / 2
 	if maxW > 60 {
@@ -2237,8 +2491,12 @@ func overlayTooltip(bg, text string, screenW, screenH, cursorIdx, perPage, scrol
 		row := y + i
 		if row >= 0 && row < len(bgLines) {
 			bgLine := bgLines[row]
-			// Place tooltip starting at column 2
-			bgLines[row] = overlayLine(bgLine, tl, 2, screenW)
+			limit := screenW
+			if dividerCol > 0 {
+				limit = dividerCol - 1
+			}
+			// Place tooltip starting at column 2, but never cross the divider.
+			bgLines[row] = overlayLine(bgLine, tl, 2, limit)
 		}
 	}
 
